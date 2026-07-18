@@ -69,6 +69,7 @@ pub struct AppState {
     managed_core: Mutex<Option<ManagedCore>>,
     routing_engine: Mutex<RoutingEngine>,
     routing_transaction: RoutingTransaction,
+    initialization_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -104,10 +105,19 @@ impl AppState {
         );
         let workspace_root = workspace_root.canonicalize().unwrap_or(workspace_root);
         let data_directory = local_data_directory(&workspace_root);
-        let guardian_config_path = env::var_os("VPN_HUB_CONFIG").map_or_else(
-            || prepare_local_guardian_config(&data_directory, &workspace_root),
-            PathBuf::from,
-        );
+        let guardian_override = env::var_os("VPN_HUB_CONFIG").map(PathBuf::from);
+        Self::new_with_data_directory(workspace_root, &data_directory, guardian_override)
+    }
+
+    fn new_with_data_directory(
+        workspace_root: PathBuf,
+        data_directory: &Path,
+        guardian_override: Option<PathBuf>,
+    ) -> Self {
+        let runtime_directory = data_directory.join("runtime");
+        let initialization_error = initialize_runtime_security(&runtime_directory).err();
+        let guardian_config_path = guardian_override
+            .unwrap_or_else(|| prepare_local_guardian_config(data_directory, &workspace_root));
         let private_config_path = data_directory.join("private-routing.toml");
         let _ = PrivateRoutingConfig::create_default(&private_config_path);
         let _ = harden_private_path(&private_config_path);
@@ -120,11 +130,17 @@ impl AppState {
             workspace_root,
             guardian_config_path,
             private_config_path,
-            runtime_directory: data_directory.join("runtime"),
+            runtime_directory,
             managed_core: Mutex::new(None),
             routing_engine: Mutex::new(routing_engine),
             routing_transaction: RoutingTransaction::default(),
+            initialization_error,
         }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(workspace_root: PathBuf, data_directory: &Path) -> Self {
+        Self::new_with_data_directory(workspace_root, data_directory, None)
     }
 
     #[must_use]
@@ -294,6 +310,7 @@ impl AppState {
     }
 
     pub fn start_development_core(&self) -> Result<CoreStatus, String> {
+        self.ensure_runtime_ready()?;
         let protected_owner_pid = listening_owner_pid(PROTECTED_PORT)
             .ok_or_else(|| "受保护端口 6666 当前没有监听者，拒绝启动开发核心".to_string())?;
         if is_port_reachable(DEVELOPMENT_PORT) {
@@ -314,7 +331,6 @@ impl AppState {
         fs::create_dir_all(&self.runtime_directory)
             .map_err(|error| format!("无法创建 Mihomo 运行目录：{error}"))?;
         harden_private_path(&self.runtime_directory)?;
-        clear_legacy_raw_logs(&self.runtime_directory)?;
         let controller_secret = generate_controller_secret();
         let (yaml, _) = generate_mihomo_config(&private_config, &controller_secret)
             .map_err(|error| format!("无法生成 Mihomo 配置：{error}"))?;
@@ -452,6 +468,12 @@ impl AppState {
     fn reset_routing_session(&self) -> Result<(), String> {
         reset_routing_engine(&self.routing_engine)
     }
+
+    fn ensure_runtime_ready(&self) -> Result<(), String> {
+        self.initialization_error
+            .as_ref()
+            .map_or(Ok(()), |error| Err(error.clone()))
+    }
 }
 
 impl Default for AppState {
@@ -474,6 +496,13 @@ fn local_data_directory(workspace_root: &Path) -> PathBuf {
 }
 
 const LEGACY_RAW_LOGS: [&str; 2] = ["mihomo.log", "mihomo-desktop.log"];
+
+fn initialize_runtime_security(runtime_directory: &Path) -> Result<(), String> {
+    fs::create_dir_all(runtime_directory)
+        .map_err(|_| "无法初始化 VPN Hub 私密运行目录".to_string())?;
+    harden_private_path(runtime_directory)?;
+    clear_legacy_raw_logs(runtime_directory)
+}
 
 fn clear_legacy_raw_logs(runtime_directory: &Path) -> Result<(), String> {
     for name in LEGACY_RAW_LOGS {
@@ -607,7 +636,7 @@ mod tests {
     };
 
     #[test]
-    fn credential_bearing_url_is_absent_from_diagnostics_and_ui_summary() {
+    fn app_initialization_removes_raw_logs_and_keeps_diagnostics_sanitized() {
         let sensitive_url =
             "https://example.invalid/provider/credential-token-value/node-detail-value";
         let mut config = PrivateRoutingConfig::default();
@@ -630,13 +659,31 @@ mod tests {
             assert!(!diagnostics.contains(sensitive_part));
             assert!(!rejected_error.contains(sensitive_part));
         }
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
+        let data_directory = directory.path().join("app-data");
+        let runtime_directory = data_directory.join("runtime");
+        fs::create_dir_all(&runtime_directory).expect("runtime directory");
         for name in LEGACY_RAW_LOGS {
-            fs::write(directory.path().join(name), sensitive_url).expect("synthetic legacy log");
+            fs::write(runtime_directory.join(name), sensitive_url).expect("synthetic legacy log");
         }
-        clear_legacy_raw_logs(directory.path()).expect("clear raw logs");
+        let state = AppState::new_for_test(workspace_root.clone(), &data_directory);
+        state.ensure_runtime_ready().expect("safe initialization");
+        assert!(state.managed_core.lock().expect("managed core").is_none());
         for name in LEGACY_RAW_LOGS {
-            assert!(!directory.path().join(name).exists());
+            assert!(!runtime_directory.join(name).exists());
+        }
+
+        let blocked_data = directory.path().join("credential-token-value-private-data");
+        let blocked_runtime = blocked_data.join("runtime");
+        fs::create_dir_all(blocked_runtime.join(LEGACY_RAW_LOGS[0])).expect("blocking directory");
+        let blocked = AppState::new_for_test(workspace_root, &blocked_data);
+        let blocking_error = blocked
+            .ensure_runtime_ready()
+            .expect_err("raw log deletion failure must block core startup");
+        assert_eq!(blocking_error, "无法清理旧版 Mihomo 原始日志");
+        for sensitive_part in ["credential-token-value", sensitive_url, rejected_url] {
+            assert!(!blocking_error.contains(sensitive_part));
         }
     }
 

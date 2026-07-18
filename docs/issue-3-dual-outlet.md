@@ -17,7 +17,7 @@
 
 ## 本机私密配置
 
-桌面端首次运行会在 `%LOCALAPPDATA%\VPN Hub\private-routing.toml` 创建私密配置，并通过 Windows ACL 将文件权限收敛给当前用户与 `SYSTEM`。运行时配置和 provider 缓存保存在同一目录下的 `runtime`，也应用相同权限策略。Mihomo 的 stdout/stderr 会直接丢弃，不持久化原始输出；启动前会删除旧版本留下的 raw log。
+桌面端首次运行会在 `%LOCALAPPDATA%\VPN Hub\private-routing.toml` 创建私密配置，并通过 Windows ACL 将文件权限收敛给当前用户与 `SYSTEM`。运行时配置和 provider 缓存保存在同一目录下的 `runtime`，也应用相同权限策略。Mihomo 的 stdout/stderr 会直接丢弃，不持久化原始输出；AppState 初始化时会无条件删除旧版本留下的 raw log，删除失败会用不含路径或原内容的诊断阻断核心启动。
 
 在总览的密码输入框粘贴订阅地址并保存。应用只向界面返回“已配置/未配置”，不会返回地址。以下内容不会写入 SQLite 或普通事件日志：订阅 URL/token、provider 节点信息、Controller secret、探测目标响应。
 
