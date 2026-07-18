@@ -10,6 +10,6 @@ mod probe;
 mod store;
 
 pub use config::{ConfigError, GuardianConfig, MonitorConfig, OutletConfig};
-pub use model::{HealthStatus, OutletSummary, ProbeResult, StateEvent};
+pub use model::{HealthStatus, LatencySample, OutletSummary, ProbeResult, StateEvent};
 pub use probe::probe_outlet;
 pub use store::{GuardianStore, StoreError};

@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-use crate::{HealthStatus, OutletConfig, OutletSummary, ProbeResult, StateEvent};
+use crate::{HealthStatus, LatencySample, OutletConfig, OutletSummary, ProbeResult, StateEvent};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -250,6 +250,88 @@ impl GuardianStore {
                 last_status: HealthStatus::try_from(status.as_str())
                     .map_err(StoreError::InvalidStatus)?,
                 last_observed_at: last_seen,
+            })
+        })
+        .collect()
+    }
+
+    /// Returns the newest sanitized latency samples in chronological order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored rows cannot be queried or decoded.
+    pub fn recent_samples(&self, limit: u32) -> Result<Vec<LatencySample>, StoreError> {
+        let mut statement = self.connection.prepare(
+            r"
+            SELECT outlet_id, observed_at, port_reachable, status, latency_ms, error_code
+            FROM (
+              SELECT id, outlet_id, observed_at, port_reachable, status, latency_ms, error_code
+              FROM probe_samples
+              ORDER BY id DESC
+              LIMIT ?1
+            )
+            ORDER BY id ASC
+            ",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            let status = row.get::<_, String>(3)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                status,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (outlet_id, observed_at, port_reachable, status, latency_ms, error_code) = row?;
+            Ok(LatencySample {
+                outlet_id,
+                observed_at,
+                port_reachable,
+                status: HealthStatus::try_from(status.as_str())
+                    .map_err(StoreError::InvalidStatus)?,
+                latency_ms: latency_ms.and_then(|value| u64::try_from(value).ok()),
+                error_code,
+            })
+        })
+        .collect()
+    }
+
+    /// Returns the newest state transitions, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored rows cannot be queried or decoded.
+    pub fn recent_events(&self, limit: u32) -> Result<Vec<StateEvent>, StoreError> {
+        let mut statement = self.connection.prepare(
+            r"
+            SELECT outlet_id, occurred_at, from_status, to_status, reason
+            FROM state_events
+            ORDER BY id DESC
+            LIMIT ?1
+            ",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (outlet_id, occurred_at, from_status, to_status, reason) = row?;
+            Ok(StateEvent {
+                outlet_id,
+                occurred_at,
+                from_status: HealthStatus::try_from(from_status.as_str())
+                    .map_err(StoreError::InvalidStatus)?,
+                to_status: HealthStatus::try_from(to_status.as_str())
+                    .map_err(StoreError::InvalidStatus)?,
+                reason,
             })
         })
         .collect()
