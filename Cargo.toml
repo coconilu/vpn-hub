@@ -3,7 +3,7 @@ members = ["apps/desktop/src-tauri", "crates/vpn-hub-cli", "crates/vpn-hub-core"
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/coconilu/vpn-hub"
@@ -12,10 +12,12 @@ repository = "https://github.com/coconilu/vpn-hub"
 anyhow = "1.0.100"
 chrono = { version = "0.4.43", features = ["serde"] }
 clap = { version = "4.5.54", features = ["derive"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "socks"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "socks", "json"] }
+rand = "0.9.2"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+serde_yaml = "0.9.34"
 thiserror = "2.0.17"
 tokio = { version = "1.53.0", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 toml = "1.1.3"

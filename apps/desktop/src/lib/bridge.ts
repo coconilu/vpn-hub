@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { mockSnapshot } from "../data/mock";
-import type { CoreStatus, DashboardSnapshot } from "../types";
+import type { CoreStatus, DashboardSnapshot, RouteMode } from "../types";
 
 declare global {
   interface Window {
@@ -63,4 +63,27 @@ export async function stopDevelopmentCore(): Promise<CoreStatus> {
     return status;
   }
   return invoke<CoreStatus>("stop_development_core");
+}
+
+export async function setRouteMode(mode: RouteMode, manualOutlet: string | null): Promise<DashboardSnapshot> {
+  if (!isTauriRuntime()) {
+    browserSnapshot = {
+      ...browserSnapshot,
+      updated_at: new Date().toISOString(),
+      routing: { ...browserSnapshot.routing, mode, manual_outlet: manualOutlet },
+    };
+    return structuredClone(browserSnapshot);
+  }
+  return invoke<DashboardSnapshot>("set_route_mode", { mode, manualOutlet });
+}
+
+export async function saveSubscriptionUrl(subscriptionUrl: string): Promise<void> {
+  if (!isTauriRuntime()) {
+    browserSnapshot = {
+      ...browserSnapshot,
+      routing: { ...browserSnapshot.routing, subscription_configured: Boolean(subscriptionUrl) },
+    };
+    return;
+  }
+  await invoke("save_subscription_url", { subscriptionUrl });
 }

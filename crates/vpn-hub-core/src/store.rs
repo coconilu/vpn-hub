@@ -3,7 +3,10 @@ use std::{fs, path::Path};
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-use crate::{HealthStatus, LatencySample, OutletConfig, OutletSummary, ProbeResult, StateEvent};
+use crate::{
+    HealthStatus, LatencySample, OutletConfig, OutletSummary, ProbeResult, RouteSwitchEvent,
+    StateEvent,
+};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -64,7 +67,9 @@ impl GuardianStore {
                 status TEXT NOT NULL,
                 http_status INTEGER,
                 latency_ms INTEGER,
-                error_code TEXT
+                error_code TEXT,
+                successful_targets INTEGER NOT NULL DEFAULT 0,
+                total_targets INTEGER NOT NULL DEFAULT 1
             );
             CREATE INDEX IF NOT EXISTS idx_probe_samples_outlet_time
                 ON probe_samples(outlet_id, observed_at DESC);
@@ -85,11 +90,28 @@ impl GuardianStore {
             );
             CREATE INDEX IF NOT EXISTS idx_state_events_outlet_time
                 ON state_events(outlet_id, occurred_at DESC);
+            CREATE TABLE IF NOT EXISTS route_switches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at TEXT NOT NULL,
+                from_outlet TEXT,
+                to_outlet TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_route_switches_time
+                ON route_switches(occurred_at DESC);
             ",
         )?;
         ensure_probe_column(&connection, "port_reachable", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_probe_column(&connection, "http_status", "INTEGER")?;
-        connection.pragma_update(None, "user_version", 1_i64)?;
+        ensure_probe_column(
+            &connection,
+            "successful_targets",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        ensure_probe_column(&connection, "total_targets", "INTEGER NOT NULL DEFAULT 1")?;
+        connection.pragma_update(None, "user_version", 2_i64)?;
         Ok(Self { connection })
     }
 
@@ -113,7 +135,7 @@ impl GuardianStore {
             params![outlet.id, outlet.label, result.observed_at],
         )?;
         transaction.execute(
-            "INSERT INTO probe_samples(outlet_id, observed_at, port_reachable, status, http_status, latency_ms, error_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO probe_samples(outlet_id, observed_at, port_reachable, status, http_status, latency_ms, error_code, successful_targets, total_targets) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 outlet.id,
                 result.observed_at,
@@ -121,7 +143,9 @@ impl GuardianStore {
                 result.status.as_str(),
                 result.http_status,
                 result.latency_ms.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
-                result.error_code
+                result.error_code,
+                result.successful_targets,
+                result.total_targets
             ],
         )?;
 
@@ -263,9 +287,9 @@ impl GuardianStore {
     pub fn recent_samples(&self, limit: u32) -> Result<Vec<LatencySample>, StoreError> {
         let mut statement = self.connection.prepare(
             r"
-            SELECT outlet_id, observed_at, port_reachable, status, latency_ms, error_code
+            SELECT outlet_id, observed_at, port_reachable, status, latency_ms, error_code, successful_targets, total_targets
             FROM (
-              SELECT id, outlet_id, observed_at, port_reachable, status, latency_ms, error_code
+              SELECT id, outlet_id, observed_at, port_reachable, status, latency_ms, error_code, successful_targets, total_targets
               FROM probe_samples
               ORDER BY id DESC
               LIMIT ?1
@@ -282,10 +306,21 @@ impl GuardianStore {
                 status,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, u32>(6)?,
+                row.get::<_, u32>(7)?,
             ))
         })?;
         rows.map(|row| {
-            let (outlet_id, observed_at, port_reachable, status, latency_ms, error_code) = row?;
+            let (
+                outlet_id,
+                observed_at,
+                port_reachable,
+                status,
+                latency_ms,
+                error_code,
+                successful_targets,
+                total_targets,
+            ) = row?;
             Ok(LatencySample {
                 outlet_id,
                 observed_at,
@@ -294,6 +329,8 @@ impl GuardianStore {
                     .map_err(StoreError::InvalidStatus)?,
                 latency_ms: latency_ms.and_then(|value| u64::try_from(value).ok()),
                 error_code,
+                successful_targets,
+                total_targets,
             })
         })
         .collect()
@@ -335,6 +372,49 @@ impl GuardianStore {
             })
         })
         .collect()
+    }
+
+    /// Persists a sanitized selector change after the controller confirms it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the event cannot be inserted.
+    pub fn record_route_switch(&self, event: &RouteSwitchEvent) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO route_switches(occurred_at, from_outlet, to_outlet, mode, reason, duration_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event.occurred_at,
+                event.from_outlet,
+                event.to_outlet,
+                event.mode,
+                event.reason,
+                i64::try_from(event.duration_ms).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the newest confirmed selector changes, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored rows cannot be queried.
+    pub fn recent_route_switches(&self, limit: u32) -> Result<Vec<RouteSwitchEvent>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT occurred_at, from_outlet, to_outlet, mode, reason, duration_ms FROM route_switches ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], |row| {
+            Ok(RouteSwitchEvent {
+                occurred_at: row.get(0)?,
+                from_outlet: row.get(1)?,
+                to_outlet: row.get(2)?,
+                mode: row.get(3)?,
+                reason: row.get(4)?,
+                duration_ms: u64::try_from(row.get::<_, i64>(5)?).unwrap_or(u64::MAX),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 }
 
@@ -414,6 +494,8 @@ mod tests {
             http_status: Some(204),
             latency_ms: Some(10),
             error_code: (status == HealthStatus::Down).then(|| "timeout".into()),
+            successful_targets: u32::from(status != HealthStatus::Down),
+            total_targets: 1,
         }
     }
 
@@ -486,5 +568,23 @@ mod tests {
         assert_eq!(summaries[0].failed_samples, 2);
         assert!((summaries[0].availability_percent - 66.666).abs() < 0.01);
         assert_eq!(summaries[0].last_status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn records_sanitized_route_switches() {
+        let store = GuardianStore::open_in_memory().expect("store");
+        let event = RouteSwitchEvent {
+            occurred_at: "2026-01-01T00:00:00Z".into(),
+            from_outlet: Some("subscription-a".into()),
+            to_outlet: "chaoshihui".into(),
+            mode: "priority".into(),
+            reason: "priority_policy".into(),
+            duration_ms: 12,
+        };
+        store.record_route_switch(&event).expect("record");
+        assert_eq!(
+            store.recent_route_switches(1).expect("list")[0].reason,
+            "priority_policy"
+        );
     }
 }

@@ -53,6 +53,10 @@ pub struct ProbeResult {
     pub http_status: Option<u16>,
     pub latency_ms: Option<u64>,
     pub error_code: Option<String>,
+    #[serde(default)]
+    pub successful_targets: u32,
+    #[serde(default = "default_target_count")]
+    pub total_targets: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,4 +89,20 @@ pub struct LatencySample {
     pub status: HealthStatus,
     pub latency_ms: Option<u64>,
     pub error_code: Option<String>,
+    pub successful_targets: u32,
+    pub total_targets: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteSwitchEvent {
+    pub occurred_at: String,
+    pub from_outlet: Option<String>,
+    pub to_outlet: String,
+    pub mode: String,
+    pub reason: String,
+    pub duration_ms: u64,
+}
+
+const fn default_target_count() -> u32 {
+    1
 }

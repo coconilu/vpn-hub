@@ -1,66 +1,49 @@
 import type { DashboardSnapshot, HealthStatus } from "../types";
 
-interface OutletRow {
-  id: string;
-  name: string;
-  status: string;
-  health: HealthStatus | "pending";
-  port: string;
-  latency: string;
-  availability: string;
-  lastDisconnect: string;
-  role: string;
-  selected?: boolean;
-}
-
-const formatTime = (value: string | null) => {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date(value));
-};
+const formatTime = (value: string | null) => value ? new Intl.DateTimeFormat("zh-CN", {
+  hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+}).format(new Date(value)) : "—";
 
 const statusText: Record<HealthStatus, string> = {
   unknown: "未知",
   healthy: "正常",
-  degraded: "退化",
-  down: "异常/端口可达",
+  degraded: "部分目标异常",
+  down: "不可用",
 };
 
 export function OutletTable({ snapshot }: { snapshot: DashboardSnapshot }) {
-  const live = snapshot.summaries.find((item) => item.outlet_id === "chaoshihui");
-  const rows: OutletRow[] = [
-    { id: "subscription", name: "订阅 A", status: "待配置", health: "pending", port: "—", latency: "—", availability: "—", lastDisconnect: "—", role: "备用" },
-    {
-      id: "chaoshihui",
-      name: "超实惠",
-      status: live ? statusText[live.last_status] : snapshot.upstream_entry.reachable ? "端口可达/待检测" : "端口未就绪",
-      health: live?.last_status ?? (snapshot.upstream_entry.reachable ? "unknown" : "down"),
-      port: "16666",
-      latency: live?.average_latency_ms == null ? "—" : `${Math.round(live.average_latency_ms)} ms`,
-      availability: live ? `${live.availability_percent.toFixed(1)}%` : "—",
-      lastDisconnect: formatTime(live?.last_observed_at ?? null),
-      role: "当前开发出口",
-      selected: true,
-    },
-    { id: "speedcat", name: "SpeedCat", status: "待迁移", health: "pending", port: "26666", latency: "—", availability: "—", lastDisconnect: "—", role: "备用" },
-  ];
+  const rows = [
+    { id: "subscription-a", name: "订阅 A", port: "provider", configured: snapshot.routing.subscription_configured },
+    { id: "chaoshihui", name: "超实惠", port: "16666", configured: true },
+  ].map((definition) => {
+    const summary = snapshot.summaries.find((item) => item.outlet_id === definition.id);
+    const health: HealthStatus | "pending" = definition.configured ? summary?.last_status ?? "unknown" : "pending";
+    return {
+      ...definition,
+      summary,
+      health,
+      status: definition.configured ? statusText[summary?.last_status ?? "unknown"] : "待本机配置",
+      selected: snapshot.routing.current_outlet === definition.id,
+    };
+  });
 
   return (
     <section className="table-section" aria-labelledby="outlets-title">
       <h2 id="outlets-title">出口状态</h2>
       <div className="table-scroll">
         <table>
-          <thead><tr><th>出口</th><th>状态</th><th>端口</th><th>当前延迟</th><th>24h 在线率</th><th>最近检测</th><th>角色</th></tr></thead>
-          <tbody>
-            {rows.map((row) => (
-              <tr className={row.selected ? "selected" : ""} key={row.id}>
-                <td className="outlet-name">{row.name}</td>
-                <td><span className={`status-cell ${row.health}`}><i />{row.status}</span></td>
-                <td className="mono">{row.port}</td>
-                <td className={row.health === "down" ? "danger-text" : ""}>{row.latency}</td>
-                <td>{row.availability}</td><td>{row.lastDisconnect}</td><td>{row.role}</td>
-              </tr>
-            ))}
-          </tbody>
+          <thead><tr><th>出口</th><th>状态</th><th>接入</th><th>平均延迟</th><th>历史可用率</th><th>最近检测</th><th>角色</th></tr></thead>
+          <tbody>{rows.map((row) => (
+            <tr className={row.selected ? "selected" : ""} key={row.id}>
+              <td className="outlet-name">{row.name}</td>
+              <td><span className={`status-cell ${row.health}`}><i />{row.status}</span></td>
+              <td className="mono">{row.port}</td>
+              <td className={row.health === "down" ? "danger-text" : ""}>{row.summary?.average_latency_ms == null ? "—" : `${Math.round(row.summary.average_latency_ms)} ms`}</td>
+              <td>{row.summary ? `${row.summary.availability_percent.toFixed(1)}%` : "—"}</td>
+              <td>{formatTime(row.summary?.last_observed_at ?? null)}</td>
+              <td>{row.selected ? "当前真实出口" : "候选出口"}</td>
+            </tr>
+          ))}</tbody>
         </table>
       </div>
     </section>

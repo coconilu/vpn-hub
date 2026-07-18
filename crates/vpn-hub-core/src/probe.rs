@@ -16,6 +16,8 @@ pub async fn probe_outlet(outlet: &OutletConfig, monitor: &MonitorConfig) -> Pro
         http_status: None,
         latency_ms: None,
         error_code: None,
+        successful_targets: 0,
+        total_targets: 1,
     };
 
     let Ok(socket_addr) = outlet.socket_addr() else {
@@ -56,6 +58,7 @@ pub async fn probe_outlet(outlet: &OutletConfig, monitor: &MonitorConfig) -> Pro
                 },
                 http_status: Some(status_code),
                 latency_ms: Some(elapsed_ms),
+                successful_targets: 1,
                 ..base
             }
         }
