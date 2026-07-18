@@ -4357,6 +4357,7 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "tempfile",
  "tokio",
  "vpn-hub-core",
 ]

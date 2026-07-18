@@ -65,7 +65,7 @@ export default function App() {
     }
     const status = await startDevelopmentCore();
     setNotice(status.message);
-    setSnapshot(await refreshGuardian());
+    await load();
   });
 
   const handleModeChange = (mode: RouteMode, manualOutlet: string | null) => runBusy(async () => {

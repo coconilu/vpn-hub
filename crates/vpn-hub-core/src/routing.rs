@@ -115,10 +115,17 @@ impl RoutingEngine {
                     .unwrap_or_else(|| FAIL_CLOSED_OUTLET.to_owned()),
                 "priority_policy",
             ),
-            RouteMode::Fastest => (
-                fastest_available(health).unwrap_or_else(|| FAIL_CLOSED_OUTLET.to_owned()),
-                "lowest_latency_policy",
-            ),
+            RouteMode::Fastest => {
+                let desired = fastest_available(health)
+                    .or_else(|| {
+                        self.current_outlet
+                            .as_ref()
+                            .filter(|id| is_available(health, id))
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| FAIL_CLOSED_OUTLET.to_owned());
+                (desired, "lowest_latency_policy")
+            }
             RouteMode::Manual => {
                 let manual = self.manual_outlet.as_deref();
                 if manual.is_some_and(|id| is_available(health, id)) {
@@ -153,8 +160,11 @@ impl RoutingEngine {
                 .and_then(|id| health.get(id))
                 .and_then(|item| item.latency_ms);
             let desired_latency = health.get(&desired).and_then(|item| item.latency_ms);
-            if matches!((current_latency, desired_latency), (Some(current), Some(candidate)) if candidate.saturating_add(policy.minimum_improvement_ms) >= current)
-            {
+            let (Some(current_latency), Some(desired_latency)) = (current_latency, desired_latency)
+            else {
+                return None;
+            };
+            if desired_latency.saturating_add(policy.minimum_improvement_ms) >= current_latency {
                 return None;
             }
         }
@@ -268,6 +278,40 @@ mod tests {
                 .expect("switch")
                 .to_outlet,
             SUBSCRIPTION_OUTLET
+        );
+    }
+
+    #[test]
+    fn fastest_keeps_healthy_current_when_current_latency_is_missing() {
+        let mut engine = RoutingEngine::new(RouteMode::Fastest, None);
+        let initial = health(&[
+            (SUBSCRIPTION_OUTLET, HealthStatus::Healthy, Some(100)),
+            (LOCAL_OUTLET, HealthStatus::Healthy, Some(200)),
+        ]);
+        let first = engine.evaluate(0, &initial, &policy()).expect("initial");
+        engine.apply(&first, 0);
+        assert_eq!(first.to_outlet, SUBSCRIPTION_OUTLET);
+
+        let missing_current_sample = health(&[
+            (SUBSCRIPTION_OUTLET, HealthStatus::Healthy, None),
+            (LOCAL_OUTLET, HealthStatus::Healthy, Some(50)),
+        ]);
+        assert!(
+            engine
+                .evaluate(120_000, &missing_current_sample, &policy())
+                .is_none()
+        );
+
+        let current_is_down = health(&[
+            (SUBSCRIPTION_OUTLET, HealthStatus::Down, None),
+            (LOCAL_OUTLET, HealthStatus::Healthy, Some(50)),
+        ]);
+        assert_eq!(
+            engine
+                .evaluate(120_001, &current_is_down, &policy())
+                .expect("failover")
+                .to_outlet,
+            LOCAL_OUTLET
         );
     }
 

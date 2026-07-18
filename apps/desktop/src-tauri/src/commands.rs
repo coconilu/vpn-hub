@@ -76,6 +76,11 @@ async fn record_direct_guardian_cycle(config_path: &Path) -> Result<u64, String>
 }
 
 async fn record_routing_cycle(state: &AppState) -> Result<u64, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    record_routing_cycle_locked(state).await
+}
+
+async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
     let private = state.private_config()?;
@@ -170,7 +175,7 @@ async fn probe_configured_outlets(
         unavailable_result(
             SUBSCRIPTION_OUTLET,
             "订阅 A",
-            "subscription_not_configured",
+            ProbeFailureCode::SubscriptionNotConfigured,
             private.probe_targets.len(),
         )
     };
@@ -194,7 +199,12 @@ async fn probe_controller_outlet(
         "超实惠"
     };
     let Some(proxy_name) = outlet_proxy_name(outlet_id) else {
-        return unavailable_result(outlet_id, label, "unknown_outlet", targets.len());
+        return unavailable_result(
+            outlet_id,
+            label,
+            ProbeFailureCode::UnknownOutlet,
+            targets.len(),
+        );
     };
     let mut delays = Vec::new();
     for target in targets {
@@ -236,7 +246,7 @@ fn classify_delays(delays: &[u64], total_targets: usize) -> (HealthStatus, Optio
 fn unavailable_result(
     outlet_id: &str,
     label: &str,
-    error_code: &str,
+    error_code: ProbeFailureCode,
     total_targets: usize,
 ) -> ProbeResult {
     ProbeResult {
@@ -247,9 +257,28 @@ fn unavailable_result(
         status: HealthStatus::Down,
         http_status: None,
         latency_ms: None,
-        error_code: Some(error_code.into()),
+        error_code: Some(error_code.as_str().into()),
         successful_targets: 0,
         total_targets: u32::try_from(total_targets).unwrap_or(u32::MAX),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProbeFailureCode {
+    SubscriptionNotConfigured,
+    UnknownOutlet,
+    #[cfg(test)]
+    ProviderFailed,
+}
+
+impl ProbeFailureCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SubscriptionNotConfigured => "subscription_not_configured",
+            Self::UnknownOutlet => "unknown_outlet",
+            #[cfg(test)]
+            Self::ProviderFailed => "provider_failed",
+        }
     }
 }
 
@@ -290,13 +319,17 @@ pub(crate) async fn monitor_guardian(app: AppHandle) {
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub fn get_dashboard_snapshot(state: State<'_, AppState>) -> Result<DashboardSnapshot, String> {
+pub async fn get_dashboard_snapshot(
+    state: State<'_, AppState>,
+) -> Result<DashboardSnapshot, String> {
+    let _transaction = state.lock_routing_transaction().await;
     load_dashboard(&state)
 }
 
 #[tauri::command]
 pub async fn refresh_guardian(state: State<'_, AppState>) -> Result<DashboardSnapshot, String> {
-    record_routing_cycle(&state).await?;
+    let _transaction = state.lock_routing_transaction().await;
+    record_routing_cycle_locked(&state).await?;
     load_dashboard(&state)
 }
 
@@ -307,32 +340,44 @@ pub async fn set_route_mode(
     mode: RouteMode,
     manual_outlet: Option<String>,
 ) -> Result<DashboardSnapshot, String> {
+    let _transaction = state.lock_routing_transaction().await;
     if state.controller_client()?.is_none() {
         return Err("请先启动开发核心；未连接 Controller 时不会伪装路由切换".into());
     }
     state.set_route_mode(mode, manual_outlet)?;
-    record_routing_cycle(&state).await?;
+    record_routing_cycle_locked(&state).await?;
     load_dashboard(&state)
 }
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub fn save_subscription_url(
+pub async fn save_subscription_url(
     state: State<'_, AppState>,
     subscription_url: String,
 ) -> Result<PrivateConfigSummary, String> {
+    let _transaction = state.lock_routing_transaction().await;
     state.save_subscription_url(&subscription_url)
 }
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub fn start_development_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
-    state.start_development_core()
+pub async fn start_development_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    let mut status = state.start_development_core()?;
+    if let Err(error) = record_routing_cycle_locked(&state).await {
+        let _ = state.stop_development_core();
+        return Err(format!(
+            "开发核心首次健康决策失败，已停止并保持 Fail Closed：{error}"
+        ));
+    }
+    status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();
+    Ok(status)
 }
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub fn stop_development_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
+pub async fn stop_development_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
+    let _transaction = state.lock_routing_transaction().await;
     state.stop_development_core()
 }
 
@@ -342,9 +387,19 @@ mod tests {
 
     #[test]
     fn unavailable_result_contains_no_target_details() {
-        let result = unavailable_result("subscription-a", "订阅 A", "provider_failed", 3);
+        let sensitive_url =
+            "https://example.invalid/provider/credential-token-value/node-detail-value";
+        let result = unavailable_result(
+            "subscription-a",
+            "订阅 A",
+            ProbeFailureCode::ProviderFailed,
+            3,
+        );
         let serialized = serde_json::to_string(&result).expect("serialize");
         assert!(!serialized.contains("://"));
+        for sensitive_part in [sensitive_url, "credential-token-value", "node-detail-value"] {
+            assert!(!serialized.contains(sensitive_part));
+        }
         assert_eq!(result.total_targets, 3);
     }
 

@@ -20,5 +20,8 @@ tauri = { version = "2.11.5", features = [] }
 tokio.workspace = true
 vpn-hub-core = { path = "../../../crates/vpn-hub-core" }
 
+[dev-dependencies]
+tempfile = "3.23.0"
+
 [lints]
 workspace = true

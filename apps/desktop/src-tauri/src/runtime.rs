@@ -1,6 +1,5 @@
 use std::{
-    env,
-    fs::{self, File, OpenOptions},
+    env, fs,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -69,6 +68,18 @@ pub struct AppState {
     runtime_directory: PathBuf,
     managed_core: Mutex<Option<ManagedCore>>,
     routing_engine: Mutex<RoutingEngine>,
+    routing_transaction: RoutingTransaction,
+}
+
+#[derive(Default)]
+struct RoutingTransaction {
+    gate: tokio::sync::Mutex<()>,
+}
+
+impl RoutingTransaction {
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.gate.lock().await
+    }
 }
 
 struct ManagedCore {
@@ -112,6 +123,7 @@ impl AppState {
             runtime_directory: data_directory.join("runtime"),
             managed_core: Mutex::new(None),
             routing_engine: Mutex::new(routing_engine),
+            routing_transaction: RoutingTransaction::default(),
         }
     }
 
@@ -136,11 +148,11 @@ impl AppState {
 
     pub fn routing_status(&self) -> Result<RoutingStatus, String> {
         let config = self.private_config()?;
+        let controller_ready = self.controller_client()?.is_some();
         let engine = self
             .routing_engine
             .lock()
             .map_err(|_| "路由策略状态锁已损坏".to_string())?;
-        let controller_ready = self.controller_client()?.is_some();
         Ok(RoutingStatus {
             mode: engine.mode(),
             current_outlet: engine.current_outlet().map(str::to_owned),
@@ -154,6 +166,10 @@ impl AppState {
                 "开发核心未运行，路由保持 Fail Closed".into()
             },
         })
+    }
+
+    pub async fn lock_routing_transaction(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.routing_transaction.lock().await
     }
 
     pub fn set_route_mode(
@@ -228,6 +244,8 @@ impl AppState {
             .is_some()
         {
             *guard = None;
+            drop(guard);
+            self.reset_routing_session()?;
             return Ok(None);
         }
         ControllerClient::new(
@@ -296,6 +314,7 @@ impl AppState {
         fs::create_dir_all(&self.runtime_directory)
             .map_err(|error| format!("无法创建 Mihomo 运行目录：{error}"))?;
         harden_private_path(&self.runtime_directory)?;
+        clear_legacy_raw_logs(&self.runtime_directory)?;
         let controller_secret = generate_controller_secret();
         let (yaml, _) = generate_mihomo_config(&private_config, &controller_secret)
             .map_err(|error| format!("无法生成 Mihomo 配置：{error}"))?;
@@ -310,25 +329,22 @@ impl AppState {
             .arg(&self.runtime_directory)
             .arg("-f")
             .arg(&config_path)
-            .output()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
             .map_err(|error| format!("无法验证 Mihomo 配置：{error}"))?;
-        if !validation.status.success() {
-            return Err("Mihomo 配置验证失败；详细信息仅保留在本机运行目录".into());
+        if !validation.success() {
+            return Err(core_diagnostic(CoreDiagnostic::ValidationFailed).into());
         }
 
-        let log_path = self.runtime_directory.join("mihomo.log");
-        let stdout = append_log(&log_path)?;
-        let stderr = stdout
-            .try_clone()
-            .map_err(|error| format!("无法复制 Mihomo 日志句柄：{error}"))?;
         let mut child = hidden_command(&executable)
             .arg("-d")
             .arg(&self.runtime_directory)
             .arg("-f")
             .arg(&config_path)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|error| format!("无法启动 Mihomo：{error}"))?;
 
@@ -343,7 +359,7 @@ impl AppState {
                 .map_err(|error| format!("无法读取 Mihomo 启动状态：{error}"))?
                 .is_some()
             {
-                return Err("Mihomo 在开发入口就绪前退出".into());
+                return Err(core_diagnostic(CoreDiagnostic::ExitedBeforeReady).into());
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -360,6 +376,10 @@ impl AppState {
 
         let pid = child.id();
         let started_at = chrono::Utc::now().to_rfc3339();
+        if let Err(error) = self.reset_routing_session() {
+            terminate_child(&mut child);
+            return Err(error);
+        }
         *guard = Some(ManagedCore {
             child,
             protected_owner_pid,
@@ -388,10 +408,7 @@ impl AppState {
         if listening_owner_pid(PROTECTED_PORT) != Some(core.protected_owner_pid) {
             return Err("开发核心停止后检测到 6666 所有者发生变化".into());
         }
-        self.routing_engine
-            .lock()
-            .map_err(|_| "路由策略状态锁已损坏".to_string())?
-            .restore_current(None, None);
+        self.reset_routing_session()?;
         Ok(CoreStatus {
             state: "stopped".into(),
             managed: false,
@@ -431,6 +448,10 @@ impl AppState {
         }
         Ok(executable)
     }
+
+    fn reset_routing_session(&self) -> Result<(), String> {
+        reset_routing_engine(&self.routing_engine)
+    }
 }
 
 impl Default for AppState {
@@ -452,12 +473,39 @@ fn local_data_directory(workspace_root: &Path) -> PathBuf {
     )
 }
 
-fn append_log(path: &Path) -> Result<File, String> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("无法打开 Mihomo 本机日志：{error}"))
+const LEGACY_RAW_LOGS: [&str; 2] = ["mihomo.log", "mihomo-desktop.log"];
+
+fn clear_legacy_raw_logs(runtime_directory: &Path) -> Result<(), String> {
+    for name in LEGACY_RAW_LOGS {
+        let path = runtime_directory.join(name);
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("无法清理旧版 Mihomo 原始日志".into()),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum CoreDiagnostic {
+    ValidationFailed,
+    ExitedBeforeReady,
+}
+
+const fn core_diagnostic(diagnostic: CoreDiagnostic) -> &'static str {
+    match diagnostic {
+        CoreDiagnostic::ValidationFailed => "Mihomo 配置验证失败（原始输出已丢弃）",
+        CoreDiagnostic::ExitedBeforeReady => "Mihomo 在开发入口就绪前退出（原始输出已丢弃）",
+    }
+}
+
+fn reset_routing_engine(engine: &Mutex<RoutingEngine>) -> Result<(), String> {
+    engine
+        .lock()
+        .map_err(|_| "路由策略状态锁已损坏".to_string())?
+        .restore_current(None, None);
+    Ok(())
 }
 
 fn prepare_local_guardian_config(data_directory: &Path, workspace_root: &Path) -> PathBuf {
@@ -553,7 +601,125 @@ fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
-    use vpn_hub_core::{LOCAL_PROXY, MASTER_SELECTOR};
+    use std::sync::Arc;
+    use vpn_hub_core::{
+        HealthStatus, LOCAL_OUTLET, LOCAL_PROXY, MASTER_SELECTOR, OutletHealth, RoutingPolicy,
+    };
+
+    #[test]
+    fn credential_bearing_url_is_absent_from_diagnostics_and_ui_summary() {
+        let sensitive_url =
+            "https://example.invalid/provider/credential-token-value/node-detail-value";
+        let mut config = PrivateRoutingConfig::default();
+        config
+            .set_subscription_url(sensitive_url)
+            .expect("synthetic URL");
+        let rejected_url = "https://user:credential-token-value@example.invalid/node-detail-value";
+        let rejected_error = config
+            .set_subscription_url(rejected_url)
+            .expect_err("userinfo must be rejected")
+            .to_string();
+        let ui_summary = serde_json::to_string(&config.summary()).expect("summary");
+        let diagnostics = [
+            core_diagnostic(CoreDiagnostic::ValidationFailed),
+            core_diagnostic(CoreDiagnostic::ExitedBeforeReady),
+        ]
+        .join(" ");
+        for sensitive_part in [sensitive_url, "credential-token-value", "node-detail-value"] {
+            assert!(!ui_summary.contains(sensitive_part));
+            assert!(!diagnostics.contains(sensitive_part));
+            assert!(!rejected_error.contains(sensitive_part));
+        }
+        let directory = tempfile::tempdir().expect("tempdir");
+        for name in LEGACY_RAW_LOGS {
+            fs::write(directory.path().join(name), sensitive_url).expect("synthetic legacy log");
+        }
+        clear_legacy_raw_logs(directory.path()).expect("clear raw logs");
+        for name in LEGACY_RAW_LOGS {
+            assert!(!directory.path().join(name).exists());
+        }
+    }
+
+    #[test]
+    fn core_exit_and_restart_reset_current_route_session() {
+        let engine = Mutex::new(RoutingEngine::new(RouteMode::Priority, None));
+        let health = [(
+            LOCAL_OUTLET.to_owned(),
+            OutletHealth {
+                status: HealthStatus::Healthy,
+                latency_ms: Some(100),
+            },
+        )]
+        .into_iter()
+        .collect();
+        let policy = RoutingPolicy {
+            priority: vec![LOCAL_OUTLET.into()],
+            cooldown_ms: 60_000,
+            minimum_improvement_ms: 100,
+        };
+
+        let decision = engine
+            .lock()
+            .expect("engine")
+            .evaluate(100, &health, &policy)
+            .expect("initial decision");
+        engine.lock().expect("engine").apply(&decision, 100);
+        reset_routing_engine(&engine).expect("unexpected exit reset");
+        assert!(engine.lock().expect("engine").current_outlet().is_none());
+
+        let restarted = engine
+            .lock()
+            .expect("engine")
+            .evaluate(101, &health, &policy)
+            .expect("new core must select through Controller again");
+        engine.lock().expect("engine").apply(&restarted, 101);
+        reset_routing_engine(&engine).expect("successful new core reset");
+        assert!(engine.lock().expect("engine").current_outlet().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn routing_transactions_serialize_probe_put_apply_order() {
+        let transaction = Arc::new(RoutingTransaction::default());
+        let events = Arc::new(tokio::sync::Mutex::new(Vec::<&'static str>::new()));
+        let first_locked = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let second_attempted = Arc::new(tokio::sync::Notify::new());
+
+        let first = {
+            let transaction = Arc::clone(&transaction);
+            let events = Arc::clone(&events);
+            let first_locked = Arc::clone(&first_locked);
+            let release_first = Arc::clone(&release_first);
+            tokio::spawn(async move {
+                let _guard = transaction.lock().await;
+                events.lock().await.push("probe-1");
+                first_locked.notify_one();
+                release_first.notified().await;
+                events.lock().await.extend(["put-1", "apply-1"]);
+            })
+        };
+        first_locked.notified().await;
+        let second = {
+            let transaction = Arc::clone(&transaction);
+            let events = Arc::clone(&events);
+            let second_attempted = Arc::clone(&second_attempted);
+            tokio::spawn(async move {
+                second_attempted.notify_one();
+                let _guard = transaction.lock().await;
+                events.lock().await.extend(["probe-2", "put-2", "apply-2"]);
+            })
+        };
+        second_attempted.notified().await;
+        tokio::task::yield_now().await;
+        assert_eq!(*events.lock().await, ["probe-1"]);
+        release_first.notify_one();
+        first.await.expect("first cycle");
+        second.await.expect("second cycle");
+        assert_eq!(
+            *events.lock().await,
+            ["probe-1", "put-1", "apply-1", "probe-2", "put-2", "apply-2"]
+        );
+    }
 
     #[test]
     #[ignore = "requires the pinned Mihomo binary and live local outlet on 16666"]
