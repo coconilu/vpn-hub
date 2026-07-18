@@ -2,7 +2,7 @@
 
 面向 Windows 的本地多出口 VPN/代理编排客户端。它计划把一个远程订阅和多个已安装客户端统一接入一个稳定入口，并提供健康检测、自动切换和历史记录。
 
-> 当前状态：方案已 Review，Phase 0 已确认本地客户端 A 可在 `16666` 与现有 `6666` 出口并行运行；开发 Mihomo 链路已在隔离端口 `36666` 验证。仓库暂不提供可运行安装包。
+> 当前状态：Phase 0 的 `16666` 兼容性与 `36666 → Mihomo → 16666` 隔离链路已经验证；Phase 3 桌面端已有可运行的 Tauri/React 开发版本和本地 NSIS 构建。当前版本仍不接管 `6666`，也不是三出口正式发行版。
 
 ## 核心约束
 
@@ -41,6 +41,8 @@ flowchart LR
 | [Mihomo 开发隔离](docs/mihomo-development.md) | 校验 sidecar 并在 `36666` 验证本地编排链路 |
 | [兼容性实测](docs/compatibility/2026-07-18-chaoshihui.md) | 本地客户端 A 使用 `16666` 的首轮验证证据 |
 | [Mihomo 链路实测](docs/compatibility/2026-07-18-mihomo-chain.md) | `36666 → Mihomo → 16666` 的隔离验证证据 |
+| [桌面 UI 设计系统](docs/desktop-design-system.md) | 视觉概念、正确端口值、组件和响应式约束 |
+| [桌面端视觉验收](docs/qa/desktop-fidelity-ledger.md) | 概念图与浏览器实装的逐项对照结果 |
 | [贡献指南](CONTRIBUTING.md) | 如何提交兼容性报告和代码变更 |
 | [安全策略](SECURITY.md) | 敏感配置处理和漏洞报告规则 |
 
@@ -59,6 +61,35 @@ cargo run -p vpn-hub-cli -- summary --database data/guardian-dev.db
 ```
 
 Guardian 只输出和保存字段白名单，不会记录订阅 URL、节点地址、认证信息、访问目标历史或流量正文。
+
+## Desktop App
+
+桌面端位于 `apps/desktop`，由 React/Vite 前端和 Tauri 2 Rust 后端组成。它目前提供：
+
+| 能力 | 当前实现 |
+|---|---|
+| 端口保护 | 只读展示 `6666` 状态；后端没有修改系统代理或绑定 `6666` 的命令 |
+| Guardian | 启动后立即检测，之后按本地配置每 180 秒检测 `16666`，结果写入用户本地 SQLite |
+| 历史展示 | 出口汇总、延迟趋势和最近状态事件 |
+| Mihomo | 只启动/停止本应用自己创建的 `36666` 开发进程；未知进程不会被终止 |
+| 三出口路由 | 尚未接入；订阅 A 和 SpeedCat 在界面中明确显示为待配置/待迁移 |
+
+开发运行：
+
+```powershell
+cd apps/desktop
+npm install
+npm run tauri dev
+```
+
+构建 Windows 安装包：
+
+```powershell
+cd apps/desktop
+npm run tauri build -- --bundles nsis
+```
+
+安装包输出到 `target/release/bundle/nsis/`。Mihomo 二进制不提交到仓库；在当前开发阶段，启动开发核心前仍需先运行 `scripts/fetch-mihomo.ps1`。
 
 ## 非目标
 

@@ -14,6 +14,8 @@ secrets/
 *.log
 logs/
 data/
+!apps/desktop/src/data/
+!apps/desktop/src/data/mock.ts
 .tools/
 
 # Build output
@@ -21,6 +23,18 @@ target/
 dist/
 node_modules/
 src-tauri/target/
+*.tsbuildinfo
+apps/desktop/vite.config.js
+apps/desktop/vite.config.d.ts
+apps/desktop/src-tauri/gen/
+
+# Tauri icon generator emits mobile/store variants that this Windows-only app
+# does not ship. Keep only the four files referenced by tauri.conf.json.
+apps/desktop/src-tauri/icons/*
+!apps/desktop/src-tauri/icons/32x32.png
+!apps/desktop/src-tauri/icons/128x128.png
+!apps/desktop/src-tauri/icons/128x128@2x.png
+!apps/desktop/src-tauri/icons/icon.ico
 
 # Editors and OS
 .idea/

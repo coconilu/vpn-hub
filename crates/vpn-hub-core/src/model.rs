@@ -76,3 +76,13 @@ pub struct OutletSummary {
     pub last_status: HealthStatus,
     pub last_observed_at: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatencySample {
+    pub outlet_id: String,
+    pub observed_at: String,
+    pub port_reachable: bool,
+    pub status: HealthStatus,
+    pub latency_ms: Option<u64>,
+    pub error_code: Option<String>,
+}

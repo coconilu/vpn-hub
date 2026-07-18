@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vpn-hub-cli", "crates/vpn-hub-core"]
+members = ["apps/desktop/src-tauri", "crates/vpn-hub-cli", "crates/vpn-hub-core"]
 resolver = "2"
 
 [workspace.package]
