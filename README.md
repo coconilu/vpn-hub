@@ -2,7 +2,7 @@
 
 面向 Windows 的本地多出口 VPN/代理编排客户端。它计划把一个远程订阅和多个已安装客户端统一接入一个稳定入口，并提供健康检测、自动切换和历史记录。
 
-> 当前状态：方案已 Review，正在进行 Phase 0 兼容性验证。仓库暂不提供可运行安装包。
+> 当前状态：方案已 Review，Phase 0 已确认本地客户端 A 可在 `16666` 与现有 `6666` 出口并行运行；开发 Mihomo 链路已在隔离端口 `36666` 验证。仓库暂不提供可运行安装包。
 
 ## 核心约束
 
@@ -36,12 +36,29 @@ flowchart LR
 | [完整设计方案](docs/design.md) | 架构、路由、健康检测、数据库、UI、安全和验收标准 |
 | [已确认决策](docs/decisions.md) | Review 后锁定的默认选择与不可变约束 |
 | [实施路线图](docs/roadmap.md) | 从兼容性验证到正式发行的阶段计划 |
+| [开发安全边界](docs/development.md) | 如何在不接管现有 `6666` 的前提下开发和测试 |
+| [Guardian 设计与使用](docs/guardian.md) | Rust 健康检测、SQLite 状态机和 CLI 使用方法 |
+| [Mihomo 开发隔离](docs/mihomo-development.md) | 校验 sidecar 并在 `36666` 验证本地编排链路 |
+| [兼容性实测](docs/compatibility/2026-07-18-chaoshihui.md) | 本地客户端 A 使用 `16666` 的首轮验证证据 |
+| [Mihomo 链路实测](docs/compatibility/2026-07-18-mihomo-chain.md) | `36666 → Mihomo → 16666` 的隔离验证证据 |
 | [贡献指南](CONTRIBUTING.md) | 如何提交兼容性报告和代码变更 |
 | [安全策略](SECURITY.md) | 敏感配置处理和漏洞报告规则 |
 
 ## 当前优先事项
 
-Phase 0 必须先证明两个外部客户端可以同时运行，并分别暴露 `16666` 和 `26666`。如果客户端强制占用 `6666`，同一 Windows 网络命名空间内的并行编排就不成立，需要厂商支持、虚拟机隔离或改为顺序切换。
+Phase 0 已证明本地客户端 A 可以暴露 `16666`，并与当前占用 `6666` 的本地客户端 B 同时运行。剩余硬门槛是把客户端 B 迁移到 `26666`，并完成 UDP、长时间稳定性与重启恢复验证。在迁移完成前，开发环境不得绑定、关闭或修改 `6666`。
+
+## Guardian CLI
+
+当前已提供不修改系统代理的 Rust Guardian 原型。开发配置只探测 `127.0.0.1:16666`：
+
+```powershell
+cargo run -p vpn-hub-cli -- check --config config/development.toml
+cargo run -p vpn-hub-cli -- monitor --config config/development.toml --cycles 5
+cargo run -p vpn-hub-cli -- summary --database data/guardian-dev.db
+```
+
+Guardian 只输出和保存字段白名单，不会记录订阅 URL、节点地址、认证信息、访问目标历史或流量正文。
 
 ## 非目标
 
