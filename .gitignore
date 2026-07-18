@@ -1,0 +1,29 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+config/local.*
+config/runtime.*
+providers/
+secrets/
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+*.log
+logs/
+data/
+
+# Build output
+target/
+dist/
+node_modules/
+src-tauri/target/
+
+# Editors and OS
+.idea/
+.vscode/
+*.user
+Thumbs.db
+Desktop.ini
