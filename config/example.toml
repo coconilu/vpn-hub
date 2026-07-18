@@ -1,0 +1,25 @@
+# Example production topology. Do not add real subscription URLs or secrets.
+database_path = "../data/guardian.db"
+
+[monitor]
+interval_seconds = 15
+connect_timeout_ms = 1500
+request_timeout_ms = 8000
+failure_threshold = 2
+recovery_threshold = 3
+
+[[outlets]]
+id = "local-a"
+label = "Local client A"
+proxy_url = "socks5h://127.0.0.1:16666"
+probe_url = "https://www.gstatic.com/generate_204"
+degraded_latency_ms = 2500
+enabled = true
+
+[[outlets]]
+id = "local-b"
+label = "Local client B"
+proxy_url = "socks5h://127.0.0.1:26666"
+probe_url = "https://www.gstatic.com/generate_204"
+degraded_latency_ms = 2500
+enabled = true

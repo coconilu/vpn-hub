@@ -14,6 +14,7 @@ secrets/
 *.log
 logs/
 data/
+.tools/
 
 # Build output
 target/

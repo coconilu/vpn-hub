@@ -1,0 +1,31 @@
+# Development-only Mihomo topology.
+# This file must never bind, modify, or replace the protected port 6666.
+mixed-port: 36666
+bind-address: 127.0.0.1
+allow-lan: false
+mode: rule
+log-level: warning
+ipv6: false
+find-process-mode: "off"
+unified-delay: true
+tcp-concurrent: true
+
+profile:
+  store-selected: false
+  store-fake-ip: false
+
+proxies:
+  - name: OUT-LOCAL-A
+    type: socks5
+    server: 127.0.0.1
+    port: 16666
+    udp: false
+
+proxy-groups:
+  - name: MASTER
+    type: select
+    proxies:
+      - OUT-LOCAL-A
+
+rules:
+  - MATCH,MASTER
