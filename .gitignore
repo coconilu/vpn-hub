@@ -14,6 +14,8 @@ secrets/
 *.log
 logs/
 data/
+!apps/desktop/src/data/
+!apps/desktop/src/data/mock.ts
 .tools/
 
 # Build output

@@ -1,0 +1,64 @@
+import type { DashboardSnapshot, HealthStatus, LatencySample } from "../types";
+
+const now = Date.now();
+const latencyValues = [182, 194, 178, 216, 228, 205, null, null, 241, 220, 201, 190, 231, 248, 226, 214, null, null, 264, 238, 217, 202, 194, 228];
+
+const samples: LatencySample[] = latencyValues.map((latency, index) => ({
+  outlet_id: "chaoshihui",
+  observed_at: new Date(now - (latencyValues.length - 1 - index) * 60 * 60 * 1000).toISOString(),
+  port_reachable: true,
+  status: (latency === null ? "down" : latency > 230 ? "degraded" : "healthy") as HealthStatus,
+  latency_ms: latency,
+  error_code: latency === null ? "request_timeout" : null,
+}));
+
+export const mockSnapshot: DashboardSnapshot = {
+  updated_at: new Date(now).toISOString(),
+  protected_entry: { port: 6666, reachable: true, owner_pid: 64908 },
+  development_entry: { port: 36666, reachable: false, owner_pid: null },
+  upstream_entry: { port: 16666, reachable: true, owner_pid: 70700 },
+  mihomo: {
+    state: "stopped",
+    managed: false,
+    pid: null,
+    started_at: null,
+    message: "开发核心已停止",
+  },
+  summaries: [
+    {
+      outlet_id: "chaoshihui",
+      label: "超实惠",
+      samples: 72,
+      successful_samples: 63,
+      failed_samples: 9,
+      availability_percent: 87.6,
+      average_latency_ms: 228,
+      last_status: "down",
+      last_observed_at: new Date(now - 4 * 60 * 1000).toISOString(),
+    },
+  ],
+  samples,
+  events: [
+    {
+      outlet_id: "chaoshihui",
+      occurred_at: new Date(now - 4 * 60 * 1000).toISOString(),
+      from_status: "healthy",
+      to_status: "down",
+      reason: "request_timeout",
+    },
+    {
+      outlet_id: "chaoshihui",
+      occurred_at: new Date(now - 9 * 60 * 1000).toISOString(),
+      from_status: "down",
+      to_status: "healthy",
+      reason: "probe_result",
+    },
+    {
+      outlet_id: "chaoshihui",
+      occurred_at: new Date(now - 14 * 60 * 1000).toISOString(),
+      from_status: "unknown",
+      to_status: "healthy",
+      reason: "port_reachable",
+    },
+  ],
+};
