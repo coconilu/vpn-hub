@@ -420,4 +420,25 @@ mod tests {
             (HealthStatus::Healthy, Some(100))
         );
     }
+
+    #[tokio::test]
+    async fn clean_data_dashboard_and_refresh_work_without_static_outlets() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_directory = directory.path().join("clean-app-data");
+        let state = AppState::new_for_test(workspace_root, &data_directory);
+
+        let initial = load_dashboard(&state).expect("clean dashboard");
+        assert_eq!(initial.entry.host, "127.0.0.1");
+        assert_eq!(initial.entry.port, 3_666);
+        assert!(initial.routing.outlets.is_empty());
+
+        let interval = record_routing_cycle_locked(&state)
+            .await
+            .expect("clean refresh");
+        assert_eq!(interval, 180);
+        let refreshed = load_dashboard(&state).expect("refreshed dashboard");
+        assert!(refreshed.routing.outlets.is_empty());
+        assert!(refreshed.summaries.is_empty());
+    }
 }

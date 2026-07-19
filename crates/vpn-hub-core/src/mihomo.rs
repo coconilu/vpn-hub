@@ -15,6 +15,7 @@ const DEFAULT_ENTRY_PORT: u16 = 3_666;
 const LEGACY_SUBSCRIPTION_ID: &str = "subscription-a";
 const LEGACY_LOCAL_ID: &str = "chaoshihui";
 const LEGACY_SECRET_REF: &str = "legacy.subscription-a";
+const RESERVED_OUTLET_IDS: [&str; 1] = ["fail-closed"];
 
 pub type ResolvedSubscriptionUrls = BTreeMap<String, String>;
 
@@ -363,16 +364,16 @@ impl PrivateRoutingConfig {
         legacy.validate()?;
         let mut outlets = Vec::new();
         let mut legacy_subscription_urls = BTreeMap::new();
+        outlets.push(OutletConfig {
+            id: LEGACY_SUBSCRIPTION_ID.into(),
+            label: "Subscription A".into(),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: LEGACY_SECRET_REF.into(),
+                provider_update_seconds: legacy.provider_update_seconds,
+            },
+        });
         if !legacy.subscription_url.is_empty() {
-            outlets.push(OutletConfig {
-                id: LEGACY_SUBSCRIPTION_ID.into(),
-                label: "Subscription A".into(),
-                enabled: true,
-                kind: OutletKind::Subscription {
-                    secret_ref: LEGACY_SECRET_REF.into(),
-                    provider_update_seconds: legacy.provider_update_seconds,
-                },
-            });
             legacy_subscription_urls
                 .insert(LEGACY_SECRET_REF.into(), legacy.subscription_url.clone());
         }
@@ -728,6 +729,11 @@ fn validate_subscription_url(value: &str) -> Result<(), PrivateConfigError> {
 }
 
 fn validate_outlet_id(id: &str) -> Result<(), PrivateConfigError> {
+    if RESERVED_OUTLET_IDS.contains(&id) {
+        return Err(PrivateConfigError::Invalid(format!(
+            "outlet id is reserved by the routing engine: {id}"
+        )));
+    }
     let mut chars = id.chars();
     let valid_first = chars
         .next()
@@ -1001,6 +1007,19 @@ mod tests {
     }
 
     #[test]
+    fn reserved_fail_closed_id_is_rejected_before_generation() {
+        let config = PrivateRoutingConfig {
+            outlets: vec![local("fail-closed", "socks5h://127.0.0.1:2666", true)],
+            ..PrivateRoutingConfig::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(PrivateConfigError::Invalid(message)) if message.contains("reserved")
+        ));
+        assert!(generate_mihomo_config(&config, &BTreeMap::new(), "test-secret").is_err());
+    }
+
+    #[test]
     fn migrates_legacy_dual_outlet_without_exposing_url_in_summary() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("routing.toml");
@@ -1023,6 +1042,33 @@ probe_targets = ["https://a.invalid/", "https://b.invalid/"]
             .expect("summary");
         assert!(!summary.contains("credential-token"));
         assert!(!summary.contains("example.invalid"));
+    }
+
+    #[test]
+    fn migrates_empty_legacy_subscription_slot_and_manual_reference() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("routing.toml");
+        let legacy = r#"
+subscription_url = ""
+provider_update_seconds = 180
+controller_port = 39090
+route_mode = "manual"
+manual_outlet = "subscription-a"
+priority = ["chaoshihui", "subscription-a"]
+cooldown_seconds = 60
+minimum_improvement_ms = 150
+probe_targets = ["https://a.invalid/", "https://b.invalid/"]
+"#;
+        fs::write(&path, legacy).expect("legacy file");
+        let config = PrivateRoutingConfig::load(&path).expect("migrate");
+        assert_eq!(config.manual_outlet.as_deref(), Some("subscription-a"));
+        assert_eq!(config.priority(), ["chaoshihui", "subscription-a"]);
+        assert_eq!(config.outlets.len(), 2);
+        assert!(config.resolved_subscription_urls().is_empty());
+        assert!(matches!(
+            config.outlets[1].kind,
+            OutletKind::Subscription { .. }
+        ));
     }
 
     #[test]

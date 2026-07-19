@@ -67,12 +67,27 @@ impl GuardianConfig {
         Ok(config)
     }
 
+    /// Loads a standalone Guardian configuration that must contain at least
+    /// one enabled static proxy outlet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read, parsed, validated, or
+    /// has no enabled static outlet.
+    pub fn load_static(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let config = Self::load(path)?;
+        config.validate_static_outlets()?;
+        Ok(config)
+    }
+
     /// Validates safety and state-machine constraints.
     ///
     /// # Errors
     ///
     /// Returns an error for duplicate outlet IDs, remote proxy hosts, invalid
-    /// URLs, zero thresholds, or an empty enabled outlet set.
+    /// URLs or zero thresholds. An empty outlet set is valid for the desktop
+    /// monitor-only configuration because its dynamic outlets are loaded from
+    /// the versioned routing config.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.monitor.interval_seconds == 0 {
             return Err(ConfigError::Invalid(
@@ -101,6 +116,15 @@ impl GuardianConfig {
             validate_proxy_url(outlet)?;
             validate_probe_url(outlet)?;
         }
+        Ok(())
+    }
+
+    /// Requires at least one enabled outlet for standalone Guardian CLI runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no static outlet is enabled.
+    pub fn validate_static_outlets(&self) -> Result<(), ConfigError> {
         if !self.outlets.iter().any(|outlet| outlet.enabled) {
             return Err(ConfigError::Invalid(
                 "at least one outlet must be enabled".into(),
@@ -230,5 +254,16 @@ mod tests {
         let mut config = base_config();
         config.outlets.push(config.outlets[0].clone());
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    #[test]
+    fn monitor_only_config_allows_empty_outlets_but_static_mode_rejects_them() {
+        let mut config = base_config();
+        config.outlets.clear();
+        assert!(config.validate().is_ok());
+        assert!(matches!(
+            config.validate_static_outlets(),
+            Err(ConfigError::Invalid(_))
+        ));
     }
 }

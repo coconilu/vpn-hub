@@ -130,7 +130,7 @@ impl AppState {
     }
 
     #[cfg(test)]
-    fn new_for_test(workspace_root: PathBuf, data_directory: &Path) -> Self {
+    pub(crate) fn new_for_test(workspace_root: PathBuf, data_directory: &Path) -> Self {
         Self::new_with_data_directory(workspace_root, data_directory, None)
     }
 

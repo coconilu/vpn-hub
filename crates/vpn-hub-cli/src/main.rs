@@ -53,7 +53,7 @@ async fn main() -> ExitCode {
 async fn run() -> Result<ExitCode> {
     match Cli::parse().command {
         Command::Check { config, json } => {
-            let config = GuardianConfig::load(&config)
+            let config = GuardianConfig::load_static(&config)
                 .with_context(|| format!("loading {}", config.display()))?;
             let mut store = GuardianStore::open(&config.database_path)?;
             let results = run_cycle(&config, &mut store).await?;
@@ -96,7 +96,7 @@ async fn run() -> Result<ExitCode> {
 
 async fn monitor(path: &PathBuf, cycles: Option<u64>, json: bool) -> Result<ExitCode> {
     let config =
-        GuardianConfig::load(path).with_context(|| format!("loading {}", path.display()))?;
+        GuardianConfig::load_static(path).with_context(|| format!("loading {}", path.display()))?;
     let mut store = GuardianStore::open(&config.database_path)?;
     let mut ticker = tokio::time::interval(Duration::from_secs(config.monitor.interval_seconds));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
