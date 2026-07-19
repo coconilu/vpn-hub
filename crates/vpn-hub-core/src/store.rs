@@ -20,6 +20,8 @@ pub enum StoreError {
     InvalidStatus(String),
     #[error("invalid stored UDP capability: {0}")]
     InvalidUdpCapability(String),
+    #[error("UDP configuration generation is outside the supported SQLite integer range")]
+    InvalidUdpGeneration,
     #[error("database version {0} is newer than this application supports")]
     UnsupportedDatabaseVersion(i64),
 }
@@ -459,6 +461,10 @@ impl GuardianStore {
         label: &str,
         evidence: &UdpCapabilityEvidence,
     ) -> Result<(), StoreError> {
+        let configuration_generation = i64::try_from(evidence.configuration_generation)
+            .ok()
+            .filter(|generation| *generation != i64::MAX)
+            .ok_or(StoreError::InvalidUdpGeneration)?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
             r"INSERT INTO outlets(id, label, updated_at) VALUES (?1, ?2, ?3)
@@ -475,7 +481,7 @@ impl GuardianStore {
                 evidence.probe_version,
                 evidence.model_version,
                 evidence.configuration_fingerprint,
-                i64::try_from(evidence.configuration_generation).unwrap_or(i64::MAX),
+                configuration_generation,
                 evidence.reason_code,
             ],
         )?;
@@ -649,6 +655,7 @@ fn next_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn outlet() -> ProbeOutletConfig {
         ProbeOutletConfig {
@@ -824,6 +831,117 @@ mod tests {
             store.summaries().expect("TCP summary")[0].last_status,
             HealthStatus::Healthy,
             "UDP evidence must not alter Guardian TCP health"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn high_bit_configuration_survives_restart_for_generator_and_guardian_selector() {
+        let outlet = (10_000..u16::MAX)
+            .map(|port| crate::OutletConfig {
+                id: "high-bit-local".into(),
+                label: "High bit local".into(),
+                enabled: true,
+                kind: crate::OutletKind::LocalProxy {
+                    endpoint: format!("socks5://127.0.0.1:{port}"),
+                },
+            })
+            .find(|candidate| {
+                let digest = Sha256::digest(serde_json::to_vec(candidate).expect("serialize"));
+                digest[0] & 0x80 != 0
+            })
+            .expect("a high-bit SHA-256 fixture");
+        let raw_digest = Sha256::digest(serde_json::to_vec(&outlet).expect("serialize"));
+        assert_ne!(raw_digest[0] & 0x80, 0, "fixture must exercise high bit");
+
+        let mut evidence = crate::unknown_udp_evidence(&outlet, "test");
+        evidence.status = UdpCapabilityStatus::Supported;
+        assert!(i64::try_from(evidence.configuration_generation).is_ok());
+        assert_ne!(evidence.configuration_generation, i64::MAX as u64);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("guardian.db");
+        {
+            let mut store = GuardianStore::open(&path).expect("create store");
+            store
+                .record_udp_capability(&outlet.id, &outlet.label, &evidence)
+                .expect("persist supported evidence");
+        }
+
+        let store = GuardianStore::open(&path).expect("restart store");
+        let restored = store.udp_capabilities().expect("restored evidence");
+        assert_eq!(
+            restored[0].configuration_generation,
+            evidence.configuration_generation
+        );
+        assert_eq!(
+            crate::current_udp_status(&outlet, restored.first()),
+            UdpCapabilityStatus::Supported
+        );
+        let mut config = crate::PrivateRoutingConfig::default();
+        config.entry = crate::EntryConfig {
+            host: "127.0.0.1".into(),
+            port: 45_123,
+        };
+        config.controller_port = 45_124;
+        config.outlets = vec![outlet.clone()];
+        let capabilities = restored
+            .iter()
+            .map(|item| (item.outlet_id.clone(), item.clone()))
+            .collect();
+        let (yaml, _) = crate::generate_mihomo_config_with_udp_capabilities(
+            &config,
+            &crate::ResolvedSubscriptionUrls::new(),
+            "test-secret",
+            &capabilities,
+        )
+        .expect("generate after restart");
+        let document = serde_yaml::from_str::<serde_yaml::Value>(&yaml).expect("runtime yaml");
+        let udp_candidates = document
+            .get("proxy-groups")
+            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(|groups| {
+                groups.iter().find(|group| {
+                    group.get("name").and_then(serde_yaml::Value::as_str)
+                        == Some(crate::UDP_SELECTOR)
+                })
+            })
+            .and_then(|group| group.get("proxies"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("UDP selector candidates")
+            .iter()
+            .filter_map(serde_yaml::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            udp_candidates,
+            [
+                crate::outlet_proxy_name(&outlet.id),
+                crate::FAIL_CLOSED_PROXY.into()
+            ]
+        );
+        assert_eq!(
+            crate::guardian_cycle::udp_selector_target(&config, Some(&outlet.id), &restored),
+            crate::outlet_proxy_name(&outlet.id)
+        );
+        drop(store);
+
+        let connection = Connection::open(&path).expect("open legacy-clamped evidence");
+        connection
+            .execute(
+                "UPDATE udp_capability_history SET configuration_generation=?1",
+                [i64::MAX],
+            )
+            .expect("seed previously clamped generation");
+        drop(connection);
+        let store = GuardianStore::open(&path).expect("restart legacy-clamped store");
+        let clamped = store.udp_capabilities().expect("clamped evidence");
+        assert_eq!(clamped[0].configuration_generation, i64::MAX as u64);
+        assert_eq!(
+            crate::current_udp_status(&outlet, clamped.first()),
+            UdpCapabilityStatus::Unknown
+        );
+        assert_eq!(
+            crate::guardian_cycle::udp_selector_target(&config, Some(&outlet.id), &clamped),
+            crate::FAIL_CLOSED_PROXY
         );
     }
 

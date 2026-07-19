@@ -66,6 +66,7 @@ pub fn is_current_udp_evidence(outlet: &OutletConfig, evidence: &UdpCapabilityEv
         && evidence.probe_version == UDP_PROBE_VERSION
         && evidence.model_version == UDP_MODEL_VERSION
         && evidence.configuration_fingerprint == fingerprint
+        && evidence.configuration_generation != i64::MAX as u64
         && evidence.configuration_generation == generation
 }
 
@@ -92,7 +93,13 @@ pub fn outlet_udp_configuration(outlet: &OutletConfig) -> (String, u64) {
     let generation = digest
         .iter()
         .take(8)
-        .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte));
+        .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte))
+        & (i64::MAX as u64);
+    let generation = if generation == i64::MAX as u64 {
+        i64::MAX as u64 - 1
+    } else {
+        generation
+    };
     (fingerprint, generation)
 }
 
@@ -257,7 +264,7 @@ fn read_socks5_reply(stream: &mut TcpStream) -> Result<SocketAddr, UdpProbeError
     stream
         .read_exact(&mut header)
         .map_err(|_| UdpProbeError::Unavailable)?;
-    if header[0] != 5 {
+    if header[0] != 5 || header[2] != 0 {
         return Err(UdpProbeError::InvalidResponse);
     }
     if header[1] != 0 {
@@ -352,6 +359,14 @@ mod tests {
         greeting_reply: [u8; 2],
         reply_code: Option<u8>,
     ) -> UdpCapabilityEvidence {
+        scripted_socks_result_with_reserved(greeting_reply, reply_code, 0)
+    }
+
+    fn scripted_socks_result_with_reserved(
+        greeting_reply: [u8; 2],
+        reply_code: Option<u8>,
+        reserved: u8,
+    ) -> UdpCapabilityEvidence {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("listener");
         let port = listener.local_addr().expect("address").port();
         let server = thread::spawn(move || {
@@ -365,7 +380,7 @@ mod tests {
                 stream.read_exact(&mut associate).expect("associate");
                 assert_eq!(associate[1], 3);
                 stream
-                    .write_all(&[5, reply_code, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .write_all(&[5, reply_code, reserved, 1, 0, 0, 0, 0, 0, 0])
                     .expect("reply");
             }
         });
@@ -452,6 +467,28 @@ mod tests {
             assert_eq!(result.status, UdpCapabilityStatus::Unknown);
             assert_eq!(result.reason_code, "socks5_udp_response_invalid");
         }
+    }
+
+    #[test]
+    fn nonzero_socks5_reserved_byte_remains_unknown() {
+        let result = scripted_socks_result_with_reserved([5, 0], Some(0), 1);
+        assert_eq!(result.status, UdpCapabilityStatus::Unknown);
+        assert_eq!(result.reason_code, "socks5_udp_response_invalid");
+    }
+
+    #[test]
+    fn configuration_generation_is_nonnegative_sqlite_integer_even_for_high_bit_hash() {
+        let outlet = (10_000..u16::MAX)
+            .map(|port| local(&format!("socks5://127.0.0.1:{port}")))
+            .find(|candidate| {
+                let digest = Sha256::digest(serde_json::to_vec(candidate).expect("serialize"));
+                digest[0] & 0x80 != 0
+            })
+            .expect("a high-bit SHA-256 fixture");
+        let digest = Sha256::digest(serde_json::to_vec(&outlet).expect("serialize"));
+        assert_ne!(digest[0] & 0x80, 0, "fixture must exercise the high bit");
+        let (_, generation) = outlet_udp_configuration(&outlet);
+        assert!(i64::try_from(generation).is_ok());
     }
 
     #[test]

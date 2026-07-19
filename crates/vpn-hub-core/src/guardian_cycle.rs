@@ -174,27 +174,7 @@ pub async fn run_controller_guardian_cycle(
         .map(|decision| decision.to_outlet.clone())
         .or(routing.current_outlet()?);
     let udp_capabilities = store.udp_capabilities()?;
-    let udp_target = selected_outlet
-        .as_deref()
-        .and_then(|selected_outlet| {
-            udp_capabilities
-                .into_iter()
-                .find(|evidence| evidence.outlet_id == selected_outlet)
-                .filter(|evidence| {
-                    private
-                        .outlets
-                        .iter()
-                        .find(|outlet| outlet.id == evidence.outlet_id)
-                        .is_some_and(|outlet| {
-                            current_udp_status(outlet, Some(evidence))
-                                == UdpCapabilityStatus::Supported
-                        })
-                })
-        })
-        .map_or_else(
-            || crate::FAIL_CLOSED_PROXY.to_string(),
-            |evidence| outlet_proxy_name(&evidence.outlet_id),
-        );
+    let udp_target = udp_selector_target(private, selected_outlet.as_deref(), &udp_capabilities);
     if let Err(error) = controller.select(UDP_SELECTOR, &udp_target).await {
         let _ = controller
             .select(UDP_SELECTOR, crate::FAIL_CLOSED_PROXY)
@@ -218,6 +198,33 @@ pub async fn run_controller_guardian_cycle(
         observed: observed.into_iter().map(|(_, result)| result).collect(),
         decision,
     })
+}
+
+pub(crate) fn udp_selector_target(
+    private: &PrivateRoutingConfig,
+    selected_outlet: Option<&str>,
+    udp_capabilities: &[crate::UdpCapabilityEvidence],
+) -> String {
+    let Some(selected_outlet) = selected_outlet else {
+        return crate::FAIL_CLOSED_PROXY.to_string();
+    };
+    let supported = private
+        .outlets
+        .iter()
+        .find(|outlet| outlet.id == selected_outlet)
+        .is_some_and(|outlet| {
+            current_udp_status(
+                outlet,
+                udp_capabilities
+                    .iter()
+                    .find(|evidence| evidence.outlet_id == selected_outlet),
+            ) == UdpCapabilityStatus::Supported
+        });
+    if supported {
+        outlet_proxy_name(selected_outlet)
+    } else {
+        crate::FAIL_CLOSED_PROXY.to_string()
+    }
 }
 
 async fn probe_configured_outlets(

@@ -67,6 +67,8 @@ pub struct AppState {
     routing_engine: Mutex<RoutingEngine>,
     routing_transaction: RoutingTransaction,
     initialization_error: Option<String>,
+    #[cfg(test)]
+    entry_switch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[derive(Default)]
@@ -186,8 +188,7 @@ impl OwnedProbeCore {
                 return Err("隔离 UDP 进程在就绪前退出".into());
             }
             let pid = owned.child.id();
-            let owns_ports = listening_owner_pid(entry_port) == Some(pid)
-                && listening_owner_pid(controller_port) == Some(pid);
+            let owns_ports = owns_loopback_listeners(pid, &[entry_port, controller_port]);
             if owns_ports && owned.controller.is_ready().await.unwrap_or(false) {
                 return Ok(owned);
             }
@@ -319,12 +320,24 @@ impl AppState {
             routing_engine: Mutex::new(routing_engine),
             routing_transaction: RoutingTransaction::default(),
             initialization_error,
+            #[cfg(test)]
+            entry_switch_hook: Mutex::new(None),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(workspace_root: PathBuf, data_directory: &Path) -> Self {
         Self::new_with_data_directory(workspace_root, data_directory, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn private_config_path_for_test(&self) -> &Path {
+        &self.private_config_path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_entry_switch_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.entry_switch_hook.lock().expect("entry switch hook") = Some(Box::new(hook));
     }
 
     #[must_use]
@@ -837,10 +850,9 @@ impl AppState {
             .spawn()
             .map_err(|error| format!("无法启动 Mihomo：{error}"))?;
 
+        let pid = child.id();
         for _ in 0..50 {
-            if is_endpoint_reachable(&private_config.entry.host, startup_entry_port)
-                && is_endpoint_reachable("127.0.0.1", private_config.controller_port)
-            {
+            if owns_loopback_listeners(pid, &[startup_entry_port, private_config.controller_port]) {
                 break;
             }
             if child
@@ -852,9 +864,7 @@ impl AppState {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if !is_endpoint_reachable(&private_config.entry.host, startup_entry_port)
-            || !is_endpoint_reachable("127.0.0.1", private_config.controller_port)
-        {
+        if !owns_loopback_listeners(pid, &[startup_entry_port, private_config.controller_port]) {
             terminate_child(&mut child);
             return Err(format!(
                 "Mihomo 启动超时，{}:{} 或本机 Controller 未就绪",
@@ -894,6 +904,15 @@ impl AppState {
                 return Err(format!("无法恢复主 Fail Closed 选择器：{error}"));
             }
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .entry_switch_hook
+            .lock()
+            .expect("entry switch hook")
+            .take()
+        {
+            hook();
+        }
         if let Err(error) = fs::write(&config_path, full_yaml) {
             terminate_child(&mut child);
             return Err(format!("无法写入完整 Mihomo 运行配置：{error}"));
@@ -907,18 +926,20 @@ impl AppState {
             return Err(format!("无法加载完整 Mihomo 配置：{error}"));
         }
         for _ in 0..20 {
-            if is_endpoint_reachable(&private_config.entry.host, private_config.entry.port)
-                && !is_endpoint_reachable(&private_config.entry.host, startup_entry_port)
+            if listening_owner_pid(private_config.entry.port) == Some(pid)
+                && listening_owner_pid(private_config.controller_port) == Some(pid)
+                && listening_owner_pid(startup_entry_port).is_none()
             {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if !is_endpoint_reachable(&private_config.entry.host, private_config.entry.port)
-            || is_endpoint_reachable(&private_config.entry.host, startup_entry_port)
+        if listening_owner_pid(private_config.entry.port) != Some(pid)
+            || listening_owner_pid(private_config.controller_port) != Some(pid)
+            || listening_owner_pid(startup_entry_port).is_some()
         {
             terminate_child(&mut child);
-            return Err("完整配置入口切换未完成；开发核心已停止".into());
+            return Err("完整配置入口监听器不属于刚启动的 Mihomo；开发核心已安全停止".into());
         }
         match controller
             .is_selected(UDP_SELECTOR, FAIL_CLOSED_PROXY)
@@ -949,7 +970,6 @@ impl AppState {
             }
         }
 
-        let pid = child.id();
         let started_at = chrono::Utc::now().to_rfc3339();
         if let Err(error) = self.reset_routing_session() {
             terminate_child(&mut child);
@@ -1200,6 +1220,12 @@ fn harden_private_path(path: &Path) -> Result<(), String> {
 #[cfg(not(target_os = "windows"))]
 fn harden_private_path(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+fn owns_loopback_listeners(pid: u32, ports: &[u16]) -> bool {
+    ports
+        .iter()
+        .all(|port| listening_owner_pid(*port) == Some(pid))
 }
 
 #[cfg(target_os = "windows")]
@@ -1476,6 +1502,54 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             *events.lock().await,
             ["probe-1", "put-1", "apply-1", "probe-2", "put-2", "apply-2"]
         );
+    }
+
+    #[tokio::test]
+    async fn final_entry_port_race_fails_without_terminating_unknown_owner() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_directory = directory.path().join("entry-ownership-race");
+        let state = AppState::new_for_test(workspace_root, &data_directory);
+        let entry = ProbePortLease::reserve().expect("entry lease");
+        let entry_port = entry.port();
+        let controller =
+            ProbePortLease::reserve_excluding(&[entry_port]).expect("controller lease");
+        let controller_port = controller.port();
+        assert!(!matches!(entry_port, 3_666 | 6_666));
+        assert!(!matches!(controller_port, 3_666 | 6_666));
+        drop(entry);
+        drop(controller);
+
+        let mut config = PrivateRoutingConfig::default();
+        config.entry = EntryConfig {
+            host: "127.0.0.1".into(),
+            port: entry_port,
+        };
+        config.controller_port = controller_port;
+        config.outlets.clear();
+        config
+            .save(state.private_config_path_for_test())
+            .expect("save isolated random-port config");
+        let unknown_listener = Arc::new(Mutex::new(None::<TcpListener>));
+        let captured_listener = Arc::clone(&unknown_listener);
+        state.set_entry_switch_hook_for_test(move || {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, entry_port))
+                .expect("unknown owner must deterministically win final entry race");
+            *captured_listener.lock().expect("captured listener") = Some(listener);
+        });
+
+        let error = state
+            .start_development_core()
+            .await
+            .expect_err("mismatched final entry owner must fail closed");
+        assert!(
+            error.contains("入口监听器不属于刚启动的 Mihomo"),
+            "ownership failure must be explicit and sanitized: {error}"
+        );
+        assert_eq!(listening_owner_pid(entry_port), Some(std::process::id()));
+        assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, entry_port)).is_ok());
+        assert!(state.managed_core.lock().expect("managed core").is_none());
+        drop(unknown_listener.lock().expect("unknown listener").take());
     }
 
     #[tokio::test]

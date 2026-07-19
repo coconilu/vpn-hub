@@ -14,8 +14,8 @@ use tauri::{AppHandle, Manager, State};
 use vpn_hub_core::{
     GuardianConfig, GuardianStore, HealthStatus, LatencySample, OutletConfig, OutletKind,
     OutletSummary, ProbeOutletConfig, ProbeResult, RouteMode, RouteSwitchEvent, StateEvent,
-    SubscriptionCredentialStatus, UdpCapabilityEvidence, UdpProbeTarget, probe_local_proxy_udp,
-    probe_outlet, run_controller_guardian_cycle, unknown_udp_evidence,
+    SubscriptionCredentialStatus, UdpCapabilityEvidence, UdpProbeTarget, is_current_udp_evidence,
+    probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle, unknown_udp_evidence,
 };
 
 use crate::runtime::{AppState, CoreStatus, PortSnapshot, RoutingStatus};
@@ -48,6 +48,20 @@ fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
             )
             .map_err(|error| format!("无法初始化 UDP 能力状态：{error}"))?;
     }
+    let mut udp_capabilities = store
+        .udp_capabilities()
+        .map_err(|error| format!("无法读取 UDP 能力状态：{error}"))?;
+    for evidence in &mut udp_capabilities {
+        let current = private
+            .outlets
+            .iter()
+            .find(|outlet| outlet.id == evidence.outlet_id)
+            .is_some_and(|outlet| is_current_udp_evidence(outlet, evidence));
+        if !current {
+            evidence.status = vpn_hub_core::UdpCapabilityStatus::Unknown;
+            evidence.reason_code = "evidence_requires_revalidation".into();
+        }
+    }
     Ok(DashboardSnapshot {
         updated_at: Utc::now().to_rfc3339(),
         entry: AppState::port_snapshot(&private.entry.host, private.entry.port),
@@ -65,9 +79,7 @@ fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
         route_switches: store
             .recent_route_switches(12)
             .map_err(|error| format!("无法读取路由切换事件：{error}"))?,
-        udp_capabilities: store
-            .udp_capabilities()
-            .map_err(|error| format!("无法读取 UDP 能力状态：{error}"))?,
+        udp_capabilities,
     })
 }
 
@@ -470,5 +482,67 @@ mod tests {
         let refreshed = load_dashboard(&state).expect("refreshed dashboard");
         assert!(refreshed.routing.outlets.is_empty());
         assert!(refreshed.summaries.is_empty());
+    }
+
+    #[test]
+    fn dashboard_projects_stale_udp_evidence_as_unknown_without_rewriting_history() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_directory = directory.path().join("dashboard-stale-evidence");
+        let state = AppState::new_for_test(workspace_root, &data_directory);
+        let mut config = vpn_hub_core::PrivateRoutingConfig::default();
+        config.entry = vpn_hub_core::EntryConfig {
+            host: "127.0.0.1".into(),
+            port: 45_131,
+        };
+        config.controller_port = 45_132;
+        let outlet = OutletConfig {
+            id: "dashboard-local".into(),
+            label: "Dashboard local".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "socks5://127.0.0.1:45133".into(),
+            },
+        };
+        config.outlets = vec![outlet.clone()];
+        config
+            .save(state.private_config_path_for_test())
+            .expect("save original config");
+        let guardian = GuardianConfig::load(state.guardian_config_path()).expect("guardian config");
+        let mut store = GuardianStore::open(&guardian.database_path).expect("guardian store");
+        let mut evidence = unknown_udp_evidence(&outlet, "test");
+        evidence.status = vpn_hub_core::UdpCapabilityStatus::Supported;
+        store
+            .record_udp_capability(&outlet.id, &outlet.label, &evidence)
+            .expect("record current supported evidence");
+        drop(store);
+
+        if let OutletKind::LocalProxy { endpoint } = &mut config.outlets[0].kind {
+            *endpoint = "socks5://127.0.0.1:45134".into();
+        }
+        config
+            .save(state.private_config_path_for_test())
+            .expect("save changed config");
+        let dashboard = load_dashboard(&state).expect("dashboard snapshot");
+        assert_eq!(dashboard.udp_capabilities.len(), 1);
+        assert_eq!(
+            dashboard.udp_capabilities[0].status,
+            vpn_hub_core::UdpCapabilityStatus::Unknown
+        );
+        assert_eq!(
+            dashboard.udp_capabilities[0].reason_code,
+            "evidence_requires_revalidation"
+        );
+
+        let store = GuardianStore::open(&guardian.database_path).expect("reopen history");
+        let history = store
+            .udp_capability_history(&outlet.id, 10)
+            .expect("evidence history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].status,
+            vpn_hub_core::UdpCapabilityStatus::Supported
+        );
+        assert_eq!(history[0].reason_code, "test");
     }
 }
