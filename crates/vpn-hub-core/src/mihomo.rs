@@ -876,6 +876,11 @@ fn validate_outlet_id(id: &str) -> Result<(), PrivateConfigError> {
 pub fn normalize_loopback_host(value: &str) -> Option<IpAddr> {
     let ip = if value.eq_ignore_ascii_case("localhost") {
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else if let Some(literal) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        IpAddr::V6(literal.parse::<std::net::Ipv6Addr>().ok()?)
     } else {
         value.parse::<IpAddr>().ok()?
     };
@@ -1126,8 +1131,15 @@ mod tests {
             normalize_loopback_host("::1"),
             Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
         );
+        assert_eq!(
+            normalize_loopback_host("[::1]"),
+            Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
         for rejected in ["0.0.0.0", "::", "192.0.2.1", "example.invalid"] {
             assert_eq!(normalize_loopback_host(rejected), None);
+        }
+        for malformed in ["[localhost]", "[127.0.0.1]", "[::1", "::1]"] {
+            assert_eq!(normalize_loopback_host(malformed), None);
         }
     }
 

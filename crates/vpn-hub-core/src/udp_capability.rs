@@ -8,7 +8,9 @@ use std::{
 use chrono::{SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 
-use crate::{OutletConfig, OutletKind, UdpCapabilityEvidence, UdpCapabilityStatus};
+use crate::{
+    OutletConfig, OutletKind, UdpCapabilityEvidence, UdpCapabilityStatus, normalize_loopback_host,
+};
 
 pub const UDP_EVIDENCE_VERSION: u32 = 1;
 pub const UDP_MODEL_VERSION: u32 = 1;
@@ -122,17 +124,9 @@ pub fn probe_local_proxy_udp(
             "http_proxy_transport_has_no_udp",
         );
     }
-    let Some(host) = url.host_str() else {
-        return unknown_udp_evidence(outlet, "invalid_local_proxy_endpoint");
-    };
-    let Ok(ip) = host.parse::<IpAddr>() else {
-        return unknown_udp_evidence(outlet, "invalid_local_proxy_endpoint");
-    };
-    if !ip.is_loopback() {
-        return unknown_udp_evidence(outlet, "non_loopback_proxy_rejected");
-    }
-    let Some(port) = url.port() else {
-        return unknown_udp_evidence(outlet, "invalid_local_proxy_endpoint");
+    let proxy = match local_proxy_socket_address(&url) {
+        Ok(proxy) => proxy,
+        Err(reason_code) => return unknown_udp_evidence(outlet, reason_code),
     };
     if targets.is_empty() {
         return unknown_udp_evidence(outlet, "controlled_udp_target_unavailable");
@@ -144,7 +138,7 @@ pub fn probe_local_proxy_udp(
         return unknown_udp_evidence(outlet, "non_loopback_udp_target_rejected");
     }
 
-    match probe_authorized_socks5_udp(SocketAddr::new(ip, port), targets, timeout) {
+    match probe_authorized_socks5_udp(proxy, targets, timeout) {
         Ok(outcomes) if outcomes.iter().any(|result| *result) => evidence(
             outlet,
             UdpCapabilityStatus::Supported,
@@ -161,6 +155,13 @@ pub fn probe_local_proxy_udp(
             unknown_udp_evidence(outlet, "socks5_udp_response_invalid")
         }
     }
+}
+
+fn local_proxy_socket_address(url: &reqwest::Url) -> Result<SocketAddr, &'static str> {
+    let host = url.host_str().ok_or("invalid_local_proxy_endpoint")?;
+    let ip = normalize_loopback_host(host).ok_or("non_loopback_proxy_rejected")?;
+    let port = url.port().ok_or("invalid_local_proxy_endpoint")?;
+    Ok(SocketAddr::new(ip, port))
 }
 
 fn evidence(
@@ -353,6 +354,118 @@ mod tests {
                 endpoint: endpoint.into(),
             },
         }
+    }
+
+    fn owned_socks5_udp_echo_result(endpoint_host: &str) -> UdpCapabilityEvidence {
+        let echo = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("owned echo socket");
+        echo.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("echo timeout");
+        let echo_address = echo.local_addr().expect("echo address");
+        assert!(!matches!(echo_address.port(), 3_666 | 6_666));
+        let echo_thread = thread::spawn(move || {
+            let mut payload = [0_u8; 128];
+            let (length, peer) = echo.recv_from(&mut payload).expect("owned echo request");
+            echo.send_to(&payload[..length], peer)
+                .expect("owned echo response");
+        });
+
+        let relay = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("owned SOCKS5 relay");
+        relay
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("relay timeout");
+        let relay_address = relay.local_addr().expect("relay address");
+        assert!(!matches!(relay_address.port(), 3_666 | 6_666));
+
+        let control = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("owned SOCKS5 control");
+        let control_port = control.local_addr().expect("control address").port();
+        assert!(!matches!(control_port, 3_666 | 6_666));
+        let proxy_thread = thread::spawn(move || {
+            let (mut stream, _) = control.accept().expect("SOCKS5 control connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("control read timeout");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("control write timeout");
+
+            let mut greeting = [0_u8; 3];
+            stream.read_exact(&mut greeting).expect("SOCKS5 greeting");
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).expect("SOCKS5 method");
+
+            let mut associate = [0_u8; 10];
+            stream
+                .read_exact(&mut associate)
+                .expect("UDP ASSOCIATE request");
+            assert_eq!(associate, [5, 3, 0, 1, 0, 0, 0, 0, 0, 0]);
+            let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1];
+            reply.extend_from_slice(&relay_address.port().to_be_bytes());
+            stream.write_all(&reply).expect("UDP ASSOCIATE reply");
+
+            let mut packet = [0_u8; 512];
+            let (length, client) = relay.recv_from(&mut packet).expect("relay request");
+            let payload = decode_udp_response(&packet[..length])
+                .expect("valid SOCKS5 UDP request")
+                .to_vec();
+            relay
+                .send_to(&payload, echo_address)
+                .expect("forward to owned echo");
+            let (length, source) = relay.recv_from(&mut packet).expect("owned echo response");
+            assert_eq!(source, echo_address);
+            let response = encode_udp_request(echo_address, &packet[..length]);
+            relay
+                .send_to(&response, client)
+                .expect("relay SOCKS5 UDP response");
+        });
+
+        let target = UdpProbeTarget {
+            address: echo_address,
+            request: b"owned-localhost-udp".to_vec(),
+            expected_response: b"owned-localhost-udp".to_vec(),
+        };
+        let result = probe_local_proxy_udp(
+            &local(&format!("socks5://{endpoint_host}:{control_port}")),
+            &[target],
+            Duration::from_secs(2),
+        );
+        proxy_thread.join().expect("owned SOCKS5 proxy");
+        echo_thread.join().expect("owned UDP echo");
+        result
+    }
+
+    #[test]
+    fn production_proxy_endpoint_uses_shared_loopback_normalization() {
+        for (endpoint, expected) in [
+            ("socks5://localhost:45120", "127.0.0.1:45120"),
+            ("socks5://LOCALHOST:45121", "127.0.0.1:45121"),
+            ("socks5://127.0.0.2:45122", "127.0.0.2:45122"),
+            ("socks5://[::1]:45123", "[::1]:45123"),
+        ] {
+            let url = reqwest::Url::parse(endpoint).expect("endpoint URL");
+            assert_eq!(
+                local_proxy_socket_address(&url),
+                Ok(expected.parse().expect("expected loopback address"))
+            );
+        }
+        for rejected in [
+            "socks5://0.0.0.0:45124",
+            "socks5://[::]:45125",
+            "socks5://192.0.2.1:45126",
+            "socks5://example.invalid:45127",
+        ] {
+            let url = reqwest::Url::parse(rejected).expect("endpoint URL");
+            assert_eq!(
+                local_proxy_socket_address(&url),
+                Err("non_loopback_proxy_rejected")
+            );
+        }
+    }
+
+    #[test]
+    fn localhost_socks5_udp_associate_reaches_owned_echo() {
+        let result = owned_socks5_udp_echo_result("localhost");
+        assert_eq!(result.status, UdpCapabilityStatus::Supported);
+        assert_eq!(result.reason_code, "controlled_udp_echo_succeeded");
     }
 
     fn scripted_socks_result(

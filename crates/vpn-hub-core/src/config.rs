@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fs, net::IpAddr, path::Path};
+use std::{collections::HashSet, fs, path::Path};
 
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -146,19 +146,9 @@ impl ProbeOutletConfig {
         let host = url
             .host_str()
             .ok_or_else(|| ConfigError::Invalid(format!("missing proxy host for {}", self.id)))?;
-        let ip: IpAddr = if host.eq_ignore_ascii_case("localhost") {
-            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-        } else {
-            host.parse().map_err(|_| {
-                ConfigError::Invalid(format!("proxy host for {} must be local", self.id))
-            })?
-        };
-        if !ip.is_loopback() {
-            return Err(ConfigError::Invalid(format!(
-                "proxy host for {} must be a loopback address",
-                self.id
-            )));
-        }
+        let ip = crate::normalize_loopback_host(host).ok_or_else(|| {
+            ConfigError::Invalid(format!("proxy host for {} must be local", self.id))
+        })?;
         let port = url
             .port()
             .ok_or_else(|| ConfigError::Invalid(format!("missing proxy port for {}", self.id)))?;
@@ -240,6 +230,31 @@ mod tests {
     #[test]
     fn accepts_loopback_proxy() {
         assert!(base_config().validate().is_ok());
+    }
+
+    #[test]
+    fn guardian_proxy_socket_uses_shared_loopback_normalization() {
+        let mut outlet = base_config().outlets.remove(0);
+        for (endpoint, expected) in [
+            ("socks5h://LOCALHOST:45120", "127.0.0.1:45120"),
+            ("socks5h://127.0.0.2:45121", "127.0.0.2:45121"),
+            ("socks5h://[::1]:45122", "[::1]:45122"),
+        ] {
+            outlet.proxy_url = endpoint.into();
+            assert_eq!(
+                outlet.socket_addr().expect("supported loopback"),
+                expected.parse().expect("expected socket address")
+            );
+        }
+        for rejected in [
+            "socks5h://0.0.0.0:45123",
+            "socks5h://[::]:45124",
+            "socks5h://192.0.2.1:45125",
+            "socks5h://example.invalid:45126",
+        ] {
+            outlet.proxy_url = rejected.into();
+            assert!(matches!(outlet.socket_addr(), Err(ConfigError::Invalid(_))));
+        }
     }
 
     #[test]
