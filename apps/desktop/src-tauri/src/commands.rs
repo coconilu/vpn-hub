@@ -10,7 +10,7 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 use vpn_hub_core::{
     GuardianConfig, GuardianStore, HealthStatus, HistoryExport, HistoryFilter, HistoryOutletKind,
     HistoryOutletSnapshot, HistoryResponse, LatencySample, OutletConfig, OutletKind, OutletSummary,
@@ -19,9 +19,12 @@ use vpn_hub_core::{
     probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle, unknown_udp_evidence,
 };
 
-use crate::runtime::{
-    AppState, CoreStatus, PortSnapshot, RoutingStatus, SettingsApplyRequest, SettingsApplyResult,
-    SettingsPreview, SettingsPreviewRequest,
+use crate::{
+    lifecycle::{self, LifecycleEvent},
+    runtime::{
+        AppState, CoreStatus, PortSnapshot, RoutingStatus, SettingsApplyRequest,
+        SettingsApplyResult, SettingsPreview, SettingsPreviewRequest,
+    },
 };
 
 #[derive(Debug, Serialize)]
@@ -210,11 +213,19 @@ pub async fn preview_settings(
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn apply_settings(
+    app: AppHandle,
     state: State<'_, AppState>,
     request: SettingsApplyRequest,
 ) -> Result<SettingsApplyResult, String> {
     let _transaction = state.lock_routing_transaction().await;
-    state.apply_settings(request)
+    let result = state.apply_settings(request)?;
+    lifecycle::dispatch(
+        &app,
+        LifecycleEvent::ConfigReload {
+            now_ms: unix_time_ms(),
+        },
+    );
+    Ok(result)
 }
 
 async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
@@ -266,7 +277,7 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
     Ok(guardian.monitor.interval_seconds)
 }
 
-async fn record_routing_cycle(state: &AppState) -> Result<u64, String> {
+pub(crate) async fn record_routing_cycle(state: &AppState) -> Result<u64, String> {
     let _transaction = state.lock_routing_transaction().await;
     record_routing_cycle_locked(state).await
 }
@@ -358,22 +369,6 @@ fn unix_time_ms() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
-}
-
-pub(crate) async fn monitor_guardian(app: AppHandle) {
-    loop {
-        let interval = {
-            let state = app.state::<AppState>();
-            match record_routing_cycle(&state).await {
-                Ok(interval) => interval,
-                Err(error) => {
-                    eprintln!("Guardian background cycle failed: {error}");
-                    180
-                }
-            }
-        };
-        tokio::time::sleep(Duration::from_secs(interval)).await;
-    }
 }
 
 #[tauri::command]
@@ -554,24 +549,44 @@ pub fn delete_subscription_credential(
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn start_development_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
+pub async fn start_development_core(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CoreStatus, String> {
     let _transaction = state.lock_routing_transaction().await;
-    let mut status = state.start_development_core().await?;
+    let mut status = match state.start_development_core().await {
+        Ok(status) => status,
+        Err(error) => {
+            if state
+                .core_status()
+                .is_ok_and(|status| status.state == "external")
+            {
+                lifecycle::dispatch(&app, LifecycleEvent::PortConflictObserved);
+            }
+            return Err(error);
+        }
+    };
     if let Err(error) = record_routing_cycle_locked(&state).await {
         let _ = state.stop_development_core();
         return Err(format!(
             "开发核心首次健康决策失败，已停止并保持 Fail Closed：{error}"
         ));
     }
+    lifecycle::dispatch(&app, LifecycleEvent::CoreStarted);
     status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();
     Ok(status)
 }
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn stop_development_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
+pub async fn stop_development_core(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CoreStatus, String> {
     let _transaction = state.lock_routing_transaction().await;
-    state.stop_development_core()
+    let status = state.stop_development_core()?;
+    lifecycle::dispatch(&app, LifecycleEvent::CoreStopped);
+    Ok(status)
 }
 
 #[cfg(test)]

@@ -1,7 +1,10 @@
 mod commands;
+mod lifecycle;
 mod runtime;
 
+use lifecycle::{DesktopCoordinator, LifecycleEvent};
 use runtime::AppState;
+use tauri::Manager as _;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// Starts the VPN Hub desktop runtime.
@@ -11,11 +14,22 @@ use runtime::AppState;
 /// Panics when Tauri cannot initialize the application runtime.
 pub fn run() {
     let state = AppState::new();
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .manage(state)
-        .setup(move |app| {
-            tauri::async_runtime::spawn(commands::monitor_guardian(app.handle().clone()));
+        .manage(DesktopCoordinator::new())
+        .setup(|app| {
+            lifecycle::install_tray(app)?;
+            app.state::<DesktopCoordinator>()
+                .start(app.handle().clone())
+                .map_err(std::io::Error::other)?;
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                lifecycle::dispatch(window.app_handle(), LifecycleEvent::WindowClose);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_dashboard_snapshot,
@@ -34,6 +48,15 @@ pub fn run() {
             commands::start_development_core,
             commands::stop_development_core,
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run VPN Hub desktop application");
+        .build(tauri::generate_context!())
+        .expect("failed to build VPN Hub desktop application");
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            let coordinator = app.state::<DesktopCoordinator>();
+            if !coordinator.exit_permitted() {
+                api.prevent_exit();
+                coordinator.dispatch(LifecycleEvent::OsShutdown);
+            }
+        }
+    });
 }
