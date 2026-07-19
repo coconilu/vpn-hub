@@ -31,6 +31,7 @@ pub struct SubscriptionCredentialStatus {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum LegacyMigrationOutcome {
     NotNeeded,
+    BackupRecovered,
     EmptyLegacyUpgraded,
     Migrated {
         subscription_id: String,
@@ -46,6 +47,8 @@ pub enum SecretStoreError {
     AccessDenied,
     #[error("the protected credential is corrupted")]
     Corrupted,
+    #[error("the protected credential could not be read")]
+    CredentialUnavailable,
     #[error("the credential reference is invalid")]
     InvalidReference,
     #[error("the subscription credential is invalid")]
@@ -170,10 +173,11 @@ fn map_keyring_error(error: &keyring_core::Error) -> SecretStoreError {
         keyring_core::Error::NoStorageAccess(_) => SecretStoreError::AccessDenied,
         keyring_core::Error::BadEncoding(_)
         | keyring_core::Error::BadDataFormat(_, _)
-        | keyring_core::Error::BadStoreFormat(_) => SecretStoreError::Corrupted,
+        | keyring_core::Error::Ambiguous(_) => SecretStoreError::Corrupted,
         keyring_core::Error::Invalid(_, _) | keyring_core::Error::TooLong(_, _) => {
             SecretStoreError::InvalidReference
         }
+        keyring_core::Error::PlatformFailure(_) => SecretStoreError::CredentialUnavailable,
         _ => SecretStoreError::Unavailable,
     }
 }
@@ -231,11 +235,21 @@ impl<'a, S: SecretStore + ?Sized> SubscriptionSecrets<'a, S> {
     ) -> Result<ResolvedSubscriptionUrls, SecretStoreError> {
         let mut resolved = BTreeMap::new();
         for outlet in &config.outlets {
-            if let OutletKind::Subscription { secret_ref, .. } = &outlet.kind
-                && let Some(secret) = self.store.get(secret_ref)?
-            {
-                validate_subscription_url(&secret).map_err(|_| SecretStoreError::Corrupted)?;
-                resolved.insert(secret_ref.clone(), secret);
+            let OutletKind::Subscription { secret_ref, .. } = &outlet.kind else {
+                continue;
+            };
+            match self.store.get(secret_ref) {
+                Ok(Some(secret)) if validate_subscription_url(&secret).is_ok() => {
+                    resolved.insert(secret_ref.clone(), secret);
+                }
+                Ok(_)
+                | Err(
+                    SecretStoreError::Corrupted
+                    | SecretStoreError::InvalidReference
+                    | SecretStoreError::CredentialUnavailable,
+                ) => {}
+                Err(error) if error.is_global_failure() => return Err(error),
+                Err(_) => {}
             }
         }
         Ok(resolved)
@@ -309,6 +323,12 @@ impl<'a, S: SecretStore + ?Sized> SubscriptionSecrets<'a, S> {
     }
 }
 
+impl SecretStoreError {
+    const fn is_global_failure(self) -> bool {
+        matches!(self, Self::Unavailable | Self::AccessDenied)
+    }
+}
+
 /// Migrates the one legacy plaintext subscription into protected storage.
 /// The credential write happens before the atomic config rewrite; if the
 /// rewrite fails, the previous credential value is restored or removed.
@@ -328,7 +348,15 @@ pub fn migrate_legacy_subscription<S: SecretStore + ?Sized>(
     let mut config =
         PrivateRoutingConfig::load(path).map_err(|_| SecretStoreError::MigrationFailed)?;
     if !config.is_legacy_format() {
-        return Ok(LegacyMigrationOutcome::NotNeeded);
+        if original_primary.is_some() {
+            return Ok(LegacyMigrationOutcome::NotNeeded);
+        }
+        if config.save(path).is_err() {
+            restore_snapshot(path, original_primary.as_deref())?;
+            restore_snapshot(&backup, original_backup.as_deref())?;
+            return Err(SecretStoreError::MigrationFailed);
+        }
+        return Ok(LegacyMigrationOutcome::BackupRecovered);
     }
 
     let legacy = config
@@ -410,18 +438,27 @@ fn validate_reference(secret_ref: &str) -> Result<(), SecretStoreError> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::HashSet, sync::Mutex};
 
     use super::*;
-    use crate::{OutletConfig, generate_controller_secret};
+    use crate::{OutletConfig, generate_controller_secret, generate_mihomo_config};
 
     #[derive(Default)]
     struct MemorySecretStore {
         values: Mutex<BTreeMap<String, String>>,
+        unreadable: Mutex<HashSet<String>>,
     }
 
     impl SecretStore for MemorySecretStore {
         fn get(&self, secret_ref: &str) -> Result<Option<String>, SecretStoreError> {
+            if self
+                .unreadable
+                .lock()
+                .expect("unreadable")
+                .contains(secret_ref)
+            {
+                return Err(SecretStoreError::CredentialUnavailable);
+            }
             Ok(self.values.lock().expect("values").get(secret_ref).cloned())
         }
 
@@ -507,6 +544,87 @@ mod tests {
     }
 
     #[test]
+    fn one_corrupted_subscription_does_not_block_healthy_or_local_outlets() {
+        let healthy_url = random_url();
+        let corrupted_value = "corrupted-sensitive-credential-marker";
+        let mut config = PrivateRoutingConfig::default();
+        config.outlets = vec![
+            OutletConfig {
+                id: "subscription-healthy".into(),
+                label: "Healthy subscription".into(),
+                enabled: true,
+                kind: OutletKind::Subscription {
+                    secret_ref: "subscription.healthy".into(),
+                    provider_update_seconds: 180,
+                },
+            },
+            OutletConfig {
+                id: "subscription-corrupted".into(),
+                label: "Corrupted subscription".into(),
+                enabled: true,
+                kind: OutletKind::Subscription {
+                    secret_ref: "subscription.corrupted".into(),
+                    provider_update_seconds: 180,
+                },
+            },
+            OutletConfig {
+                id: "subscription-unreadable".into(),
+                label: "Unreadable subscription".into(),
+                enabled: true,
+                kind: OutletKind::Subscription {
+                    secret_ref: "subscription.unreadable".into(),
+                    provider_update_seconds: 180,
+                },
+            },
+            OutletConfig {
+                id: "local-a".into(),
+                label: "Local A".into(),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: "socks5h://127.0.0.1:2666".into(),
+                },
+            },
+        ];
+        let store = MemorySecretStore::default();
+        store
+            .set("subscription.healthy", &healthy_url)
+            .expect("healthy secret");
+        store
+            .set("subscription.corrupted", corrupted_value)
+            .expect("synthetic corrupted secret");
+        store
+            .unreadable
+            .lock()
+            .expect("unreadable")
+            .insert("subscription.unreadable".into());
+        let secrets = SubscriptionSecrets::new(&store);
+
+        let resolved = secrets.resolve(&config).expect("isolated resolution");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.get("subscription.healthy"), Some(&healthy_url));
+        assert!(!resolved.contains_key("subscription.corrupted"));
+        assert!(!resolved.contains_key("subscription.unreadable"));
+
+        let statuses = secrets.statuses(&config);
+        assert_eq!(statuses[0].state, CredentialState::Configured);
+        assert_eq!(statuses[1].state, CredentialState::Corrupted);
+        assert_eq!(statuses[2].state, CredentialState::Unavailable);
+        let summary_json = serde_json::to_string(&config.summary(&resolved)).expect("summary");
+        assert!(!summary_json.contains(&healthy_url));
+        assert!(!summary_json.contains(corrupted_value));
+
+        let (yaml, runtime) = generate_mihomo_config(&config, &resolved, "synthetic-controller")
+            .expect("healthy and local outlets remain usable");
+        assert!(yaml.contains("vpn-hub-provider-subscription-healthy"));
+        assert!(!yaml.contains("vpn-hub-provider-subscription-corrupted"));
+        assert!(!yaml.contains("VPN-HUB-OUTLET-subscription-corrupted"));
+        assert!(!yaml.contains("VPN-HUB-OUTLET-subscription-unreadable"));
+        assert!(yaml.contains("VPN-HUB-OUTLET-local-a"));
+        assert_eq!(runtime.configured_subscription_count, 1);
+        assert_eq!(runtime.enabled_outlet_count, 4);
+    }
+
+    #[test]
     fn migrates_legacy_plaintext_without_leaving_it_in_config_or_backup() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("private-routing.toml");
@@ -539,6 +657,45 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         let resolved = SubscriptionSecrets::new(&store)
             .resolve(&config)
             .expect("resolved migrated credential");
+        assert_eq!(resolved.get("legacy.subscription-a"), Some(&credential));
+    }
+
+    #[test]
+    fn missing_primary_recovers_and_migrates_the_only_legacy_backup() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("private-routing.toml");
+        let backup = path.with_extension("toml.bak");
+        let credential = random_url();
+        std::fs::write(
+            &backup,
+            format!(
+                r#"subscription_url = "{credential}"
+provider_update_seconds = 180
+controller_port = 39090
+route_mode = "priority"
+priority = ["subscription-a", "chaoshihui"]
+cooldown_seconds = 60
+minimum_improvement_ms = 150
+probe_targets = ["https://example.com/a", "https://example.com/b"]
+"#
+            ),
+        )
+        .expect("legacy backup");
+        assert!(!path.exists());
+        let store = MemorySecretStore::default();
+
+        let outcome = migrate_legacy_subscription(&path, &store).expect("recover and migrate");
+        assert!(matches!(outcome, LegacyMigrationOutcome::Migrated { .. }));
+        for config_path in [&path, &backup] {
+            let content = std::fs::read_to_string(config_path).expect("sanitized config");
+            assert!(!content.contains(&credential));
+            assert!(!content.contains("subscription_url"));
+        }
+        assert_eq!(store.values.lock().expect("values").len(), 1);
+        let config = PrivateRoutingConfig::load(&path).expect("recovered config");
+        let resolved = SubscriptionSecrets::new(&store)
+            .resolve(&config)
+            .expect("recovered secret");
         assert_eq!(resolved.get("legacy.subscription-a"), Some(&credential));
     }
 

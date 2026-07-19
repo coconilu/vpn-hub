@@ -42,6 +42,7 @@ Windows 凭据使用 `VPNHub:subscription:<secret_ref>` 作为目标名，并指
 - 配置提交失败：先恢复迁移前的主配置与备份快照，再恢复原有凭据；旧配置保持原状。
 - 回滚也失败：返回单独的脱敏 `RollbackFailed`，阻止 Mihomo 启动并保持 Fail Closed。
 - 迁移成功：主配置和 `.bak` 都不再包含 `subscription_url` 或其值。
+- 主配置缺失但 `.toml.bak` 存在：启动时先从备份恢复或迁移，再决定是否创建默认配置；绝不先用默认配置覆盖唯一备份。
 
 ## 生命周期
 
@@ -61,3 +62,4 @@ Windows 凭据使用 `VPNHub:subscription:<secret_ref>` 作为目标名，并指
 - 不探测、占用或切换用户现有的 `127.0.0.1:6666`。
 - 受保护存储和迁移错误统一映射为脱敏状态，不拼接 Windows 平台错误或凭据内容。
 - 凭据缺失时对应订阅不会进入 Mihomo 选择器；全部出口不可用时继续 Fail Closed。
+- 单条凭据损坏、引用无效或发生条目级读取失败时，只把该订阅标记为 `corrupted` / `unavailable` 并从选择器排除；其他订阅和本地出口继续工作。只有整个 Windows 凭据存储不可访问时才返回全局错误。
