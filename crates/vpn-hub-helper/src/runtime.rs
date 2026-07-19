@@ -5,9 +5,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    AuthenticatedRequest, AuthorityLease, AuthorityRegistry, Command, FailClosedReason,
-    OwnedProcessIdentity, SupervisionManifest, SupervisorAuthority, SupervisorEvent,
-    SupervisorMachine,
+    AuthenticatedRequest, AuthorityLease, AuthorityRegistry, Command, ExpectedOwnership,
+    FailClosedReason, OwnedProcessIdentity, SupervisionManifest, SupervisorAuthority,
+    SupervisorEvent, SupervisorMachine,
 };
 
 pub trait ManifestProvider {
@@ -58,11 +58,13 @@ pub struct RuntimeReply {
     pub generation: u64,
     pub authority: String,
     pub owned_pid: Option<u32>,
+    pub ownership: Option<ExpectedOwnership>,
     pub entry_host: String,
     pub entry_port: u16,
     pub outlets: Vec<crate::OutletSummary>,
     pub circuit_open: bool,
     pub reason: Option<String>,
+    pub command_applied: Option<bool>,
 }
 
 pub struct HelperRuntime<B: CoreBackend, P: ManifestProvider> {
@@ -283,10 +285,14 @@ impl<B: CoreBackend, P: ManifestProvider> HelperRuntime<B, P> {
         if request.install_id != self.manifest.install_id {
             return Err(RuntimeError::Authority);
         }
+        let mut command_applied = None;
         let operation = match request.command {
             Command::Status | Command::Version => Ok(()),
             Command::Start => self.start(now_ms),
             Command::Stop => self.stop(),
+            Command::StopIfOwned(expected) => self.stop_if_owned(expected).map(|applied| {
+                command_applied = Some(applied);
+            }),
             Command::Restart => self.replace_owned(now_ms),
             Command::Reload => self.reload(now_ms),
             Command::Resume => {
@@ -324,7 +330,7 @@ impl<B: CoreBackend, P: ManifestProvider> HelperRuntime<B, P> {
             }
             return Err(error);
         }
-        Ok(self.reply())
+        Ok(self.reply_with_command_applied(command_applied))
     }
 
     pub fn recover_from_service_signal(&mut self, now_ms: i64) -> Result<(), RuntimeError> {
@@ -401,6 +407,20 @@ impl<B: CoreBackend, P: ManifestProvider> HelperRuntime<B, P> {
         Ok(())
     }
 
+    fn stop_if_owned(&mut self, expected: ExpectedOwnership) -> Result<bool, RuntimeError> {
+        let matches = self.owned.as_ref().is_some_and(|identity| {
+            identity.pid == expected.pid
+                && identity.creation_identity == expected.creation_identity
+                && identity.fencing_token == expected.fencing_epoch
+                && self.manifest.generation == expected.generation
+        });
+        if !matches {
+            return Ok(false);
+        }
+        self.stop()?;
+        Ok(true)
+    }
+
     fn reload(&mut self, now_ms: i64) -> Result<(), RuntimeError> {
         let next = self.provider.load().inspect_err(|error| {
             self.record_preflight_failure(error);
@@ -472,6 +492,10 @@ impl<B: CoreBackend, P: ManifestProvider> HelperRuntime<B, P> {
     }
 
     fn reply(&self) -> RuntimeReply {
+        self.reply_with_command_applied(None)
+    }
+
+    fn reply_with_command_applied(&self, command_applied: Option<bool>) -> RuntimeReply {
         let reason = match self.supervisor.state() {
             crate::SupervisorState::FailClosed(FailClosedReason::CorruptConfig) => {
                 Some("corrupt-config".into())
@@ -500,11 +524,18 @@ impl<B: CoreBackend, P: ManifestProvider> HelperRuntime<B, P> {
             generation: self.manifest.generation,
             authority: "helper".into(),
             owned_pid: self.owned.as_ref().map(|identity| identity.pid),
+            ownership: self.owned.as_ref().map(|identity| ExpectedOwnership {
+                pid: identity.pid,
+                creation_identity: identity.creation_identity,
+                fencing_epoch: identity.fencing_token,
+                generation: self.manifest.generation,
+            }),
             entry_host: self.manifest.entry.host.clone(),
             entry_port: self.manifest.entry.port,
             outlets: self.manifest.outlets.clone(),
             circuit_open: self.supervisor.circuit() == crate::CircuitState::Open,
             reason,
+            command_applied,
         }
     }
 }
@@ -549,6 +580,89 @@ pub struct WindowsJobCoreBackend {
     program_data_root: PathBuf,
     child: Option<Box<dyn process_wrap::tokio::ChildWrapper>>,
     identity: Option<OwnedProcessIdentity>,
+}
+
+#[cfg(target_os = "windows")]
+trait StoppableChild {
+    fn child_id(&self) -> Option<u32>;
+    fn creation_identity(&self) -> Result<u64, RuntimeError>;
+    fn start_kill(&mut self) -> Result<(), RuntimeError>;
+    fn has_exited(&mut self) -> Result<bool, RuntimeError>;
+}
+
+#[cfg(target_os = "windows")]
+impl StoppableChild for Box<dyn process_wrap::tokio::ChildWrapper> {
+    fn child_id(&self) -> Option<u32> {
+        self.id()
+    }
+
+    fn creation_identity(&self) -> Result<u64, RuntimeError> {
+        vpn_hub_windows_security::process_creation_identity(
+            self.inner_child()
+                .raw_handle()
+                .ok_or(RuntimeError::OwnedCore)? as usize,
+        )
+        .map_err(|_| RuntimeError::OwnedCore)
+    }
+
+    fn start_kill(&mut self) -> Result<(), RuntimeError> {
+        process_wrap::tokio::ChildWrapper::start_kill(self.as_mut())
+            .map_err(|_| RuntimeError::OwnedCore)
+    }
+
+    fn has_exited(&mut self) -> Result<bool, RuntimeError> {
+        self.try_wait()
+            .map(|status| status.is_some())
+            .map_err(|_| RuntimeError::OwnedCore)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_held_child<C, H, E, S>(
+    slot: &mut Option<C>,
+    identity: &OwnedProcessIdentity,
+    fencing_token: u64,
+    mut observed_hash: H,
+    mut deadline_expired: E,
+    mut sleep_before_retry: S,
+) -> Result<(), RuntimeError>
+where
+    C: StoppableChild,
+    H: FnMut() -> Result<String, RuntimeError>,
+    E: FnMut() -> bool,
+    S: FnMut(),
+{
+    if identity.fencing_token != fencing_token {
+        return Err(RuntimeError::OwnedCore);
+    }
+    let mut child = slot.take().ok_or(RuntimeError::OwnedCore)?;
+    let result = (|| {
+        let observed_creation = child.creation_identity()?;
+        let executable_sha256 = observed_hash()?;
+        if child.child_id() != Some(identity.pid)
+            || observed_creation != identity.creation_identity
+            || executable_sha256 != identity.executable_sha256
+        {
+            return Err(RuntimeError::OwnedCore);
+        }
+        if child.has_exited()? {
+            return Ok(());
+        }
+        child.start_kill()?;
+        loop {
+            if child.has_exited()? {
+                return Ok(());
+            }
+            if deadline_expired() {
+                return Err(RuntimeError::OwnedCore);
+            }
+            sleep_before_retry();
+        }
+    })();
+    if result.is_err() {
+        *slot = Some(child);
+    }
+    result
 }
 
 #[cfg(target_os = "windows")]
@@ -643,38 +757,16 @@ impl CoreBackend for WindowsJobCoreBackend {
         if self.identity.as_ref() != Some(identity) || identity.fencing_token != fencing_token {
             return Err(RuntimeError::OwnedCore);
         }
-        let mut child = self.child.take().ok_or(RuntimeError::OwnedCore)?;
-        let observed_creation = vpn_hub_windows_security::process_creation_identity(
-            child
-                .inner_child()
-                .raw_handle()
-                .ok_or(RuntimeError::OwnedCore)? as usize,
-        )
-        .map_err(|_| RuntimeError::OwnedCore)?;
-        if child.id() != Some(identity.pid)
-            || observed_creation != identity.creation_identity
-            || hash_file(&self.program_data_root.join("bin/mihomo.exe"))?
-                != identity.executable_sha256
-        {
-            self.child = Some(child);
-            return Err(RuntimeError::OwnedCore);
-        }
-        child.start_kill().map_err(|_| RuntimeError::OwnedCore)?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if child
-                .try_wait()
-                .map_err(|_| RuntimeError::OwnedCore)?
-                .is_some()
-            {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                self.child = Some(child);
-                return Err(RuntimeError::OwnedCore);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let executable = self.program_data_root.join("bin/mihomo.exe");
+        stop_held_child(
+            &mut self.child,
+            identity,
+            fencing_token,
+            || hash_file(&executable).map_err(|_| RuntimeError::OwnedCore),
+            || std::time::Instant::now() >= deadline,
+            || std::thread::sleep(std::time::Duration::from_millis(10)),
+        )?;
         self.identity = None;
         Ok(())
     }
@@ -733,7 +825,10 @@ mod tests {
     use crate::{
         CoreArtifact, EntrySummary, OutletHealthSummary, OutletKindSummary, OutletSummary,
     };
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     #[derive(Clone)]
     struct FakeProvider(Arc<Mutex<SupervisionManifest>>);
@@ -756,6 +851,54 @@ mod tests {
         network_fail: bool,
         fail_stop_once: bool,
         stop_attempts: u32,
+    }
+
+    #[cfg(target_os = "windows")]
+    struct FakeStoppableChild {
+        handle_id: u64,
+        pid: u32,
+        creation_identity: u64,
+        creation_fails: bool,
+        start_kill_fails: bool,
+        waits: std::collections::VecDeque<Result<bool, ()>>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    #[cfg(target_os = "windows")]
+    impl Drop for FakeStoppableChild {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    impl StoppableChild for FakeStoppableChild {
+        fn child_id(&self) -> Option<u32> {
+            Some(self.pid)
+        }
+
+        fn creation_identity(&self) -> Result<u64, RuntimeError> {
+            if self.creation_fails {
+                Err(RuntimeError::OwnedCore)
+            } else {
+                Ok(self.creation_identity)
+            }
+        }
+
+        fn start_kill(&mut self) -> Result<(), RuntimeError> {
+            if self.start_kill_fails {
+                Err(RuntimeError::OwnedCore)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn has_exited(&mut self) -> Result<bool, RuntimeError> {
+            self.waits
+                .pop_front()
+                .unwrap_or(Ok(true))
+                .map_err(|()| RuntimeError::OwnedCore)
+        }
     }
 
     impl CoreBackend for FakeBackend {
@@ -850,6 +993,86 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stop_faults_retain_the_same_wrapper_until_exit_is_confirmed() {
+        #[derive(Clone, Copy)]
+        enum Fault {
+            Creation,
+            Hash,
+            InitialTryWait,
+            StartKill,
+            PostKillTryWait,
+            Timeout,
+        }
+
+        for fault in [
+            Fault::Creation,
+            Fault::Hash,
+            Fault::InitialTryWait,
+            Fault::StartKill,
+            Fault::PostKillTryWait,
+            Fault::Timeout,
+        ] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let waits = match fault {
+                Fault::InitialTryWait => [Err(())].into_iter().collect(),
+                Fault::StartKill => [Ok(false)].into_iter().collect(),
+                Fault::PostKillTryWait => [Ok(false), Err(())].into_iter().collect(),
+                Fault::Timeout => [Ok(false), Ok(false)].into_iter().collect(),
+                Fault::Creation | Fault::Hash => std::collections::VecDeque::new(),
+            };
+            let mut slot = Some(FakeStoppableChild {
+                handle_id: 77,
+                pid: 43_210,
+                creation_identity: 99,
+                creation_fails: matches!(fault, Fault::Creation),
+                start_kill_fails: matches!(fault, Fault::StartKill),
+                waits,
+                drops: Arc::clone(&drops),
+            });
+            let identity = OwnedProcessIdentity {
+                pid: 43_210,
+                creation_identity: 99,
+                executable_sha256: "a".repeat(64),
+                fencing_token: 5,
+            };
+            let result = stop_held_child(
+                &mut slot,
+                &identity,
+                5,
+                || {
+                    if matches!(fault, Fault::Hash) {
+                        Err(RuntimeError::OwnedCore)
+                    } else {
+                        Ok("a".repeat(64))
+                    }
+                },
+                || matches!(fault, Fault::Timeout),
+                || {},
+            );
+            assert!(result.is_err());
+            assert_eq!(slot.as_ref().map(|child| child.handle_id), Some(77));
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+            let retained = slot.as_mut().expect("same wrapper retained");
+            retained.creation_fails = false;
+            retained.start_kill_fails = false;
+            retained.waits = [Ok(true)].into_iter().collect();
+            stop_held_child(
+                &mut slot,
+                &identity,
+                5,
+                || Ok("a".repeat(64)),
+                || false,
+                || {},
+            )
+            .expect("retained wrapper can be retried");
+            assert!(slot.is_none());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
     #[test]
     fn command_handler_only_stops_its_exact_owned_child() {
         let source = Arc::new(Mutex::new(manifest(1)));
@@ -885,10 +1108,36 @@ mod tests {
             runtime.supervisor.state(),
             crate::SupervisorState::Running { pid, .. } if pid == owned_pid
         ));
+        runtime
+            .tick(1_002)
+            .expect("failed stop must not exit the service loop");
         let stopped = runtime.handle(&request(Command::Stop), 1_003).unwrap();
         assert!(stopped.owned_pid.is_none());
         assert_eq!(runtime.backend.stop_attempts, 2);
         assert_eq!(runtime.backend.stopped, vec![owned_pid]);
+    }
+
+    #[test]
+    fn stale_stop_if_owned_never_touches_replacement_child() {
+        let source = Arc::new(Mutex::new(manifest(1)));
+        let provider = FakeProvider(source);
+        let mut runtime =
+            HelperRuntime::acquire_helper(FakeBackend::default(), provider, 1_000).unwrap();
+        let first = runtime.handle(&request(Command::Start), 1_001).unwrap();
+        let stale = first.ownership.expect("first ownership snapshot");
+        let first_pid = stale.pid;
+
+        let replacement = runtime.handle(&request(Command::Restart), 1_002).unwrap();
+        let replacement_pid = replacement.owned_pid.expect("replacement pid");
+        assert_ne!(replacement_pid, first_pid);
+
+        let rejected = runtime
+            .handle(&request(Command::StopIfOwned(stale)), 1_003)
+            .unwrap();
+        assert_eq!(rejected.command_applied, Some(false));
+        assert_eq!(rejected.owned_pid, Some(replacement_pid));
+        assert_eq!(runtime.backend.stopped, vec![first_pid]);
+        assert!(runtime.backend.alive);
     }
 
     #[test]

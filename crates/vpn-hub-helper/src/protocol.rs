@@ -26,6 +26,7 @@ pub enum Command {
     Version,
     Start,
     Stop,
+    StopIfOwned(ExpectedOwnership),
     Restart,
     Reload,
     Resume,
@@ -33,18 +34,34 @@ pub enum Command {
     ResetCircuit,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedOwnership {
+    pub pid: u32,
+    pub creation_identity: u64,
+    pub fencing_epoch: u64,
+    pub generation: u64,
+}
+
 impl Command {
-    fn wire_name(self) -> &'static str {
+    fn canonical_value(self) -> String {
         match self {
-            Self::Status => "status",
-            Self::Version => "version",
-            Self::Start => "start",
-            Self::Stop => "stop",
-            Self::Restart => "restart",
-            Self::Reload => "reload",
-            Self::Resume => "resume",
-            Self::NetworkChanged => "network-changed",
-            Self::ResetCircuit => "reset-circuit",
+            Self::Status => "status".into(),
+            Self::Version => "version".into(),
+            Self::Start => "start".into(),
+            Self::Stop => "stop".into(),
+            Self::StopIfOwned(expected) => format!(
+                "stop-if-owned:{}:{}:{}:{}",
+                expected.pid,
+                expected.creation_identity,
+                expected.fencing_epoch,
+                expected.generation
+            ),
+            Self::Restart => "restart".into(),
+            Self::Reload => "reload".into(),
+            Self::Resume => "resume".into(),
+            Self::NetworkChanged => "network-changed".into(),
+            Self::ResetCircuit => "reset-circuit".into(),
         }
     }
 }
@@ -390,7 +407,7 @@ fn canonical_bytes(request: &UnsignedRequest) -> Vec<u8> {
         request.expires_at_unix_ms,
         request.nonce,
         request.challenge,
-        request.command.wire_name()
+        request.command.canonical_value()
     )
     .into_bytes()
 }
@@ -403,7 +420,7 @@ fn canonical_response_bytes(response: &UnsignedResponse) -> Vec<u8> {
         response.install_id,
         response.nonce,
         response.challenge,
-        response.command.wire_name(),
+        response.command.canonical_value(),
         response.payload_sha256,
     )
     .into_bytes()
@@ -552,6 +569,43 @@ mod tests {
             ),
             Err(AuthError::AuthenticationFailed)
         );
+    }
+
+    #[test]
+    fn stop_if_owned_authentication_binds_every_identity_field() {
+        let key = ProtocolKey::from_bytes([9; 32]);
+        let expected = ExpectedOwnership {
+            pid: 40_001,
+            creation_identity: 91,
+            fencing_epoch: 7,
+            generation: 3,
+        };
+        let frame = frame(request(Command::StopIfOwned(expected)), &key);
+        let authenticated = authenticate_frame(
+            &frame,
+            &key,
+            "install-a",
+            15_000,
+            &mut ReplayCache::default(),
+        )
+        .unwrap();
+        assert_eq!(authenticated.command, Command::StopIfOwned(expected));
+
+        for field in ["pid", "creation_identity", "fencing_epoch", "generation"] {
+            let mut tampered: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+            tampered["command"]["stop-if-owned"][field] = 1.into();
+            assert_eq!(
+                authenticate_frame(
+                    &serde_json::to_vec(&tampered).unwrap(),
+                    &key,
+                    "install-a",
+                    15_000,
+                    &mut ReplayCache::default(),
+                ),
+                Err(AuthError::AuthenticationFailed),
+                "{field} must be HMAC-bound"
+            );
+        }
     }
 
     #[test]

@@ -34,8 +34,8 @@ pub use ownership::{
     ChildControl, OwnedChildGuard, OwnedProcessIdentity, OwnershipError, ProcessObservation,
 };
 pub use protocol::{
-    AuthError, AuthenticatedRequest, Command, NamedPipeContract, ProtocolKey, ReplayCache,
-    SignedRequest, SignedResponse, UnsignedRequest, UnsignedResponse,
+    AuthError, AuthenticatedRequest, Command, ExpectedOwnership, NamedPipeContract, ProtocolKey,
+    ReplayCache, SignedRequest, SignedResponse, UnsignedRequest, UnsignedResponse,
     authenticate_challenged_frame, authenticate_response_frame, pipe_name,
 };
 pub use runtime::{CoreBackend, HelperRuntime, ManifestProvider, RuntimeError, RuntimeReply};

@@ -430,7 +430,7 @@ enum SupervisorRoute {
     },
     HelperOwned {
         client: NamedPipeClient,
-        last_status: Mutex<Option<RuntimeReply>>,
+        last_status: Box<Mutex<Option<RuntimeReply>>>,
     },
     FailClosed,
 }
@@ -730,7 +730,7 @@ fn select_supervisor_route_with_program_data(
     };
     SupervisorRoute::HelperOwned {
         client: NamedPipeClient::new(reference.install_id, Arc::new(key)),
-        last_status: Mutex::new(None),
+        last_status: Box::new(Mutex::new(None)),
     }
 }
 
@@ -2420,17 +2420,19 @@ impl AppState {
 
     pub async fn stop_supervised_core_if_pid(&self, expected_pid: u32) -> Result<bool, String> {
         match &self.supervisor_route {
-            SupervisorRoute::HelperOwned { .. } => {
-                let status = self.helper_command(HelperCommand::Status).await?;
-                let owns_pid = status.ok
-                    && status.state == "running"
-                    && status.owned_pid == Some(expected_pid);
-                if !owns_pid {
+            SupervisorRoute::HelperOwned { last_status, .. } => {
+                let expected = last_status
+                    .lock()
+                    .map_err(|_| "Helper 状态锁不可用".to_owned())?
+                    .as_ref()
+                    .and_then(|status| status.ownership)
+                    .filter(|ownership| ownership.pid == expected_pid);
+                let Some(expected) = expected else {
                     return Ok(false);
-                }
-                self.helper_command(HelperCommand::Stop)
+                };
+                self.helper_command(HelperCommand::StopIfOwned(expected))
                     .await
-                    .map(|status| status.owned_pid.is_none())
+                    .map(|status| status.command_applied == Some(true))
             }
             SupervisorRoute::DesktopOwned { .. } => self.stop_owned_core_if_pid(expected_pid),
             SupervisorRoute::FailClosed => Err("监督 authority 不可用；保持 Fail Closed".into()),
@@ -3105,7 +3107,7 @@ mod tests {
         OutletHealth, OutletKind, RoutingPolicy, SecretStoreError, SettingsOutletDraft,
         generate_mihomo_config, outlet_proxy_name,
     };
-    use vpn_hub_helper::{ReplayCache, serve_one_named_pipe_request};
+    use vpn_hub_helper::{ExpectedOwnership, ReplayCache, serve_one_named_pipe_request};
 
     #[derive(Default)]
     struct TestSecretStore {
@@ -3280,11 +3282,18 @@ mod tests {
             generation: 7,
             authority: "helper".into(),
             owned_pid,
+            ownership: owned_pid.map(|pid| ExpectedOwnership {
+                pid,
+                creation_identity: u64::from(pid) + 100,
+                fencing_epoch: 11,
+                generation: 7,
+            }),
             entry_host: "127.0.0.1".into(),
             entry_port: 0,
             outlets: Vec::new(),
             circuit_open: false,
             reason: None,
+            command_applied: None,
         }
     }
 
@@ -3299,7 +3308,7 @@ mod tests {
         let mut state = AppState::new_for_test(directory.path().to_path_buf(), &data);
         state.supervisor_route = SupervisorRoute::HelperOwned {
             client: NamedPipeClient::new(install_id, key),
-            last_status: Mutex::new(cached),
+            last_status: Box::new(Mutex::new(cached)),
         };
         state
     }
@@ -3403,7 +3412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn helper_stop_checks_live_status_instead_of_cached_pid() {
+    async fn helper_stop_is_one_atomic_authenticated_owned_command() {
         let directory = tempfile::tempdir().expect("tempdir");
         let install_id = format!(
             "desktop-stop-{}-{}",
@@ -3415,35 +3424,24 @@ mod tests {
             &directory,
             install_id.clone(),
             Arc::clone(&key),
-            Some(helper_reply("stopped", None)),
+            Some(helper_reply("running", Some(52_001))),
         );
         let sid = current_user_sid();
         let observed = Arc::new(Mutex::new(Vec::new()));
         let server_observed = Arc::clone(&observed);
         let server = tokio::spawn(async move {
             let replay = Arc::new(tokio::sync::Mutex::new(ReplayCache::default()));
-            for reply in [
-                helper_reply("running", Some(52_001)),
-                helper_reply("stopped", None),
-            ] {
-                let observed = Arc::clone(&server_observed);
-                serve_one_named_pipe_request(
-                    &install_id,
-                    &sid,
-                    Arc::clone(&key),
-                    Arc::clone(&replay),
-                    move |request| {
-                        observed
-                            .lock()
-                            .expect("observed commands")
-                            .push(request.command);
-                        serde_json::to_vec(&reply).expect("runtime reply")
-                    },
-                )
-                .await
-                .expect("serve stop flow");
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
+            let mut response = helper_reply("stopped", None);
+            response.command_applied = Some(true);
+            serve_one_named_pipe_request(&install_id, &sid, key, replay, move |request| {
+                server_observed
+                    .lock()
+                    .expect("observed commands")
+                    .push(request.command);
+                serde_json::to_vec(&response).expect("runtime reply")
+            })
+            .await
+            .expect("serve atomic stop flow");
         });
 
         assert!(
@@ -3455,7 +3453,12 @@ mod tests {
         server.await.expect("stop server");
         assert_eq!(
             *observed.lock().expect("observed commands"),
-            [HelperCommand::Status, HelperCommand::Stop]
+            [HelperCommand::StopIfOwned(ExpectedOwnership {
+                pid: 52_001,
+                creation_identity: 52_101,
+                fencing_epoch: 11,
+                generation: 7,
+            })]
         );
     }
 
@@ -4860,14 +4863,18 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         let task =
             tokio::spawn(async move { run_owned_command_cancellable(command, &task_cancel).await });
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !pid_path.exists() && Instant::now() < deadline {
+        let pid = loop {
+            if let Ok(content) = fs::read_to_string(&pid_path)
+                && let Ok(pid) = content.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned validation pid must become readable and complete"
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        let pid = fs::read_to_string(&pid_path)
-            .expect("owned validation pid")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric pid");
+        };
 
         cancel.store(true, Ordering::Release);
         let result = tokio::time::timeout(Duration::from_secs(1), task)
