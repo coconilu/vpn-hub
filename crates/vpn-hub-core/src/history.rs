@@ -148,6 +148,15 @@ pub struct HistoryMetric {
     pub failure_count: u64,
     pub failure_duration_seconds: u64,
     pub ongoing_failure: bool,
+    pub confirmed_route_switches: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryOutletOption {
+    pub outlet_id: String,
+    pub label: String,
+    pub kind: HistoryOutletKind,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,7 +183,11 @@ pub struct HistoryResponse {
     pub window_start: String,
     pub window_end: String,
     pub metrics: Vec<HistoryMetric>,
+    pub outlets: Vec<HistoryOutletOption>,
     pub records: Vec<HistoryRecord>,
+    pub total_count: u64,
+    pub page: u32,
+    pub total_pages: u32,
     pub next_page: Option<u32>,
     pub retention_days: u32,
 }
@@ -219,7 +232,9 @@ pub(crate) fn sanitized_label(value: &str) -> String {
 /// spreadsheet formula prefixes (including whitespace-prefixed formulas).
 pub(crate) fn csv_cell(value: &str) -> String {
     let formula = value
-        .trim_start_matches([' ', '\t', '\r'])
+        .trim_start_matches(|character: char| {
+            character.is_ascii_control() || character.is_whitespace()
+        })
         .starts_with(['=', '+', '-', '@']);
     let guarded = if formula {
         format!("'{value}")
@@ -235,12 +250,23 @@ mod tests {
 
     #[test]
     fn csv_formula_prefixes_are_neutralized() {
-        for value in ["=cmd()", "+1", "-2", "@sum", "  =hidden", "\t+hidden"] {
+        for value in [
+            "=cmd()",
+            "+1",
+            "-2",
+            "@sum",
+            "  =hidden",
+            "\t+hidden",
+            "\n=hidden",
+            "\r\n@hidden",
+        ] {
             let cell = csv_cell(value);
             assert!(cell.starts_with("\"'"), "{value:?}: {cell}");
         }
         assert_eq!(csv_cell("safe, value"), "\"safe, value\"");
         assert_eq!(csv_cell("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_cell("第一行\n第二行"), "\"第一行\n第二行\"");
+        assert_eq!(csv_cell("出口甲"), "\"出口甲\"");
     }
 
     #[test]

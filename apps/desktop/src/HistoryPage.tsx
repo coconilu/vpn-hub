@@ -1,8 +1,8 @@
 import { Download, RefreshCw } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { exportHistory, getHistory, setHistoryRetention } from "./lib/bridge";
+import { createLatestRequestGate } from "./lib/requestGeneration.js";
 import type {
-  DashboardSnapshot,
   HealthStatus,
   HistoryEventType,
   HistoryFilter,
@@ -38,41 +38,51 @@ const eventDescription = (record: HistoryResponse["records"][number]) => {
 };
 
 interface HistoryPageProps {
-  snapshot: DashboardSnapshot;
   onNotice: (message: string) => void;
 }
 
-export function HistoryPage({ snapshot, onNotice }: HistoryPageProps) {
+export function HistoryPage({ onNotice }: HistoryPageProps) {
   const [filter, setFilter] = useState(initialFilter);
   const [history, setHistory] = useState<HistoryResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [retention, setRetention] = useState(30);
+  const requestGate = useRef(createLatestRequestGate());
 
   const load = useCallback(async () => {
+    const generation = requestGate.current.begin();
     setLoading(true);
     setError(null);
     try {
       const response = await getHistory(filter);
+      if (!requestGate.current.isLatest(generation)) return;
       setHistory(response);
       setRetention(response.retention_days);
+      if (response.page !== filter.page) {
+        setFilter((current) => ({ ...current, page: response.page }));
+      }
     } catch (reason) {
+      if (!requestGate.current.isLatest(generation)) return;
       setError(String(reason));
     } finally {
+      if (!requestGate.current.isLatest(generation)) return;
       setLoading(false);
     }
   }, [filter]);
 
-  useEffect(() => void load(), [load]);
-
-  const outlets = useMemo(
-    () => snapshot.routing.outlets.map((outlet) => ({ id: outlet.outlet_id, label: outlet.label })),
-    [snapshot.routing.outlets],
-  );
+  useEffect(() => {
+    void load();
+    return () => { requestGate.current.begin(); };
+  }, [load]);
 
   const update = <K extends keyof HistoryFilter>(key: K, value: HistoryFilter[K]) => {
     setFilter((current) => ({ ...current, [key]: value, page: 0 }));
   };
+  const showsProbeMetrics = filter.event_type === null || filter.event_type === "probe";
+  const showsFailureMetrics = (filter.event_type === null || filter.event_type === "state")
+    && (filter.status === null || filter.status === "down");
+  const showsSwitchMetrics = (filter.event_type === null || filter.event_type === "route_switch")
+    && filter.status === null;
 
   const runExport = async () => {
     setLoading(true);
@@ -115,7 +125,7 @@ export function HistoryPage({ snapshot, onNotice }: HistoryPageProps) {
           <option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option>
         </select>
         <select value={filter.outlet_id ?? ""} onChange={(event) => update("outlet_id", event.target.value || null)}>
-          <option value="">全部出口</option>{outlets.map((outlet) => <option key={outlet.id} value={outlet.id}>{outlet.label}</option>)}
+          <option value="">全部出口</option>{history?.outlets.map((outlet) => <option key={outlet.outlet_id} value={outlet.outlet_id}>{outlet.label}{outlet.deleted ? "（已删除）" : ""}</option>)}
         </select>
         <select value={filter.kind ?? ""} onChange={(event) => update("kind", (event.target.value || null) as HistoryOutletKind | null)}>
           <option value="">全部类型</option><option value="subscription">订阅</option><option value="local_proxy">本地客户端</option><option value="unknown">旧版未知</option>
@@ -137,10 +147,11 @@ export function HistoryPage({ snapshot, onNotice }: HistoryPageProps) {
               <article key={metric.outlet_id}>
                 <div><strong>{metric.label}</strong>{metric.deleted ? <span>已删除</span> : null}</div>
                 <dl>
-                  <div><dt>在线率</dt><dd>{metric.availability_percent.toFixed(1)}%</dd></div>
-                  <div><dt>P50 / P95</dt><dd>{metric.p50_latency_ms ?? "—"} / {metric.p95_latency_ms ?? "—"} ms</dd></div>
-                  <div><dt>故障</dt><dd>{metric.failure_count} 次 · {formatDuration(metric.failure_duration_seconds)}{metric.ongoing_failure ? " · 进行中" : ""}</dd></div>
-                  <div><dt>样本</dt><dd>{metric.sample_count}</dd></div>
+                  <div><dt>在线率</dt><dd>{showsProbeMetrics ? `${metric.availability_percent.toFixed(1)}%` : "—"}</dd></div>
+                  <div><dt>P50 / P95</dt><dd>{showsProbeMetrics ? `${metric.p50_latency_ms ?? "—"} / ${metric.p95_latency_ms ?? "—"} ms` : "—"}</dd></div>
+                  <div><dt>故障</dt><dd>{showsFailureMetrics ? `${metric.failure_count} 次 · ${formatDuration(metric.failure_duration_seconds)}${metric.ongoing_failure ? " · 进行中" : ""}` : "—"}</dd></div>
+                  <div><dt>确认切换</dt><dd>{showsSwitchMetrics ? `${metric.confirmed_route_switches} 次` : "—"}</dd></div>
+                  <div><dt>样本</dt><dd>{showsProbeMetrics ? metric.sample_count : "—"}</dd></div>
                 </dl>
               </article>
             ))}
@@ -163,8 +174,8 @@ export function HistoryPage({ snapshot, onNotice }: HistoryPageProps) {
             </div>
             {!loading && history.records.length === 0 ? <div className="history-message">当前筛选范围没有事件。</div> : null}
             <div className="history-pagination">
-              <button type="button" className="secondary-button" disabled={loading || filter.page === 0} onClick={() => setFilter((value) => ({ ...value, page: value.page - 1 }))}>上一页</button>
-              <span>第 {filter.page + 1} 页 · 每页最多 {filter.page_size} 条</span>
+              <button type="button" className="secondary-button" disabled={loading || history.page === 0} onClick={() => setFilter((value) => ({ ...value, page: history.page - 1 }))}>上一页</button>
+              <span>共 {history.total_count} 条 · 第 {history.total_pages === 0 ? 0 : history.page + 1} / {history.total_pages} 页 · 每页最多 {filter.page_size} 条</span>
               <button type="button" className="secondary-button" disabled={loading || history.next_page === null} onClick={() => setFilter((value) => ({ ...value, page: value.page + 1 }))}>下一页</button>
             </div>
           </section>

@@ -91,7 +91,11 @@ export async function getHistory(filter: HistoryFilter): Promise<HistoryResponse
       window_start: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
       window_end: new Date().toISOString(),
       metrics: [],
+      outlets: [],
       records: [],
+      total_count: 0,
+      page: 0,
+      total_pages: 0,
       next_page: null,
       retention_days: 30,
     };

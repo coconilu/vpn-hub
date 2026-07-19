@@ -18,13 +18,13 @@ SQLite `user_version = 4` 在单一事务内从 v2 或 v3 升级：
 | `history_settings` | 单例保留期，范围 1–3650 天，默认 30 天 |
 | 索引 | 时间 + outlet + status，以及真实切换的时间 + from/to |
 
-旧数据无法可靠推断出口类型时保留 `unknown`，不会猜成订阅或本地客户端。迁移失败回滚整个事务并保留旧 `user_version`；高于 v4 的数据库在任何写入前被拒绝。
+旧数据无法可靠推断出口类型时保留 `unknown`，不会猜成订阅或本地客户端。v2/v3 迁移会在同一事务中先脱敏所有持久化显示快照，并把无毫秒 `Z`、毫秒 `Z` 或 `+00:00` 等合法 RFC 3339 时间统一成可排序的 UTC `YYYY-MM-DDTHH:MM:SS.mmmZ`。非法时间、schema 或写入失败会回滚整个事务并保留旧 `user_version`；高于 v4 的数据库在任何写入前被拒绝。
 
 ## 查询与统计口径
 
-查询固定支持 `1h`、`24h`、`7d`、`30d`，并可按稳定 `outlet_id`、`subscription/local_proxy/unknown`、健康状态和 `probe/state/route_switch` 事件类型筛选。事件以 `(occurred_at, source_order, row_id)` 稳定倒序，每页最多 500 条。桌面命令使用 `spawn_blocking`，SQLite 查询不会占用 Tauri async/UI 线程。
+查询固定支持 `1h`、`24h`、`7d`、`30d`，并可按稳定 `outlet_id`、`subscription/local_proxy/unknown`、健康状态和 `probe/state/route_switch` 事件类型筛选。事件以 `(occurred_at, source_order, row_id)` 稳定倒序，每页最多 500 条；同一 UNION 同时计算 filtered total 和总页数，清理后越界页会被夹到最后有效页。响应另带所选时间窗的脱敏出口目录，当前配置已经删除的 tombstone 仍可选择。桌面命令使用 `spawn_blocking`，SQLite 查询不会占用 Tauri async/UI 线程；UI 使用 request generation，只允许最新筛选请求提交结果。
 
-统计只受时间、出口和 kind 约束；状态和事件类型用于事件明细筛选，不改变同一时间窗的出口总体口径：
+统计与明细、total 和 CSV 使用同一 active filter 交集。`event_type=probe` 只计算样本指标；`state` 只计算故障指标；`route_switch` 只计算真实切换；未指定 event type 时合并三者。status 对 probe 的当前样本状态和 state 的 `to_status` 生效；route switch 没有健康状态，因此指定 status 时不参与。UI 对不适用指标显示 `—`。
 
 | 指标 | 固定定义 |
 | --- | --- |
@@ -34,12 +34,13 @@ SQLite `user_version = 4` 在单一事务内从 v2 或 v3 升级：
 | 故障时长 | 每段 `down` 区间与查询窗口的交集；未恢复故障截断到查询时刻 |
 | 同时间戳 | 同一数据源按 SQLite 自增 ID 顺序解释，避免恢复/故障次序不确定 |
 | 真实切换 | 仅 `record_route_switch` 中 Controller 成功确认后写入的切换，不从策略意图推测 |
+| 确认切换次数 | 对完整过滤窗口聚合；每条真实切换为匹配的 from/to 稳定出口各计一次，不受当前分页影响 |
 
-没有样本时返回空指标和空事件，不合成 `0 ms` 或虚构在线率。
+没有样本和状态证据时返回空指标和空事件，不合成 `0 ms` 或虚构在线率。窗口开始前已进入 `down` 且尚未恢复的出口即使窗口内零样本，也会保留故障指标、ongoing 标记和可选择的历史出口目录。
 
 ## CSV 与性能
 
-CSV 列顺序和 RFC 3339 时间格式稳定。所有单元格使用 RFC 4180 双引号转义；去掉前导空白后以 `= + - @` 开头的值会加前置单引号，防止 Excel/表格软件执行公式。导出用 SQLite 单游标逐行写入本机私有 runtime 目录，内存不随 30 天样本量线性增长。
+CSV 列顺序和 canonical RFC 3339 UTC 时间格式稳定。所有单元格使用 RFC 4180 双引号转义；去掉前导空格、tab、LF、CRLF 和其他控制/Unicode 空白后，以 `= + - @` 开头的值会加前置单引号，防止 Excel/表格软件执行公式。导出用 SQLite 单游标逐行写入本机私有 runtime 目录，内存不随 30 天样本量线性增长。
 
 自动化规模夹具覆盖三个出口各 14,400 个样本（30 天、180 秒周期，共 43,200 行），同时验证查询计划命中时间索引、分页查询和流式导出的宽松上限，避免把机器波动变成脆弱 CI。
 

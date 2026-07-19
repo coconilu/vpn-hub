@@ -24,7 +24,7 @@ pub use guardian_cycle::{
 };
 pub use history::{
     HistoryEventType, HistoryExport, HistoryFilter, HistoryMetric, HistoryOutletKind,
-    HistoryOutletSnapshot, HistoryRecord, HistoryResponse, HistoryWindow,
+    HistoryOutletOption, HistoryOutletSnapshot, HistoryRecord, HistoryResponse, HistoryWindow,
 };
 pub use mihomo::{
     CURRENT_CONFIG_VERSION, EntryConfig, FAIL_CLOSED_PROXY, MASTER_SELECTOR, OutletConfig,

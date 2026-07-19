@@ -100,7 +100,7 @@ export default function App() {
             onCoreToggle={handleCoreToggle}
           />
         ) : view === "history" ? (
-          <HistoryPage snapshot={snapshot} onNotice={setNotice} />
+          <HistoryPage onNotice={setNotice} />
         ) : (
           <main className="placeholder-view">
             <Construction />

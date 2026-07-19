@@ -27,6 +27,14 @@ export interface HistoryMetric {
   failure_count: number;
   failure_duration_seconds: number;
   ongoing_failure: boolean;
+  confirmed_route_switches: number;
+}
+
+export interface HistoryOutletOption {
+  outlet_id: string;
+  label: string;
+  kind: HistoryOutletKind;
+  deleted: boolean;
 }
 
 export interface HistoryRecord {
@@ -51,7 +59,11 @@ export interface HistoryResponse {
   window_start: string;
   window_end: string;
   metrics: HistoryMetric[];
+  outlets: HistoryOutletOption[];
   records: HistoryRecord[];
+  total_count: number;
+  page: number;
+  total_pages: number;
   next_page: number | null;
   retention_days: number;
 }
