@@ -35,6 +35,14 @@ pub enum PlanOperation {
         principals: Vec<String>,
     },
     ProvisionAuthorityLeaseFile,
+    ProvisionEntrySwitchState {
+        authority_relative_path: String,
+        journal_relative_path: String,
+        principals: Vec<String>,
+    },
+    RequireInteractiveUserEntrySwitchRecovery {
+        journal_relative_path: String,
+    },
     RegisterService {
         account: AccountContract,
         start_automatically: bool,
@@ -110,6 +118,11 @@ impl InstallPlan {
                         "SYSTEM".into(),
                     ],
                 },
+                PlanOperation::ProvisionEntrySwitchState {
+                    authority_relative_path: "entry-switch/authority.lease".into(),
+                    journal_relative_path: "entry-switch/entry-switch.json".into(),
+                    principals: vec!["interactive-user-sid".into(), "SYSTEM".into()],
+                },
                 PlanOperation::ProvisionAuthorityLeaseFile,
                 PlanOperation::ApplyProgramDataAcl {
                     relative_path: "authority.lease".into(),
@@ -142,6 +155,9 @@ impl InstallPlan {
                 },
             ],
             InstallAction::Upgrade => vec![
+                PlanOperation::RequireInteractiveUserEntrySwitchRecovery {
+                    journal_relative_path: "entry-switch/entry-switch.json".into(),
+                },
                 PlanOperation::StopOwnedJob,
                 PlanOperation::VerifySignedArtifact {
                     relative_path: "bin/vpn-hub-helper.exe".into(),
@@ -158,6 +174,9 @@ impl InstallPlan {
                 PlanOperation::VerifyNoOwnedJob,
             ],
             InstallAction::Uninstall => vec![
+                PlanOperation::RequireInteractiveUserEntrySwitchRecovery {
+                    journal_relative_path: "entry-switch/entry-switch.json".into(),
+                },
                 PlanOperation::StopOwnedJob,
                 PlanOperation::RemoveServiceRegistration,
                 PlanOperation::RemoveProtectedReference {
@@ -236,6 +255,10 @@ mod tests {
             InstallPlan::build(InstallAction::Upgrade, "install-a", &"b".repeat(64)).unwrap();
         assert!(matches!(
             plan.operations.first(),
+            Some(PlanOperation::RequireInteractiveUserEntrySwitchRecovery { .. })
+        ));
+        assert!(matches!(
+            plan.operations.get(1),
             Some(PlanOperation::StopOwnedJob)
         ));
         assert!(matches!(
@@ -256,6 +279,30 @@ mod tests {
         assert!(
             plan.operations
                 .contains(&PlanOperation::VerifyNoProtectedReferences)
+        );
+        assert!(matches!(
+            plan.operations.first(),
+            Some(PlanOperation::RequireInteractiveUserEntrySwitchRecovery { .. })
+        ));
+    }
+
+    #[test]
+    fn entry_switch_state_excludes_local_service_and_requires_user_recovery() {
+        let install =
+            InstallPlan::build(InstallAction::Install, "install-a", &"d".repeat(64)).unwrap();
+        let state = install
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                PlanOperation::ProvisionEntrySwitchState { principals, .. } => Some(principals),
+                _ => None,
+            })
+            .expect("entry switch state");
+        assert_eq!(state, &["interactive-user-sid", "SYSTEM"]);
+        assert!(
+            !state
+                .iter()
+                .any(|principal| principal.contains("LOCAL SERVICE"))
         );
     }
 }

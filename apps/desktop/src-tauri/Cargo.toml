@@ -25,9 +25,11 @@ vpn-hub-core = { path = "../../../crates/vpn-hub-core" }
 vpn-hub-helper = { path = "../../../crates/vpn-hub-helper" }
 zeroize.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+vpn-hub-windows-security = { path = "../../../crates/vpn-hub-windows-security" }
+
 [dev-dependencies]
 tempfile = "3.23.0"
-vpn-hub-windows-security = { path = "../../../crates/vpn-hub-windows-security" }
 
 [lints]
 workspace = true

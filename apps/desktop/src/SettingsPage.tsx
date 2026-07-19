@@ -8,6 +8,7 @@ import {
   isCurrentPreviewResponse,
   moveItem,
 } from "./lib/settingsModel";
+import { buildEntrySwitchFoundationPreview } from "./lib/entrySwitchModel";
 import type { CredentialState, LocalProxyProtocol, SafeSettingsView, SettingsDraft, SettingsOutlet, SettingsPreview } from "./types";
 
 interface Props { currentOutletId: string | null; onApplied: () => Promise<void>; onNotice: (message: string) => void }
@@ -21,6 +22,8 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const [credentialIntentById, setCredentialIntentById] = useState<Record<string, "set" | "delete">>({});
   const [replacement, setReplacement] = useState<string | null>(null);
   const [failClosed, setFailClosed] = useState(false);
+  const [entrySwitchConfirmed, setEntrySwitchConfirmed] = useState(false);
+  const [applySystemProxy, setApplySystemProxy] = useState(false);
   const [preview, setPreview] = useState<SettingsPreview | null>(null);
   const [pageState, setPageState] = useState<PageState>("loading");
   const [error, setError] = useState<string | null>(null);
@@ -96,6 +99,13 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const canApply = preview !== null && preview.issues.length === 0
     && preview.request_fingerprint === currentRequest.request_fingerprint
     && (preview.diff.changes.length > 0 || credentialIntentCount > 0);
+  const originalEntry = view.draft.entry;
+  const entrySwitchPreview = buildEntrySwitchFoundationPreview(
+    originalEntry,
+    draft.entry,
+    applySystemProxy,
+    entrySwitchConfirmed,
+  );
 
   return <main className="settings-view">
     <header className="settings-header"><div><h1>设置</h1><p>统一入口、动态出口与 Guardian 策略。普通保存不会修改系统代理、TUN、Service 或第三方客户端。</p></div><div className="settings-actions">
@@ -114,6 +124,16 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
       <label>冷却时间（秒）<input type="number" min="1" max="86400" value={draft.cooldown_seconds} onChange={(event) => changeDraft((current) => ({ ...current, cooldown_seconds: Number(event.target.value) }))} /></label>
       <label>改善阈值（毫秒）<input type="number" min="0" max="60000" value={draft.minimum_improvement_ms} onChange={(event) => changeDraft((current) => ({ ...current, minimum_improvement_ms: Number(event.target.value) }))} /></label>
     </div><label className="wide-field">HTTPS 探测目标（每行一个）<textarea rows={3} value={draft.probe_targets.join("\n")} onChange={(event) => changeDraft((current) => ({ ...current, probe_targets: event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean) }))} /></label></section>
+
+    <section className="settings-card fail-closed-card" aria-labelledby="entry-switch-title">
+      <h2 id="entry-switch-title">安全入口切换预览</h2>
+      <p>当前入口 {originalEntry.host}:{originalEntry.port} → 目标 {draft.entry.host}:{draft.entry.port}。普通“应用设置”不会修改 Windows 系统代理。</p>
+      <label className="check-field"><input type="checkbox" checked={applySystemProxy} onChange={(event) => setApplySystemProxy(event.target.checked)} />切换成功后同时应用当前用户的 Windows 系统代理</label>
+      <label className="check-field"><input type="checkbox" checked={entrySwitchConfirmed} onChange={(event) => setEntrySwitchConfirmed(event.target.checked)} />我确认：只有 Controller、出口和 Fail Closed 全部验证通过后才提交入口</label>
+      <ol>{entrySwitchPreview.steps.map((step) => <li key={step}>{step}</li>)}</ol>
+      <div role="status" aria-live="polite"><strong>当前不可执行：</strong><ul>{entrySwitchPreview.issues.map((issue) => <li key={issue.code}>{issue.message}</li>)}</ul></div>
+      <button className="primary-button" type="button" disabled aria-disabled="true" title="等待隔离 Windows live acceptance">执行安全切换</button>
+    </section>
 
     <section className="settings-card"><h2>Guardian 与历史</h2><div className="settings-grid compact">
       {([ ["刷新周期（秒）", "refresh_interval_seconds", 5, 86400], ["连接超时（毫秒）", "connect_timeout_ms", 1, 120000], ["请求超时（毫秒）", "request_timeout_ms", 1, 120000], ["失败阈值", "failure_threshold", 1, 100], ["恢复阈值", "recovery_threshold", 1, 100], ["历史保留（天）", "retention_days", 1, 3650] ] as const).map(([label, field, min, max]) => <label key={field}>{label}<input type="number" min={min} max={max} value={draft[field]} onChange={(event) => changeDraft((current) => ({ ...current, [field]: Number(event.target.value) }))} /></label>)}

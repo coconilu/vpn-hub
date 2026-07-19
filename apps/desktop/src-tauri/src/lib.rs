@@ -1,4 +1,6 @@
 mod commands;
+#[cfg(target_os = "windows")]
+mod entry_switch_windows;
 mod lifecycle;
 mod runtime;
 

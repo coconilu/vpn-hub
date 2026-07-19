@@ -7,6 +7,7 @@
 mod config;
 mod controller;
 mod durable;
+mod entry_switch;
 mod guardian_cycle;
 mod history;
 mod mihomo;
@@ -23,6 +24,13 @@ pub use controller::{ControllerClient, ControllerError};
 pub use durable::{
     DurableFileOps, SystemDurableFileOps, durable_atomic_save_with_backup,
     durable_remove_if_exists, durable_replace, durable_write_new,
+};
+pub use entry_switch::{
+    EntryBackend, EntrySwitchConsent, EntrySwitchError, EntrySwitchJournal,
+    EntrySwitchJournalRecord, EntrySwitchPhase, EntrySwitchPlan, EntrySwitchPlanner,
+    EntrySwitchRequest, EntrySwitchTransaction, FileEntrySwitchJournal, MemoryEntrySwitchJournal,
+    OwnedCoreIdentity, PortOwnership, ProxyBackend, ProxyCapability, SwitchVerification,
+    SystemProxySnapshot, UserProxyAuthority, WindowsProxyMode,
 };
 pub use guardian_cycle::{
     GuardianCycleError, GuardianCycleOutcome, RoutingSession, RoutingStateError,

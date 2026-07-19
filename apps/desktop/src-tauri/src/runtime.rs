@@ -493,7 +493,8 @@ impl Drop for PendingChild {
 }
 
 struct ProbePortLease {
-    _listener: TcpListener,
+    #[allow(dead_code)] // held for RAII; tests also inspect it for zero-connect preview proof
+    listener: TcpListener,
     address: SocketAddr,
 }
 
@@ -517,10 +518,7 @@ impl ProbePortLease {
                 .local_addr()
                 .map_err(|_| "无法读取隔离 UDP 探测端口".to_string())?;
             if !matches!(address.port(), 3_666 | 6_666) && !excluded.contains(&address.port()) {
-                return Ok(Self {
-                    _listener: listener,
-                    address,
-                });
+                return Ok(Self { listener, address });
             }
         }
         Err("无法获得安全的隔离 UDP 探测端口".into())
@@ -1020,15 +1018,9 @@ impl AppState {
             }
         };
         if let Some(candidate) = candidate.as_ref() {
-            if candidate.entry != current.entry
-                && is_endpoint_reachable(&candidate.entry.host, candidate.entry.port)
-            {
-                issues.push(ValidationIssue::new(
-                    "entry.port",
-                    "entry_port_occupied",
-                    "候选统一入口已被其他监听器占用；应用不会停止或接管该进程",
-                ));
-            }
+            // Settings preview is pure and must never contact a user-entered
+            // port. Exact ownership is checked only inside the separately
+            // consented entry-switch transaction; startup also re-checks it.
             let current_active = self
                 .routing_engine
                 .lock()
@@ -4079,7 +4071,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     }
 
     #[test]
-    fn occupied_random_entry_is_rejected_without_stopping_unknown_listener() {
+    fn settings_preview_never_contacts_a_user_entered_port() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
         let state = AppState::new_for_test(workspace_root, directory.path());
@@ -4108,13 +4100,13 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         let preview = state
             .preview_settings(&preview_request(&draft, None, false, Vec::new()))
             .expect("preview");
-        assert!(
-            preview
-                .issues
-                .iter()
-                .any(|issue| issue.code == "entry_port_occupied")
+        assert!(preview.issues.is_empty());
+        lease.listener.set_nonblocking(true).expect("nonblocking");
+        assert_eq!(
+            lease.listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "preview must not connect to or probe the candidate entry"
         );
-        assert!(TcpStream::connect(lease.address()).is_ok());
     }
 
     #[test]
