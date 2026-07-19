@@ -217,10 +217,11 @@ pub async fn apply_settings(
     state: State<'_, AppState>,
     request: SettingsApplyRequest,
 ) -> Result<SettingsApplyResult, String> {
-    app.state::<lifecycle::DesktopCoordinator>()
-        .prepare_config_reload();
     let _transaction = state.lock_routing_transaction().await;
-    let result = state.apply_settings(request)?;
+    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    let result = after_successful_settings_commit(state.apply_settings(request), || {
+        coordinator.prepare_config_reload();
+    })?;
     lifecycle::dispatch(
         &app,
         LifecycleEvent::ConfigReload {
@@ -228,6 +229,15 @@ pub async fn apply_settings(
         },
     );
     Ok(result)
+}
+
+fn after_successful_settings_commit<T>(
+    result: Result<T, String>,
+    on_commit: impl FnOnce(),
+) -> Result<T, String> {
+    let committed = result?;
+    on_commit();
+    Ok(committed)
 }
 
 async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
@@ -504,6 +514,7 @@ impl Drop for OwnedUdpEcho {
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn set_route_mode(
+    app: AppHandle,
     state: State<'_, AppState>,
     mode: RouteMode,
     manual_outlet: Option<String>,
@@ -514,6 +525,7 @@ pub async fn set_route_mode(
     }
     state.set_route_mode(mode, manual_outlet)?;
     record_routing_cycle_locked(&state).await?;
+    lifecycle::dispatch(&app, LifecycleEvent::RouteChanged);
     load_dashboard(&state)
 }
 
@@ -550,7 +562,8 @@ pub async fn start_development_core(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreStatus, String> {
-    app.state::<lifecycle::DesktopCoordinator>()
+    let start_epoch = app
+        .state::<lifecycle::DesktopCoordinator>()
         .prepare_manual_start();
     let _transaction = state.lock_routing_transaction().await;
     let mut status = match state.start_development_core().await {
@@ -572,7 +585,8 @@ pub async fn start_development_core(
         ));
     }
     if let Some(pid) = status.pid {
-        lifecycle::dispatch(&app, LifecycleEvent::CoreStarted { pid });
+        app.state::<lifecycle::DesktopCoordinator>()
+            .complete_manual_start(pid, start_epoch);
     }
     status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();
     Ok(status)
@@ -584,16 +598,34 @@ pub async fn stop_development_core(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreStatus, String> {
-    app.state::<lifecycle::DesktopCoordinator>().prepare_stop();
+    let stop_epoch = app.state::<lifecycle::DesktopCoordinator>().prepare_stop();
     let _transaction = state.lock_routing_transaction().await;
     let status = state.stop_development_core()?;
-    lifecycle::dispatch(&app, LifecycleEvent::CoreStopped);
+    app.state::<lifecycle::DesktopCoordinator>()
+        .complete_stop(stop_epoch);
     Ok(status)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_settings_apply_does_not_cancel_scheduled_recovery() {
+        let coordinator = lifecycle::DesktopCoordinator::new();
+        let recovery_epoch = coordinator.recovery_epoch();
+        let result = after_successful_settings_commit::<()>(Err("stale preview".into()), || {
+            coordinator.prepare_config_reload();
+        });
+        assert!(result.is_err());
+        assert_eq!(coordinator.recovery_epoch(), recovery_epoch);
+
+        after_successful_settings_commit(Ok(()), || {
+            coordinator.prepare_config_reload();
+        })
+        .expect("successful commit");
+        assert_eq!(coordinator.recovery_epoch(), recovery_epoch + 1);
+    }
 
     fn subscription() -> OutletConfig {
         OutletConfig {

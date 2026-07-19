@@ -3,7 +3,7 @@ use std::{
     env, fs,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Mutex,
         atomic::{AtomicBool, Ordering},
@@ -1907,15 +1907,18 @@ impl AppState {
 
         let executable = self.find_mihomo_executable()?;
         ensure_core_start_not_cancelled(cancel)?;
-        let validation = hidden_command(&executable)
+        let mut validation_command = hidden_command(&executable);
+        validation_command
             .arg("-t")
             .arg("-d")
             .arg(&self.runtime_directory)
             .arg("-f")
             .arg(&config_path)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::null());
+        let validation = run_owned_command_cancellable(validation_command, cancel)
+            .await
             .map_err(|error| format!("无法验证 Mihomo 配置：{error}"))?;
         if !validation.success() {
             return Err(core_diagnostic(CoreDiagnostic::ValidationFailed).into());
@@ -2652,6 +2655,27 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+async fn run_owned_command_cancellable(
+    mut command: Command,
+    cancel: &AtomicBool,
+) -> Result<ExitStatus, String> {
+    ensure_core_start_not_cancelled(cancel)?;
+    let child = command
+        .spawn()
+        .map_err(|error| format!("无法启动应用自管校验进程：{error}"))?;
+    let mut child = PendingChild::new(child);
+    loop {
+        ensure_core_start_not_cancelled(cancel)?;
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("无法读取应用自管校验进程状态：{error}"))?
+        {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn ensure_core_start_not_cancelled(cancel: &AtomicBool) -> Result<(), String> {
     if cancel.load(Ordering::Acquire) {
         Err("应用自管核心启动已取消；不会发布迟到进程".into())
@@ -2792,6 +2816,7 @@ mod tests {
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        time::Instant,
     };
     use vpn_hub_core::{
         HealthStatus, LocalProxyProtocol, MASTER_SELECTOR, MonitorConfig, OutletConfig,
@@ -4177,7 +4202,10 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             controller_port: 45_904,
             controller_secret: "test-only".into(),
         });
-        std::thread::sleep(Duration::from_millis(250));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.owned_core_is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
         assert!(!state.owned_core_is_running(pid));
         assert!(state.managed_core.lock().expect("managed core").is_none());
     }
@@ -4220,6 +4248,60 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 .is_err()
         );
         assert!(state.owned_core_pid().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellable_owned_command_kills_and_reaps_its_child() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pid_path = directory.path().join("validation-pid.txt");
+        let escaped_path = pid_path.to_string_lossy().replace('\'', "''");
+        let mut command = hidden_command("powershell.exe");
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Set-Content -LiteralPath '{escaped_path}' -Value $PID; Start-Sleep -Seconds 30"
+            ),
+        ]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task_cancel = Arc::clone(&cancel);
+        let task =
+            tokio::spawn(async move { run_owned_command_cancellable(command, &task_cancel).await });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_path.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let pid = fs::read_to_string(&pid_path)
+            .expect("owned validation pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric pid");
+
+        cancel.store(true, Ordering::Release);
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellation must be bounded")
+            .expect("validation task");
+        assert!(result.is_err());
+        let still_running = hidden_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ])
+            .status()
+            .expect("process ownership check")
+            .success();
+        assert!(
+            !still_running,
+            "cancelled validation child must not survive"
+        );
     }
 
     #[test]

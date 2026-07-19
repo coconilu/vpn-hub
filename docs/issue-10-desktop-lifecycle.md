@@ -12,11 +12,14 @@
 | 明确退出 / OS shutdown | cancel + bounded join → stop → permit exit | 高优先级取消后台工作，最多等待 3 秒后中止任务，只回收 owned child，再退出 |
 | owned child 意外退出 | 通知 → 有界退避 → restart → full Guardian | 独立 PID watcher 以 250ms 周期核对同一 owned PID |
 | 配置提交 | `RefreshTray` → restart（按需）→ full Guardian | 提交后立即刷新动态投影，探测异步执行 |
+| 手动路由模式 / 出口变更成功 | `RefreshTray` → collect transitions | Guardian 决策成功后立即刷新并发送一次跃迁通知，不追加 probe |
 | 睡眠间隔 / 网络 fingerprint 变化 | coalesce → full Guardian | 保留数据库阈值、路由 cooldown 和 Fail Closed 状态机 |
 
 ## 并发与恢复事务
 
-恢复启动、手动启动、停止和配置应用共享同一把 routing transaction 锁。自动恢复从启动前检查、child 发布、首次 Guardian 决策到最终提交均处于这条事务边界内；控制命令会先提升 recovery epoch 并设置取消标记，再等待事务锁。启动中的 child 由 `PendingChild` 守卫，在发布前出错、取消或任务被 abort 时都会 kill 并 wait，避免迟到子进程。
+恢复启动、手动启动、停止和配置应用共享同一把 routing transaction 锁。自动恢复从启动前检查、child 发布、首次 Guardian 决策到最终提交均处于这条事务边界内。手动启动和停止完成事件携带各自的 recovery epoch；同批 Stop 优先，跨批 stale completion 会被丢弃，CoreStarted 还必须验证 `AppState` 正持有同一 PID。配置应用只有在提交成功后才提升 epoch，预览过期、验证失败或提交失败不会取消既有退避恢复。
+
+启动中的 child 由 `PendingChild` 守卫，在发布前出错、取消或任务被 abort 时都会 kill 并 wait，避免迟到子进程。`mihomo -t` 也使用可取消的 owned child 与异步状态轮询；控制任务首次等待超时后 abort，再执行一次有界 join，不做无上限等待。
 
 恢复 worker 在 child 发布后立即记录预期 PID，并在首次 Guardian 前后都核对：
 
@@ -24,7 +27,7 @@
 2. 取消标记未设置；
 3. `AppState` 仍持有同一个 PID，且该进程存活。
 
-任一条件不满足都会仅停止该 owned PID，不把 direct fallback 或已被替换的 PID 视为成功。第一次自动替换也只有在首次完整 Guardian 成功后才产生 `CoreRecovered`。
+任一条件不满足都会仅停止该 owned PID，不把 direct fallback 或已被替换的 PID 视为成功。恢复中的 child 早退会归类为本次启动失败并继续既有 attempt / terminal 策略，不会被普通取消分支吞掉。第一次自动替换也只有在首次完整 Guardian 成功后才产生 `CoreRecovered`。
 
 连续自动启动最多尝试 5 次；达到上限后进入终止态并只发送一次去重通知。只有明确的用户配置提交或新的网络恢复信号可以重置该终止态，普通定时 tick 不会无限重试。
 
@@ -55,6 +58,6 @@ Windows 网络变化检测使用隐藏的 owned `ipconfig /all` 子进程。stdo
 
 ## 验证策略
 
-自动测试覆盖 reducer transition、重复事件、hide vs exit、有界退避与五次终止、首次恢复提交、动态投影、通知去重与脱敏、固定容量 mailbox 洪泛、慢任务取消与 join、真实 `AppState` 事务串行化、取消前不发布 child、未发布 child 的 RAII 回收、owned PID 早退 / 变化，以及网络采样的大输出、变化、失败、超时与清理。
+自动测试覆盖 reducer transition、重复事件、hide vs exit、启动 / 停止 epoch 乱序、有界退避与五次终止、恢复 child 早退、首次恢复提交、动态投影、手动路由即时刷新与单次 transition、通知去重与脱敏、固定容量 mailbox 洪泛、慢任务双重有界取消与 join、真实 `AppState` 事务串行化、失败配置不推进 recovery epoch、可取消校验 child、取消前不发布 child、未发布 child 的 RAII 回收、owned PID 早退 / 变化，以及网络采样的大输出、变化、失败、超时与清理。
 
 真实桌面验收不得关闭用户正在运行的应用或代理，也不得接管 live 6666。无法唯一确认隔离窗口时，以 headless state-machine、Tauri compile、前端测试和 debug no-bundle 构建为准。
