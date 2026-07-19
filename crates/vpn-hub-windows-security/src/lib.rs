@@ -7,6 +7,7 @@
 #[cfg(target_os = "windows")]
 mod windows {
     use std::{
+        collections::{HashMap, HashSet},
         ffi::c_void,
         fs::OpenOptions,
         io,
@@ -28,10 +29,18 @@ mod windows {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum ProtectedPathPolicy {
         Root,
+        StrictDirectory,
+        MutableDirectory,
         Immutable,
         Executable,
         Mutable,
         SecretMaterial,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct FileIdentity {
+        volume_serial_number: u32,
+        file_index: u64,
     }
     use windows_sys::Win32::{
         Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, FILETIME},
@@ -40,8 +49,9 @@ mod windows {
         },
         Security::SECURITY_ATTRIBUTES,
         Storage::FileSystem::{
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+            BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_READ,
+            GetFileInformationByHandle, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
         },
         System::Threading::GetProcessTimes,
     };
@@ -60,24 +70,112 @@ mod windows {
         let root_file = open_no_follow(root)?;
         let expected_root = normalize_final_path(&root_file)?;
         validate_secure_handle(&root_file, interactive_user_sid, ProtectedPathPolicy::Root)?;
+        validate_component_chain(root, &expected_root, critical_paths, interactive_user_sid)
+    }
+
+    fn validate_component_chain(
+        root: &Path,
+        expected_root: &Path,
+        critical_paths: &[(PathBuf, ProtectedPathPolicy)],
+        interactive_user_sid: &str,
+    ) -> io::Result<()> {
+        let mut policies = HashMap::new();
         for (path, policy) in critical_paths {
-            let file = open_no_follow(path)?;
-            let final_path = normalize_final_path(&file)?;
-            if !final_path.starts_with(&expected_root) || final_path == expected_root {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "installation path escapes protected root",
-                ));
+            let relative = safe_relative_path(root, path)?;
+            policies.insert(root.join(relative), *policy);
+        }
+
+        let mut checked = HashSet::new();
+        for (path, _) in critical_paths {
+            let relative = safe_relative_path(root, path)?;
+            let components = relative.components().collect::<Vec<_>>();
+            let mut current = root.to_path_buf();
+            for (index, component) in components.iter().enumerate() {
+                let std::path::Component::Normal(name) = component else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "installation path contains unsafe component",
+                    ));
+                };
+                current.push(name);
+                if !checked.insert(current.clone()) {
+                    continue;
+                }
+                let file = open_no_follow(&current)?;
+                let final_path = normalize_final_path(&file)?;
+                if !final_path.starts_with(expected_root) || final_path == expected_root {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "installation path escapes protected root",
+                    ));
+                }
+                if index + 1 < components.len() && !file.metadata()?.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "installation parent component is not a directory",
+                    ));
+                }
+                let policy = policies
+                    .get(&current)
+                    .copied()
+                    .unwrap_or(ProtectedPathPolicy::StrictDirectory);
+                validate_secure_handle(&file, interactive_user_sid, policy)?;
             }
-            validate_secure_handle(&file, interactive_user_sid, *policy)?;
         }
         Ok(())
+    }
+
+    fn safe_relative_path<'a>(root: &Path, path: &'a Path) -> io::Result<&'a Path> {
+        let relative = path.strip_prefix(root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "installation path escapes protected root",
+            )
+        })?;
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "installation path contains unsafe component",
+            ));
+        }
+        Ok(relative)
+    }
+
+    /// Opens a file without following reparse points and denies concurrent
+    /// write/delete sharing. The returned handle can be held through process spawn.
+    ///
+    /// # Errors
+    /// Returns an error for a reparse point or when stable file identity is unavailable.
+    pub fn open_verified_file(path: &Path) -> io::Result<(std::fs::File, FileIdentity)> {
+        let file = open_no_follow(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "verified path is not a file",
+            ));
+        }
+        let identity = file_identity(&file)?;
+        Ok((file, identity))
+    }
+
+    /// Reopens a file under the same no-follow/share contract and reads its identity.
+    ///
+    /// # Errors
+    /// Returns an error when the path is replaced, linked, or inaccessible.
+    pub fn verified_file_identity(path: &Path) -> io::Result<FileIdentity> {
+        let file = open_no_follow(path)?;
+        file_identity(&file)
     }
 
     fn open_no_follow(path: &Path) -> io::Result<std::fs::File> {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .share_mode(FILE_SHARE_READ)
             .open(path)?;
         if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(io::Error::new(
@@ -86,6 +184,23 @@ mod windows {
             ));
         }
         Ok(file)
+    }
+
+    fn file_identity(file: &std::fs::File) -> io::Result<FileIdentity> {
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the File owns a valid handle and the output structure is live
+        // and writable for the duration of the call.
+        if unsafe {
+            GetFileInformationByHandle(file.as_raw_handle().cast::<c_void>(), &raw mut information)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(FileIdentity {
+            volume_serial_number: information.dwVolumeSerialNumber,
+            file_index: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        })
     }
 
     fn normalize_final_path(file: &std::fs::File) -> io::Result<PathBuf> {
@@ -137,8 +252,10 @@ mod windows {
             .to_string();
         let owner = owner.trim_end_matches('\0');
         let allowed_owner = match policy {
-            ProtectedPathPolicy::Root => matches!(owner, "S-1-5-18" | "S-1-5-32-544"),
-            ProtectedPathPolicy::Mutable => {
+            ProtectedPathPolicy::Root | ProtectedPathPolicy::StrictDirectory => {
+                matches!(owner, "S-1-5-18" | "S-1-5-32-544")
+            }
+            ProtectedPathPolicy::Mutable | ProtectedPathPolicy::MutableDirectory => {
                 matches!(owner, "S-1-5-18" | "S-1-5-19" | "S-1-5-32-544")
                     || owner == interactive_user_sid
             }
@@ -232,8 +349,12 @@ mod windows {
             | AccessRights::Bit2
             | AccessRights::Bit4
             | AccessRights::Bit8;
+        let mutable = matches!(
+            policy,
+            ProtectedPathPolicy::Mutable | ProtectedPathPolicy::MutableDirectory
+        );
         if mask.intersects(administration)
-            || (policy != ProtectedPathPolicy::Mutable && mask.intersects(file_write))
+            || (!mutable && mask.intersects(file_write | AccessRights::Bit6))
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -242,7 +363,14 @@ mod windows {
         }
         let readable = mask.intersects(AccessRights::GenericRead | AccessRights::Bit0);
         let executable = mask.intersects(AccessRights::GenericExecute | AccessRights::Bit5);
-        if !readable || (policy == ProtectedPathPolicy::Executable && !executable) {
+        let requires_execute = matches!(
+            policy,
+            ProtectedPathPolicy::Root
+                | ProtectedPathPolicy::StrictDirectory
+                | ProtectedPathPolicy::MutableDirectory
+                | ProtectedPathPolicy::Executable
+        );
+        if !readable || (requires_execute && !executable) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "interactive user lacks required installation rights",
@@ -561,11 +689,69 @@ mod windows {
                 .is_err()
             );
         }
+
+        #[test]
+        fn user_writable_intermediate_directory_is_rejected() {
+            let sid = lookup_local_account_sid(&std::env::var("USERNAME").unwrap()).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let writable_parent = temp.path().join("writable-parent");
+            std::fs::create_dir(&writable_parent).unwrap();
+            let target = writable_parent.join("core.exe");
+            std::fs::write(&target, b"core").unwrap();
+            let root = open_no_follow(temp.path()).unwrap();
+            let expected_root = normalize_final_path(&root).unwrap();
+
+            let result = validate_component_chain(
+                temp.path(),
+                &expected_root,
+                &[(target, ProtectedPathPolicy::Executable)],
+                &sid,
+            );
+
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn intermediate_directory_reparse_point_is_rejected() {
+            let sid = lookup_local_account_sid(&std::env::var("USERNAME").unwrap()).unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("core.exe"), b"core").unwrap();
+            let linked_parent = temp.path().join("linked-parent");
+            junction::create(outside.path(), &linked_parent).unwrap();
+            let target = linked_parent.join("core.exe");
+            let root = open_no_follow(temp.path()).unwrap();
+            let expected_root = normalize_final_path(&root).unwrap();
+
+            let result = validate_component_chain(
+                temp.path(),
+                &expected_root,
+                &[(target, ProtectedPathPolicy::Executable)],
+                &sid,
+            );
+
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn verified_executable_handle_blocks_rename_until_released() {
+            let temp = tempfile::tempdir().unwrap();
+            let executable = temp.path().join("core.exe");
+            let replacement = temp.path().join("replacement.exe");
+            std::fs::write(&executable, b"core").unwrap();
+            let (guard, identity) = open_verified_file(&executable).unwrap();
+            assert_eq!(verified_file_identity(&executable).unwrap(), identity);
+
+            assert!(std::fs::rename(&executable, &replacement).is_err());
+            drop(guard);
+            std::fs::rename(&executable, &replacement).unwrap();
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
 pub use windows::{
-    ProtectedPathPolicy, create_restricted_named_pipe, lookup_local_account_sid,
-    network_state_records, process_creation_identity, validate_protected_installation,
+    FileIdentity, ProtectedPathPolicy, create_restricted_named_pipe, lookup_local_account_sid,
+    network_state_records, open_verified_file, process_creation_identity,
+    validate_protected_installation, verified_file_identity,
 };

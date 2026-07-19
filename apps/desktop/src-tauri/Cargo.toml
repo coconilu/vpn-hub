@@ -27,6 +27,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3.23.0"
+vpn-hub-windows-security = { path = "../../../crates/vpn-hub-windows-security" }
 
 [lints]
 workspace = true

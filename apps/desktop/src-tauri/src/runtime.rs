@@ -1895,13 +1895,19 @@ impl AppState {
                     .clone();
                 return Ok(status.map_or(
                     CoreStatus {
-                        state: "helper".into(),
-                        managed: true,
+                        state: "helper-stale".into(),
+                        managed: false,
                         pid: None,
                         started_at: None,
-                        message: "Helper authority 已启用，等待受认证状态".into(),
+                        message: "Helper authority 已启用；缓存不是权威状态".into(),
                     },
-                    helper_core_status,
+                    |reply| {
+                        let mut status = helper_core_status(reply);
+                        status.state = "helper-stale".into();
+                        status.managed = false;
+                        status.message.push_str("（非权威缓存）");
+                        status
+                    },
                 ));
             }
             SupervisorRoute::FailClosed => {
@@ -1947,6 +1953,16 @@ impl AppState {
             started_at: None,
             message: "开发核心已停止".into(),
         })
+    }
+
+    pub async fn core_status_authoritative(&self) -> Result<CoreStatus, String> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return self
+                .helper_command(HelperCommand::Status)
+                .await
+                .map(helper_core_status);
+        }
+        self.core_status()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2239,8 +2255,8 @@ impl AppState {
     }
 
     pub fn owned_core_pid(&self) -> Option<u32> {
-        if let SupervisorRoute::HelperOwned { last_status, .. } = &self.supervisor_route {
-            return last_status.lock().ok()?.as_ref()?.owned_pid;
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return None;
         }
         let mut guard = self.managed_core.lock().ok()?;
         let core = guard.as_mut()?;
@@ -2254,17 +2270,23 @@ impl AppState {
         }
     }
 
+    pub async fn owned_core_pid_authoritative(&self) -> Result<Option<u32>, String> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return self
+                .helper_command(HelperCommand::Status)
+                .await
+                .map(|status| status.owned_pid);
+        }
+        Ok(self.owned_core_pid())
+    }
+
     pub fn owned_core_is_running(&self, expected_pid: u32) -> bool {
         self.owned_core_pid() == Some(expected_pid)
     }
 
     pub fn owned_core_controller_is_running(&self, expected_pid: u32) -> bool {
-        if let SupervisorRoute::HelperOwned { last_status, .. } = &self.supervisor_route {
-            return last_status.lock().is_ok_and(|status| {
-                status
-                    .as_ref()
-                    .is_some_and(|reply| reply.ok && reply.owned_pid == Some(expected_pid))
-            });
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return false;
         }
         let addresses = {
             let Ok(mut guard) = self.managed_core.lock() else {
@@ -2287,6 +2309,21 @@ impl AppState {
         };
         owns_loopback_listeners(expected_pid, &addresses)
             && self.owned_core_is_running(expected_pid)
+    }
+
+    pub async fn owned_core_controller_is_running_authoritative(
+        &self,
+        expected_pid: u32,
+    ) -> Result<bool, String> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return self
+                .helper_command(HelperCommand::Status)
+                .await
+                .map(|status| {
+                    status.ok && status.state == "running" && status.owned_pid == Some(expected_pid)
+                });
+        }
+        Ok(self.owned_core_controller_is_running(expected_pid))
     }
 
     pub fn stop_owned_core_if_pid(&self, expected_pid: u32) -> Result<bool, String> {
@@ -2383,12 +2420,11 @@ impl AppState {
 
     pub async fn stop_supervised_core_if_pid(&self, expected_pid: u32) -> Result<bool, String> {
         match &self.supervisor_route {
-            SupervisorRoute::HelperOwned { last_status, .. } => {
-                let owns_pid = last_status
-                    .lock()
-                    .map_err(|_| "Helper 状态锁不可用".to_owned())?
-                    .as_ref()
-                    .is_some_and(|status| status.owned_pid == Some(expected_pid));
+            SupervisorRoute::HelperOwned { .. } => {
+                let status = self.helper_command(HelperCommand::Status).await?;
+                let owns_pid = status.ok
+                    && status.state == "running"
+                    && status.owned_pid == Some(expected_pid);
                 if !owns_pid {
                     return Ok(false);
                 }
@@ -2439,9 +2475,10 @@ impl AppState {
 }
 
 fn helper_core_status(reply: RuntimeReply) -> CoreStatus {
+    let managed = reply.ok && reply.state == "running" && reply.owned_pid.is_some();
     CoreStatus {
         state: reply.state,
-        managed: true,
+        managed,
         pid: reply.owned_pid,
         started_at: None,
         message: format!(
@@ -3068,6 +3105,7 @@ mod tests {
         OutletHealth, OutletKind, RoutingPolicy, SecretStoreError, SettingsOutletDraft,
         generate_mihomo_config, outlet_proxy_name,
     };
+    use vpn_hub_helper::{ReplayCache, serve_one_named_pipe_request};
 
     #[derive(Default)]
     struct TestSecretStore {
@@ -3233,6 +3271,192 @@ mod tests {
         let helper_route =
             select_supervisor_route_with_program_data(&data, Some(&store), &program_data);
         assert!(matches!(helper_route, SupervisorRoute::HelperOwned { .. }));
+    }
+
+    fn helper_reply(state: &str, owned_pid: Option<u32>) -> RuntimeReply {
+        RuntimeReply {
+            ok: true,
+            state: state.into(),
+            generation: 7,
+            authority: "helper".into(),
+            owned_pid,
+            entry_host: "127.0.0.1".into(),
+            entry_port: 0,
+            outlets: Vec::new(),
+            circuit_open: false,
+            reason: None,
+        }
+    }
+
+    fn helper_owned_test_state(
+        directory: &tempfile::TempDir,
+        install_id: String,
+        key: Arc<ProtocolKey>,
+        cached: Option<RuntimeReply>,
+    ) -> AppState {
+        let data = directory.path().join("client-data");
+        fs::create_dir_all(&data).expect("client data");
+        let mut state = AppState::new_for_test(directory.path().to_path_buf(), &data);
+        state.supervisor_route = SupervisorRoute::HelperOwned {
+            client: NamedPipeClient::new(install_id, key),
+            last_status: Mutex::new(cached),
+        };
+        state
+    }
+
+    fn current_user_sid() -> String {
+        vpn_hub_windows_security::lookup_local_account_sid(
+            &std::env::var("USERNAME").expect("USERNAME"),
+        )
+        .expect("interactive user SID")
+    }
+
+    #[tokio::test]
+    async fn helper_status_queries_are_live_and_ipc_failure_never_reuses_cache() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let install_id = format!(
+            "desktop-status-{}-{}",
+            std::process::id(),
+            &generate_controller_secret()[..8]
+        );
+        let key = Arc::new(ProtocolKey::from_bytes([83; 32]));
+        let state = helper_owned_test_state(&directory, install_id.clone(), Arc::clone(&key), None);
+        let replies = [
+            helper_reply("running", Some(41_001)),
+            helper_reply("stopped", None),
+            helper_reply("running", Some(41_002)),
+            helper_reply("stopped", None),
+        ];
+        let sid = current_user_sid();
+        let server_install_id = install_id.clone();
+        let server_key = Arc::clone(&key);
+        let server = tokio::spawn(async move {
+            let replay = Arc::new(tokio::sync::Mutex::new(ReplayCache::default()));
+            for reply in replies {
+                serve_one_named_pipe_request(
+                    &server_install_id,
+                    &sid,
+                    Arc::clone(&server_key),
+                    Arc::clone(&replay),
+                    |request| {
+                        assert_eq!(request.command, HelperCommand::Status);
+                        serde_json::to_vec(&reply).expect("runtime reply")
+                    },
+                )
+                .await
+                .expect("serve authenticated status");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+
+        let dashboard_running = state
+            .core_status_authoritative()
+            .await
+            .expect("live dashboard status");
+        assert_eq!(dashboard_running.pid, Some(41_001));
+        let dashboard_stopped = state
+            .core_status_authoritative()
+            .await
+            .expect("changed dashboard status");
+        assert_eq!(dashboard_stopped.pid, None);
+        assert!(
+            state
+                .owned_core_controller_is_running_authoritative(41_002)
+                .await
+                .expect("live lifecycle status")
+        );
+        assert!(
+            !state
+                .owned_core_controller_is_running_authoritative(41_002)
+                .await
+                .expect("changed lifecycle status")
+        );
+        server.await.expect("status server");
+
+        let stale_before_failure = state.core_status().expect("stale cache");
+        assert_eq!(stale_before_failure.state, "helper-stale");
+        assert!(!stale_before_failure.managed);
+
+        let wrong_key_server = tokio::spawn(async move {
+            serve_one_named_pipe_request(
+                &install_id,
+                &current_user_sid(),
+                Arc::new(ProtocolKey::from_bytes([84; 32])),
+                Arc::new(tokio::sync::Mutex::new(ReplayCache::default())),
+                |_| panic!("wrong-key request must not authenticate"),
+            )
+            .await
+        });
+        let failure = state
+            .core_status_authoritative()
+            .await
+            .expect_err("wrong-key response must fail closed");
+        assert!(failure.contains("Fail Closed"));
+        wrong_key_server
+            .await
+            .expect("wrong-key server task")
+            .expect("rejection response");
+        let stale_after_failure = state.core_status().expect("stale cache after failure");
+        assert_eq!(stale_after_failure.state, stale_before_failure.state);
+        assert_eq!(stale_after_failure.pid, stale_before_failure.pid);
+        assert_eq!(stale_after_failure.message, stale_before_failure.message);
+    }
+
+    #[tokio::test]
+    async fn helper_stop_checks_live_status_instead_of_cached_pid() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let install_id = format!(
+            "desktop-stop-{}-{}",
+            std::process::id(),
+            &generate_controller_secret()[..8]
+        );
+        let key = Arc::new(ProtocolKey::from_bytes([91; 32]));
+        let state = helper_owned_test_state(
+            &directory,
+            install_id.clone(),
+            Arc::clone(&key),
+            Some(helper_reply("stopped", None)),
+        );
+        let sid = current_user_sid();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let server_observed = Arc::clone(&observed);
+        let server = tokio::spawn(async move {
+            let replay = Arc::new(tokio::sync::Mutex::new(ReplayCache::default()));
+            for reply in [
+                helper_reply("running", Some(52_001)),
+                helper_reply("stopped", None),
+            ] {
+                let observed = Arc::clone(&server_observed);
+                serve_one_named_pipe_request(
+                    &install_id,
+                    &sid,
+                    Arc::clone(&key),
+                    Arc::clone(&replay),
+                    move |request| {
+                        observed
+                            .lock()
+                            .expect("observed commands")
+                            .push(request.command);
+                        serde_json::to_vec(&reply).expect("runtime reply")
+                    },
+                )
+                .await
+                .expect("serve stop flow");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+
+        assert!(
+            state
+                .stop_supervised_core_if_pid(52_001)
+                .await
+                .expect("authenticated stop")
+        );
+        server.await.expect("stop server");
+        assert_eq!(
+            *observed.lock().expect("observed commands"),
+            [HelperCommand::Status, HelperCommand::Stop]
+        );
     }
 
     #[test]

@@ -345,6 +345,14 @@ impl TrayProjection {
         })
     }
 
+    async fn load_authoritative(state: &AppState) -> Result<Self, String> {
+        let core_status = state.core_status_authoritative().await?;
+        let mut projection = Self::load(state)?;
+        projection.core_managed = core_status.managed && core_status.state == "running";
+        projection.stop_available = projection.core_managed;
+        Ok(projection)
+    }
+
     fn tooltip(&self) -> String {
         format!(
             "VPN Hub · {}:{} · {}",
@@ -961,7 +969,7 @@ async fn stop_owned_core_with_timeout(state: &AppState, timeout: Duration) -> bo
     let cleanup = async {
         let _transaction = state.lock_routing_transaction().await;
         state.stop_supervised_core().await?;
-        Ok::<bool, String>(state.owned_core_pid().is_none())
+        Ok::<bool, String>(state.owned_core_pid_authoritative().await?.is_none())
     };
     tokio::time::timeout(timeout, cleanup)
         .await
@@ -1079,7 +1087,8 @@ async fn run_restart_task(
             return;
         }
         let failure = if state
-            .core_status()
+            .core_status_authoritative()
+            .await
             .is_ok_and(|status| status.state == "external")
         {
             StartupFailure::PortConflict
@@ -1102,7 +1111,10 @@ async fn run_restart_task(
     published_pid.store(pid, Ordering::Release);
     let _ = sender.send(WorkMessage::RestartPublished { id, pid }).await;
     let still_current = app.state::<DesktopCoordinator>().recovery_epoch() == epoch;
-    let child_alive = state.owned_core_controller_is_running(pid);
+    let child_alive = state
+        .owned_core_controller_is_running_authoritative(pid)
+        .await
+        .unwrap_or(false);
     if cancel.load(Ordering::Acquire) || !still_current || !child_alive {
         let _ = state.stop_supervised_core_if_pid(pid).await;
         let outcome = if owned_child_exited.load(Ordering::Acquire) || !child_alive {
@@ -1115,7 +1127,10 @@ async fn run_restart_task(
     }
     let guardian_succeeded = state.uses_helper_authority()
         || commands::record_routing_cycle_locked(&state).await.is_ok();
-    let child_alive = state.owned_core_controller_is_running(pid);
+    let child_alive = state
+        .owned_core_controller_is_running_authoritative(pid)
+        .await
+        .unwrap_or(false);
     let epoch_current = app.state::<DesktopCoordinator>().recovery_epoch() == epoch;
     let deliberately_cancelled = cancel.load(Ordering::Acquire)
         && !owned_child_exited.load(Ordering::Acquire)
@@ -1148,7 +1163,7 @@ async fn send_restart_finished(
 #[allow(clippy::too_many_lines)]
 async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
     let mut machine = LifecycleMachine::default();
-    if let Some(pid) = app.state::<AppState>().owned_core_pid() {
+    if let Ok(Some(pid)) = app.state::<AppState>().owned_core_pid_authoritative().await {
         let _ = machine.reduce(LifecycleEvent::CoreStarted { pid });
         app.state::<DesktopCoordinator>()
             .stop_available
@@ -1243,7 +1258,11 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                     consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::CoreStopped), &mut pending_probe, &mut restart_at);
                 }
                 let owns_started_pid = core_pid != 0
-                    && app.state::<AppState>().owned_core_is_running(core_pid);
+                    && app
+                        .state::<AppState>()
+                        .owned_core_controller_is_running_authoritative(core_pid)
+                        .await
+                        .unwrap_or(false);
                 if should_accept_core_started(
                     signals,
                     accepted_core_stopped,
@@ -1326,7 +1345,13 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                         if let Some(mut handle) = stop_handle.take() {
                             let _ = tokio::time::timeout(CONTROL_JOIN_TIMEOUT, &mut handle).await;
                         }
-                        if confirmed && app.state::<AppState>().owned_core_pid().is_none() {
+                        let stopped = confirmed
+                            && app
+                                .state::<AppState>()
+                                .owned_core_pid_authoritative()
+                                .await
+                                .is_ok_and(|pid| pid.is_none());
+                        if stopped {
                             stop_retry_at = None;
                             consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::StopCore), &mut pending_probe, &mut restart_at);
                             app.state::<DesktopCoordinator>().resolve_stop();
@@ -1345,7 +1370,11 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
             }
             _ = watcher.tick() => {
                 if let Some(pid) = machine.expected_pid {
-                    let alive = app.state::<AppState>().owned_core_is_running(pid);
+                    let alive = app
+                        .state::<AppState>()
+                        .owned_core_controller_is_running_authoritative(pid)
+                        .await
+                        .unwrap_or(false);
                     if !alive && !machine.recovery_terminal {
                         if active.as_ref().is_some_and(|work| work.kind == WorkKind::Restart) {
                             if let Some(work) = active.as_ref() {
@@ -1466,17 +1495,21 @@ fn consume_effects(
 }
 
 fn refresh_tray(app: &AppHandle) {
-    let Ok(mut projection) = TrayProjection::load(&app.state::<AppState>()) else {
-        return;
-    };
-    projection.stop_available |= app.state::<DesktopCoordinator>().stop_available();
-    let Some(tray) = app.tray_by_id(TRAY_ID) else {
-        return;
-    };
-    if let Ok(menu) = tray_menu(app, &projection) {
-        let _ = tray.set_menu(Some(menu));
-    }
-    let _ = tray.set_tooltip(Some(projection.tooltip()));
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Ok(mut projection) = TrayProjection::load_authoritative(&app.state::<AppState>()).await
+        else {
+            return;
+        };
+        projection.stop_available |= app.state::<DesktopCoordinator>().stop_available();
+        let Some(tray) = app.tray_by_id(TRAY_ID) else {
+            return;
+        };
+        if let Ok(menu) = tray_menu(&app, &projection) {
+            let _ = tray.set_menu(Some(menu));
+        }
+        let _ = tray.set_tooltip(Some(projection.tooltip()));
+    });
 }
 
 fn publish_transition_notifications(

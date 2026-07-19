@@ -35,7 +35,8 @@ pub use ownership::{
 };
 pub use protocol::{
     AuthError, AuthenticatedRequest, Command, NamedPipeContract, ProtocolKey, ReplayCache,
-    SignedRequest, UnsignedRequest, authenticate_challenged_frame, pipe_name,
+    SignedRequest, SignedResponse, UnsignedRequest, UnsignedResponse,
+    authenticate_challenged_frame, authenticate_response_frame, pipe_name,
 };
 pub use runtime::{CoreBackend, HelperRuntime, ManifestProvider, RuntimeError, RuntimeReply};
 #[cfg(target_os = "windows")]

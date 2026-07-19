@@ -15,7 +15,8 @@ mod windows {
 
     use crate::{
         AuthenticatedRequest, Command, PROTOCOL_VERSION, ProtocolKey, ReplayCache, SignedRequest,
-        UnsignedRequest, authenticate_challenged_frame, pipe_name,
+        SignedResponse, UnsignedRequest, authenticate_challenged_frame,
+        authenticate_response_frame, pipe_name,
     };
 
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -83,7 +84,11 @@ mod windows {
             unix_ms(),
             &mut replay,
         ) {
-            Ok(request) => handler(request),
+            Ok(request) => {
+                let payload = handler(request.clone());
+                serde_json::to_vec(&SignedResponse::new(&request, &payload, &key))
+                    .map_err(|_| TransportError::Fatal)?
+            }
             Err(_) => serde_json::to_vec(&WireError {
                 ok: false,
                 error: "request rejected",
@@ -126,22 +131,29 @@ mod windows {
             let challenge = String::from_utf8(read_frame(&mut client).await?)
                 .map_err(|_| "invalid challenge".to_owned())?;
             let now = unix_ms();
-            let signed = SignedRequest::new(
-                UnsignedRequest {
-                    version: PROTOCOL_VERSION,
-                    request_id: random_token(24),
-                    install_id: self.install_id.clone(),
-                    issued_at_unix_ms: now,
-                    expires_at_unix_ms: now.saturating_add(10_000),
-                    nonce: random_token(32),
-                    challenge,
-                    command,
-                },
-                &self.key,
-            );
+            let unsigned = UnsignedRequest {
+                version: PROTOCOL_VERSION,
+                request_id: random_token(24),
+                install_id: self.install_id.clone(),
+                issued_at_unix_ms: now,
+                expires_at_unix_ms: now.saturating_add(10_000),
+                nonce: random_token(32),
+                challenge,
+                command,
+            };
+            let expected_response = AuthenticatedRequest {
+                request_id: unsigned.request_id.clone(),
+                install_id: unsigned.install_id.clone(),
+                nonce: unsigned.nonce.clone(),
+                challenge: unsigned.challenge.clone(),
+                command: unsigned.command,
+            };
+            let signed = SignedRequest::new(unsigned, &self.key);
             let frame = serde_json::to_vec(&signed).map_err(|error| error.to_string())?;
             write_frame(&mut client, &frame).await?;
-            read_frame(&mut client).await
+            let response = read_frame(&mut client).await?;
+            authenticate_response_frame(&response, &self.key, &expected_response)
+                .map_err(|_| "named pipe response rejected".to_owned())
         }
     }
 
@@ -313,6 +325,69 @@ mod windows {
                 .unwrap();
             assert_eq!(response, b"accepted:Status");
             server.await.unwrap().unwrap();
+        }
+
+        #[tokio::test]
+        async fn unsigned_wrong_key_and_wrong_request_responses_are_rejected() {
+            for attack in 0..3 {
+                let install_id = format!("test-{}", random_token(16));
+                let key = Arc::new(ProtocolKey::from_bytes([53; 32]));
+                let server_key = Arc::clone(&key);
+                let server_install = install_id.clone();
+                let target_sid = vpn_hub_windows_security::lookup_local_account_sid(
+                    &std::env::var("USERNAME").unwrap(),
+                )
+                .unwrap();
+                let server = tokio::spawn(async move {
+                    let mut options = ServerOptions::new();
+                    options
+                        .first_pipe_instance(true)
+                        .reject_remote_clients(true);
+                    let mut pipe = vpn_hub_windows_security::create_restricted_named_pipe(
+                        &options,
+                        &pipe_name(&server_install).unwrap(),
+                        &target_sid,
+                    )
+                    .unwrap();
+                    pipe.connect().await.unwrap();
+                    write_frame(&mut pipe, b"forged-challenge").await.unwrap();
+                    let request_frame = read_frame(&mut pipe).await.unwrap();
+                    let signed_request: SignedRequest =
+                        serde_json::from_slice(&request_frame).unwrap();
+                    let mut binding = AuthenticatedRequest {
+                        request_id: signed_request.request.request_id,
+                        install_id: signed_request.request.install_id,
+                        nonce: signed_request.request.nonce,
+                        challenge: signed_request.request.challenge,
+                        command: signed_request.request.command,
+                    };
+                    let response = match attack {
+                        0 => br#"{"ok":true}"#.to_vec(),
+                        1 => serde_json::to_vec(&SignedResponse::new(
+                            &binding,
+                            b"forged",
+                            &ProtocolKey::from_bytes([54; 32]),
+                        ))
+                        .unwrap(),
+                        _ => {
+                            binding.request_id = "wrong-request".into();
+                            serde_json::to_vec(&SignedResponse::new(
+                                &binding,
+                                b"forged",
+                                &server_key,
+                            ))
+                            .unwrap()
+                        }
+                    };
+                    write_frame(&mut pipe, &response).await.unwrap();
+                });
+                let client = NamedPipeClient::new(install_id, key);
+                assert!(
+                    client.send(Command::Status).await.is_err(),
+                    "attack {attack}"
+                );
+                server.await.unwrap();
+            }
         }
     }
 }

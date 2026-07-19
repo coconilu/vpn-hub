@@ -2,7 +2,7 @@ use std::{process::ExitCode, sync::Arc};
 
 #[cfg(target_os = "windows")]
 use vpn_hub_windows_security::ProtectedPathPolicy::{
-    Executable, Immutable, Mutable, SecretMaterial,
+    Executable, Immutable, Mutable, MutableDirectory, SecretMaterial, StrictDirectory,
 };
 
 fn main() -> ExitCode {
@@ -66,6 +66,9 @@ fn provisioned_service(signals: Arc<vpn_hub_helper::ServiceSignals>) -> Result<(
         return Err("helper executable location invalid".into());
     }
     let critical_paths = [
+        (root.join("bin"), StrictDirectory),
+        (root.join("runtime"), MutableDirectory),
+        (root.join("data"), MutableDirectory),
         (root.join("install-id"), Immutable),
         (root.join("interactive-user.sid"), Immutable),
         (root.join("helper.key"), SecretMaterial),

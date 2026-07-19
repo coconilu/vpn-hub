@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroize;
 
@@ -74,7 +74,30 @@ pub struct SignedRequest {
 pub struct AuthenticatedRequest {
     pub request_id: String,
     pub install_id: String,
+    pub nonce: String,
+    pub challenge: String,
     pub command: Command,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UnsignedResponse {
+    pub version: u16,
+    pub request_id: String,
+    pub install_id: String,
+    pub nonce: String,
+    pub challenge: String,
+    pub command: Command,
+    pub payload_sha256: String,
+    pub payload_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SignedResponse {
+    #[serde(flatten)]
+    pub response: UnsignedResponse,
+    pub mac_hex: String,
 }
 
 /// An in-memory protocol key. It is intentionally neither serializable nor
@@ -123,6 +146,24 @@ impl SignedRequest {
     pub fn new(request: UnsignedRequest, key: &ProtocolKey) -> Self {
         let mac_hex = encode_hex(&key.sign(&canonical_bytes(&request)));
         Self { request, mac_hex }
+    }
+}
+
+impl SignedResponse {
+    #[must_use]
+    pub fn new(request: &AuthenticatedRequest, payload: &[u8], key: &ProtocolKey) -> Self {
+        let response = UnsignedResponse {
+            version: PROTOCOL_VERSION,
+            request_id: request.request_id.clone(),
+            install_id: request.install_id.clone(),
+            nonce: request.nonce.clone(),
+            challenge: request.challenge.clone(),
+            command: request.command,
+            payload_sha256: encode_hex(&Sha256::digest(payload)),
+            payload_hex: encode_hex(payload),
+        };
+        let mac_hex = encode_hex(&key.sign(&canonical_response_bytes(&response)));
+        Self { response, mac_hex }
     }
 }
 
@@ -242,8 +283,53 @@ pub fn authenticate_challenged_frame(
     Ok(AuthenticatedRequest {
         request_id: signed.request.request_id,
         install_id: signed.request.install_id,
+        nonce: signed.request.nonce,
+        challenge: signed.request.challenge,
         command: signed.request.command,
     })
+}
+
+pub fn authenticate_response_frame(
+    frame: &[u8],
+    key: &ProtocolKey,
+    expected_request: &AuthenticatedRequest,
+) -> Result<Vec<u8>, AuthError> {
+    if frame.is_empty() || frame.len() > MAX_FRAME_BYTES || json_depth(frame) > MAX_JSON_DEPTH {
+        return Err(AuthError::Malformed);
+    }
+    let signed: SignedResponse = serde_json::from_slice(frame).map_err(|_| AuthError::Malformed)?;
+    let response = &signed.response;
+    if response.version != PROTOCOL_VERSION {
+        return Err(AuthError::UnsupportedVersion);
+    }
+    if response.install_id != expected_request.install_id {
+        return Err(AuthError::WrongInstallation);
+    }
+    if response.request_id != expected_request.request_id
+        || response.nonce != expected_request.nonce
+        || response.challenge != expected_request.challenge
+        || response.command != expected_request.command
+    {
+        return Err(AuthError::AuthenticationFailed);
+    }
+    for value in [
+        &response.request_id,
+        &response.install_id,
+        &response.nonce,
+        &response.challenge,
+    ] {
+        validate_field(value)?;
+    }
+    let signature = decode_hex_32(&signed.mac_hex).ok_or(AuthError::AuthenticationFailed)?;
+    if !key.verify(&canonical_response_bytes(response), &signature) {
+        return Err(AuthError::AuthenticationFailed);
+    }
+    let payload = decode_hex(&response.payload_hex).ok_or(AuthError::Malformed)?;
+    let digest = decode_hex_32(&response.payload_sha256).ok_or(AuthError::Malformed)?;
+    if Sha256::digest(&payload).as_slice() != digest {
+        return Err(AuthError::AuthenticationFailed);
+    }
+    Ok(payload)
 }
 
 /// Headless verification helper. Production transports must use
@@ -309,6 +395,20 @@ fn canonical_bytes(request: &UnsignedRequest) -> Vec<u8> {
     .into_bytes()
 }
 
+fn canonical_response_bytes(response: &UnsignedResponse) -> Vec<u8> {
+    format!(
+        "vpn-hub-helper-response\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        response.version,
+        response.request_id,
+        response.install_id,
+        response.nonce,
+        response.challenge,
+        response.command.wire_name(),
+        response.payload_sha256,
+    )
+    .into_bytes()
+}
+
 fn json_depth(frame: &[u8]) -> usize {
     let mut depth = 0_usize;
     let mut max_depth = 0_usize;
@@ -357,6 +457,17 @@ fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
         output[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }
     Some(output)
+}
+
+fn decode_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) || value.len() > MAX_FRAME_BYTES {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Some((hex_value(pair[0])? << 4) | hex_value(pair[1])?))
+        .collect()
 }
 
 const fn hex_value(byte: u8) -> Option<u8> {
@@ -439,6 +550,36 @@ mod tests {
                 15_000,
                 &mut ReplayCache::default()
             ),
+            Err(AuthError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn signed_response_is_bound_to_request_and_payload() {
+        let key = ProtocolKey::from_bytes([13; 32]);
+        let request = AuthenticatedRequest {
+            request_id: "request-1".into(),
+            install_id: "install-a".into(),
+            nonce: "nonce-1".into(),
+            challenge: "challenge-1".into(),
+            command: Command::Status,
+        };
+        let signed = SignedResponse::new(&request, b"payload", &key);
+        let frame = serde_json::to_vec(&signed).unwrap();
+        assert_eq!(
+            authenticate_response_frame(&frame, &key, &request).unwrap(),
+            b"payload"
+        );
+        let mut wrong_request = request.clone();
+        wrong_request.request_id = "request-2".into();
+        assert_eq!(
+            authenticate_response_frame(&frame, &key, &wrong_request),
+            Err(AuthError::AuthenticationFailed)
+        );
+        let mut tampered: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        tampered["payload_hex"] = "00".into();
+        assert_eq!(
+            authenticate_response_frame(&serde_json::to_vec(&tampered).unwrap(), &key, &request),
             Err(AuthError::AuthenticationFailed)
         );
     }
