@@ -1,0 +1,15 @@
+# Copy this shape only to the app-managed local private configuration.
+# Never commit a real subscription URL.
+subscription_url = ""
+provider_update_seconds = 180
+controller_port = 39090
+route_mode = "priority"
+manual_outlet = "chaoshihui"
+priority = ["subscription-a", "chaoshihui"]
+cooldown_seconds = 60
+minimum_improvement_ms = 150
+probe_targets = [
+  "https://www.gstatic.com/generate_204",
+  "https://www.baidu.com/",
+  "https://github.com/",
+]

@@ -33,6 +33,8 @@ export interface LatencySample {
   status: HealthStatus;
   latency_ms: number | null;
   error_code: string | null;
+  successful_targets: number;
+  total_targets: number;
 }
 
 export interface StateEvent {
@@ -43,15 +45,36 @@ export interface StateEvent {
   reason: string;
 }
 
+export interface RouteSwitchEvent {
+  occurred_at: string;
+  from_outlet: string | null;
+  to_outlet: string;
+  mode: RouteMode;
+  reason: string;
+  duration_ms: number;
+}
+
+export interface RoutingStatus {
+  mode: RouteMode;
+  current_outlet: string | null;
+  manual_outlet: string | null;
+  controller_ready: boolean;
+  subscription_configured: boolean;
+  provider_update_seconds: number;
+  message: string;
+}
+
 export interface DashboardSnapshot {
   updated_at: string;
   protected_entry: PortSnapshot;
   development_entry: PortSnapshot;
   upstream_entry: PortSnapshot;
   mihomo: CoreStatus;
+  routing: RoutingStatus;
   summaries: OutletSummary[];
   samples: LatencySample[];
   events: StateEvent[];
+  route_switches: RouteSwitchEvent[];
 }
 
 export type RouteMode = "priority" | "fastest" | "manual";

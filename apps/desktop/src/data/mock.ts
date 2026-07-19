@@ -10,6 +10,8 @@ const samples: LatencySample[] = latencyValues.map((latency, index) => ({
   status: (latency === null ? "down" : latency > 230 ? "degraded" : "healthy") as HealthStatus,
   latency_ms: latency,
   error_code: latency === null ? "request_timeout" : null,
+  successful_targets: latency === null ? 1 : 3,
+  total_targets: 3,
 }));
 
 export const mockSnapshot: DashboardSnapshot = {
@@ -23,6 +25,15 @@ export const mockSnapshot: DashboardSnapshot = {
     pid: null,
     started_at: null,
     message: "开发核心已停止",
+  },
+  routing: {
+    mode: "priority",
+    current_outlet: "chaoshihui",
+    manual_outlet: null,
+    controller_ready: false,
+    subscription_configured: false,
+    provider_update_seconds: 180,
+    message: "开发核心未运行，路由保持 Fail Closed",
   },
   summaries: [
     {
@@ -61,4 +72,5 @@ export const mockSnapshot: DashboardSnapshot = {
       reason: "port_reachable",
     },
   ],
+  route_switches: [],
 };
