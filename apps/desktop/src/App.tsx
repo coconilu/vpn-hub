@@ -55,9 +55,11 @@ export default function App() {
     setNotice("多目标检测已完成；状态、延迟和真实切换已写入本机历史。");
   });
 
-  const handleUdpRevalidate = () => runBusy(async () => {
-    setSnapshot(await revalidateUdpCapabilities());
-    setNotice("UDP 能力已使用受控回环目标重新验证；订阅出口在没有获准的端到端目标时保持未知。重启开发核心后应用新约束。");
+  const handleUdpRevalidate = (authorizedSubscriptionTargets: string[]) => runBusy(async () => {
+    setSnapshot(await revalidateUdpCapabilities(authorizedSubscriptionTargets));
+    setNotice(authorizedSubscriptionTargets.length >= 2
+      ? "UDP 能力已重新验证；订阅目标仅用于本次端到端探测，不会写入配置、数据库或摘要。"
+      : "本地客户端 UDP 能力已重新验证；订阅出口因缺少至少两个获准目标而保持未知。");
   });
 
   const handleCoreToggle = () => runBusy(async () => {

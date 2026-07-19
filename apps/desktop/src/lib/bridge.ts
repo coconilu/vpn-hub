@@ -77,10 +77,10 @@ export async function setRouteMode(mode: RouteMode, manualOutlet: string | null)
   return invoke<DashboardSnapshot>("set_route_mode", { mode, manualOutlet });
 }
 
-export async function revalidateUdpCapabilities(): Promise<DashboardSnapshot> {
+export async function revalidateUdpCapabilities(authorizedSubscriptionTargets: string[]): Promise<DashboardSnapshot> {
   if (!isTauriRuntime()) {
     browserSnapshot = { ...browserSnapshot, updated_at: new Date().toISOString() };
     return structuredClone(browserSnapshot);
   }
-  return invoke<DashboardSnapshot>("revalidate_udp_capabilities");
+  return invoke<DashboardSnapshot>("revalidate_udp_capabilities", { authorizedSubscriptionTargets });
 }

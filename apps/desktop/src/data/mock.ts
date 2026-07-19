@@ -84,6 +84,8 @@ export const mockSnapshot: DashboardSnapshot = {
       evidence_version: 1,
       probe_version: "socks5-udp-associate-v1",
       model_version: 1,
+      configuration_fingerprint: "mock-local-a",
+      configuration_generation: 1,
       reason_code: "socks5_udp_associate_rejected",
     },
     {
@@ -93,6 +95,8 @@ export const mockSnapshot: DashboardSnapshot = {
       evidence_version: 1,
       probe_version: "socks5-udp-associate-v1",
       model_version: 1,
+      configuration_fingerprint: "mock-sub-a",
+      configuration_generation: 1,
       reason_code: "subscription_end_to_end_probe_required",
     },
   ],

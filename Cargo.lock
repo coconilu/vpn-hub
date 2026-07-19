@@ -4352,6 +4352,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4364,6 +4365,7 @@ name = "vpn-hub-desktop"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "reqwest",
  "serde",
  "serde_json",
  "tauri",

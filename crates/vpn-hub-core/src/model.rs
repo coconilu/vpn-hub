@@ -51,6 +51,8 @@ pub struct UdpCapabilityEvidence {
     pub evidence_version: u32,
     pub probe_version: String,
     pub model_version: u32,
+    pub configuration_fingerprint: String,
+    pub configuration_generation: u64,
     pub reason_code: String,
 }
 

@@ -1,20 +1,22 @@
 use std::{
     env, fs,
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Mutex,
-    thread,
     time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
 use vpn_hub_core::{
-    ControllerClient, GuardianConfig, GuardianStore, OutletConfigSummary, PrivateRoutingConfig,
+    ControllerClient, EntryConfig, FAIL_CLOSED_PROXY, GuardianConfig, GuardianStore,
+    MASTER_SELECTOR, OutletConfig, OutletConfigSummary, OutletKind, PrivateRoutingConfig,
     ResolvedSubscriptionUrls, RouteDecision, RouteMode, RoutingEngine, RoutingSession,
     RoutingStateError, SecretStore, SubscriptionCredentialStatus, SubscriptionSecrets,
-    SystemSecretStore, UdpCapabilityMap, generate_controller_secret,
-    generate_mihomo_config_with_udp_capabilities, migrate_legacy_subscription,
+    SystemSecretStore, UDP_SELECTOR, UdpCapabilityEvidence, UdpCapabilityMap, UdpProbeTarget,
+    classify_subscription_udp, generate_controller_secret,
+    generate_mihomo_config_with_udp_capabilities, generate_mihomo_startup_config,
+    migrate_legacy_subscription, outlet_proxy_name, probe_authorized_socks5_udp,
     unknown_udp_evidence,
 };
 
@@ -87,7 +89,150 @@ struct ManagedCore {
     controller_secret: String,
 }
 
+struct ProbePortLease {
+    _listener: TcpListener,
+    port: u16,
+}
+
+impl ProbePortLease {
+    fn reserve() -> Result<Self, String> {
+        Self::reserve_excluding(&[])
+    }
+
+    fn reserve_excluding(excluded: &[u16]) -> Result<Self, String> {
+        for _ in 0..32 {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .map_err(|_| "无法保留隔离 UDP 探测端口".to_string())?;
+            let port = listener
+                .local_addr()
+                .map_err(|_| "无法读取隔离 UDP 探测端口".to_string())?
+                .port();
+            if !matches!(port, 3_666 | 6_666) && !excluded.contains(&port) {
+                return Ok(Self {
+                    _listener: listener,
+                    port,
+                });
+            }
+        }
+        Err("无法获得安全的隔离 UDP 探测端口".into())
+    }
+
+    const fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+struct OwnedProbeCore {
+    child: Child,
+    controller: ControllerClient,
+    entry_port: u16,
+    _directory: tempfile::TempDir,
+}
+
+impl OwnedProbeCore {
+    #[allow(clippy::too_many_arguments)]
+    async fn start(
+        executable: &Path,
+        directory: tempfile::TempDir,
+        config_path: &Path,
+        entry_port: u16,
+        controller_port: u16,
+        secret: &str,
+    ) -> Result<Self, String> {
+        let validation = hidden_command(executable)
+            .arg("-t")
+            .arg("-d")
+            .arg(directory.path())
+            .arg("-f")
+            .arg(config_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| "无法启动固定 Mihomo 隔离配置检查".to_string())?;
+        if !validation.success() {
+            return Err("固定 Mihomo 拒绝隔离 UDP 配置".into());
+        }
+        let mut child = hidden_command(executable)
+            .arg("-d")
+            .arg(directory.path())
+            .arg("-f")
+            .arg(config_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| "无法启动固定 Mihomo 隔离 UDP 进程".to_string())?;
+        let Ok(controller) = ControllerClient::new(
+            &format!("http://127.0.0.1:{controller_port}"),
+            secret.into(),
+            2_000,
+        ) else {
+            terminate_child(&mut child);
+            return Err("无法创建隔离 UDP Controller".into());
+        };
+        let mut owned = Self {
+            child,
+            controller,
+            entry_port,
+            _directory: directory,
+        };
+        for _ in 0..100 {
+            if owned
+                .child
+                .try_wait()
+                .map_err(|_| "无法读取隔离 UDP 进程状态".to_string())?
+                .is_some()
+            {
+                return Err("隔离 UDP 进程在就绪前退出".into());
+            }
+            let pid = owned.child.id();
+            let owns_ports = listening_owner_pid(entry_port) == Some(pid)
+                && listening_owner_pid(controller_port) == Some(pid);
+            if owns_ports && owned.controller.is_ready().await.unwrap_or(false) {
+                return Ok(owned);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err("隔离 UDP 进程就绪超时".into())
+    }
+
+    async fn wait_for_provider(&self, outlet: &OutletConfig, probe_targets: &[String]) -> bool {
+        let Some(target) = probe_targets.first() else {
+            return false;
+        };
+        let group = outlet_proxy_name(&outlet.id);
+        let provider = format!("vpn-hub-provider-{}", outlet.id);
+        let _ = self.controller.update_proxy_provider(&provider).await;
+        for _ in 0..40 {
+            if self
+                .controller
+                .select(MASTER_SELECTOR, &group)
+                .await
+                .is_ok()
+                && probe_https_through_entry(self.entry_port, target, 1_500).await
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        false
+    }
+}
+
+impl Drop for OwnedProbeCore {
+    fn drop(&mut self) {
+        terminate_child(&mut self.child);
+    }
+}
+
 impl RoutingSession for AppState {
+    fn current_outlet(&self) -> Result<Option<String>, RoutingStateError> {
+        self.routing_engine
+            .lock()
+            .map_err(|_| RoutingStateError::Unavailable)
+            .map(|engine| engine.current_outlet().map(str::to_owned))
+    }
+
     fn evaluate_route(
         &self,
         now_ms: u64,
@@ -297,7 +442,7 @@ impl AppState {
                 .ensure_udp_capability(
                     &outlet.id,
                     &outlet.label,
-                    &unknown_udp_evidence(&outlet.id, "not_yet_validated"),
+                    &unknown_udp_evidence(outlet, "not_yet_validated"),
                 )
                 .map_err(|error| format!("无法初始化 UDP 能力状态：{error}"))?;
         }
@@ -307,7 +452,7 @@ impl AppState {
             .map(|evidence| {
                 evidence
                     .into_iter()
-                    .map(|item| (item.outlet_id, item.status))
+                    .map(|item| (item.outlet_id.clone(), item))
                     .collect()
             })
     }
@@ -327,6 +472,205 @@ impl AppState {
         )
         .map(|(yaml, _)| yaml)
         .map_err(|error| format!("无法生成 Mihomo 配置：{error}"))
+    }
+
+    fn generate_bootstrap_config(
+        &self,
+        private_config: &PrivateRoutingConfig,
+        controller_secret: &str,
+        startup_entry_port: u16,
+    ) -> Result<String, String> {
+        let resolved = self.resolved_subscription_urls(private_config)?;
+        let udp_capabilities = self.udp_capability_map(private_config)?;
+        generate_mihomo_startup_config(
+            private_config,
+            &resolved,
+            controller_secret,
+            &udp_capabilities,
+            startup_entry_port,
+        )
+        .map(|(yaml, _)| yaml)
+        .map_err(|error| format!("无法生成 Fail Closed 启动配置：{error}"))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn revalidate_subscription_udp(
+        &self,
+        private: &PrivateRoutingConfig,
+        outlet: &OutletConfig,
+        targets: &[SocketAddr],
+    ) -> Result<UdpCapabilityEvidence, String> {
+        if !matches!(outlet.kind, OutletKind::Subscription { .. }) {
+            return Ok(unknown_udp_evidence(
+                outlet,
+                "subscription_probe_not_applicable",
+            ));
+        }
+        if targets.len() < 2 {
+            return Ok(unknown_udp_evidence(
+                outlet,
+                "subscription_cross_validation_required",
+            ));
+        }
+        if targets
+            .iter()
+            .any(|target| matches!(target.port(), 3_666 | 6_666))
+        {
+            return Ok(unknown_udp_evidence(
+                outlet,
+                "protected_udp_target_rejected",
+            ));
+        }
+
+        fs::create_dir_all(&self.runtime_directory)
+            .map_err(|_| "无法准备隔离 UDP 探测目录".to_string())?;
+        harden_private_path(&self.runtime_directory)?;
+        let directory = tempfile::Builder::new()
+            .prefix("udp-subscription-")
+            .tempdir_in(&self.runtime_directory)
+            .map_err(|_| "无法创建隔离 UDP 探测目录".to_string())?;
+        harden_private_path(directory.path())?;
+        let entry = ProbePortLease::reserve()?;
+        let controller_port = ProbePortLease::reserve_excluding(&[entry.port()])?;
+        let startup_entry =
+            ProbePortLease::reserve_excluding(&[entry.port(), controller_port.port()])?;
+        let mut isolated = private.clone();
+        isolated.entry = EntryConfig {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port: entry.port(),
+        };
+        isolated.controller_port = controller_port.port();
+        let mut probe_outlet = outlet.clone();
+        if let OutletKind::Subscription {
+            provider_update_seconds,
+            ..
+        } = &mut probe_outlet.kind
+        {
+            *provider_update_seconds = 60;
+        }
+        isolated.outlets = vec![probe_outlet.clone()];
+        isolated.route_mode = RouteMode::Priority;
+        isolated.manual_outlet = None;
+        let resolved = self.resolved_subscription_urls(&isolated)?;
+        let secret = generate_controller_secret();
+        let mut candidate =
+            unknown_udp_evidence(&probe_outlet, "isolated_subscription_probe_candidate");
+        candidate.status = vpn_hub_core::UdpCapabilityStatus::Supported;
+        let capabilities = UdpCapabilityMap::from([(outlet.id.clone(), candidate)]);
+        let (bootstrap, _) = generate_mihomo_startup_config(
+            &isolated,
+            &resolved,
+            &secret,
+            &capabilities,
+            startup_entry.port(),
+        )
+        .map_err(|error| format!("无法生成隔离 UDP 启动配置：{error}"))?;
+        let bootstrap = bootstrap.replace("interval: 60", "interval: 1");
+        let (full, _) = generate_mihomo_config_with_udp_capabilities(
+            &isolated,
+            &resolved,
+            &secret,
+            &capabilities,
+        )
+        .map_err(|error| format!("无法生成隔离 UDP 完整配置：{error}"))?;
+        let full = full.replace("interval: 60", "interval: 1");
+        let config_path = directory.path().join("mihomo.yaml");
+        fs::write(&config_path, bootstrap).map_err(|_| "无法写入隔离 UDP 启动配置".to_string())?;
+        harden_private_path(&config_path)?;
+        let executable = self.find_mihomo_executable()?;
+        let entry_port = entry.port();
+        let controller_port_value = controller_port.port();
+        let startup_entry_port = startup_entry.port();
+        drop(entry);
+        drop(controller_port);
+        drop(startup_entry);
+        let mut owned = OwnedProbeCore::start(
+            &executable,
+            directory,
+            &config_path,
+            startup_entry_port,
+            controller_port_value,
+            &secret,
+        )
+        .await?;
+        let provider_ready = owned
+            .wait_for_provider(&probe_outlet, &isolated.probe_targets)
+            .await;
+        owned
+            .controller
+            .select(MASTER_SELECTOR, FAIL_CLOSED_PROXY)
+            .await
+            .map_err(|_| "无法锁定隔离 TCP Fail Closed 选择器".to_string())?;
+        owned
+            .controller
+            .select(UDP_SELECTOR, FAIL_CLOSED_PROXY)
+            .await
+            .map_err(|_| "无法锁定隔离 UDP Fail Closed 选择器".to_string())?;
+        fs::write(&config_path, full).map_err(|_| "无法写入隔离 UDP 完整配置".to_string())?;
+        harden_private_path(&config_path)?;
+        owned
+            .controller
+            .reload_config(&config_path)
+            .await
+            .map_err(|_| "无法加载隔离 UDP 完整配置".to_string())?;
+        for _ in 0..20 {
+            if is_endpoint_reachable("127.0.0.1", entry_port)
+                && !is_endpoint_reachable("127.0.0.1", startup_entry_port)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !is_endpoint_reachable("127.0.0.1", entry_port)
+            || is_endpoint_reachable("127.0.0.1", startup_entry_port)
+        {
+            return Err("隔离 UDP 入口切换未完成".into());
+        }
+        owned.entry_port = entry_port;
+        if !owned
+            .controller
+            .is_selected(UDP_SELECTOR, FAIL_CLOSED_PROXY)
+            .await
+            .map_err(|_| "无法确认隔离 UDP Fail Closed 状态".to_string())?
+        {
+            return Err("隔离 UDP 选择器未保持 Fail Closed".into());
+        }
+
+        if !provider_ready {
+            return Ok(classify_subscription_udp(outlet, false, &[]));
+        }
+        owned
+            .controller
+            .select(UDP_SELECTOR, &outlet_proxy_name(&outlet.id))
+            .await
+            .map_err(|_| "无法选择隔离订阅 UDP 出口".to_string())?;
+        let probes = targets
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                let request = format!(
+                    "vpn-hub-subscription-udp-{index}-{}",
+                    generate_controller_secret()
+                )
+                .into_bytes();
+                UdpProbeTarget {
+                    address: *address,
+                    expected_response: request.clone(),
+                    request,
+                }
+            })
+            .collect::<Vec<_>>();
+        let outcomes = tokio::task::spawn_blocking(move || {
+            probe_authorized_socks5_udp(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, entry_port)),
+                &probes,
+                Duration::from_secs(2),
+            )
+        })
+        .await
+        .map_err(|_| "隔离订阅 UDP 探测任务失败".to_string())?
+        .unwrap_or_default();
+        Ok(classify_subscription_udp(outlet, true, &outcomes))
     }
 
     pub async fn lock_routing_transaction(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -423,7 +767,8 @@ impl AppState {
         })
     }
 
-    pub fn start_development_core(&self) -> Result<CoreStatus, String> {
+    #[allow(clippy::too_many_lines)]
+    pub async fn start_development_core(&self) -> Result<CoreStatus, String> {
         self.ensure_runtime_ready()?;
         let private_config = self.private_config()?;
         if is_endpoint_reachable(&private_config.entry.host, private_config.entry.port) {
@@ -432,11 +777,14 @@ impl AppState {
                 private_config.entry.host, private_config.entry.port
             ));
         }
-        let mut guard = self
-            .managed_core
-            .lock()
-            .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?;
-        if guard.is_some() {
+        let already_running = {
+            let guard = self
+                .managed_core
+                .lock()
+                .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?;
+            guard.is_some()
+        };
+        if already_running {
             return Err("本应用已经持有一个 Mihomo 开发进程".into());
         }
 
@@ -447,7 +795,17 @@ impl AppState {
             .map_err(|error| format!("无法创建 Mihomo 运行目录：{error}"))?;
         harden_private_path(&self.runtime_directory)?;
         let controller_secret = generate_controller_secret();
-        let yaml = self.generate_runtime_config(&private_config, &controller_secret)?;
+        let startup_entry = ProbePortLease::reserve_excluding(&[
+            private_config.entry.port,
+            private_config.controller_port,
+        ])?;
+        let startup_entry_port = startup_entry.port();
+        let yaml = self.generate_bootstrap_config(
+            &private_config,
+            &controller_secret,
+            startup_entry_port,
+        )?;
+        let full_yaml = self.generate_runtime_config(&private_config, &controller_secret)?;
         let config_path = self.runtime_directory.join("mihomo.yaml");
         fs::write(&config_path, yaml).map_err(|_| "无法写入本机 Mihomo 运行配置".to_string())?;
         harden_private_path(&config_path)?;
@@ -467,6 +825,7 @@ impl AppState {
             return Err(core_diagnostic(CoreDiagnostic::ValidationFailed).into());
         }
 
+        drop(startup_entry);
         let mut child = hidden_command(&executable)
             .arg("-d")
             .arg(&self.runtime_directory)
@@ -479,7 +838,7 @@ impl AppState {
             .map_err(|error| format!("无法启动 Mihomo：{error}"))?;
 
         for _ in 0..50 {
-            if is_endpoint_reachable(&private_config.entry.host, private_config.entry.port)
+            if is_endpoint_reachable(&private_config.entry.host, startup_entry_port)
                 && is_endpoint_reachable("127.0.0.1", private_config.controller_port)
             {
                 break;
@@ -491,16 +850,103 @@ impl AppState {
             {
                 return Err(core_diagnostic(CoreDiagnostic::ExitedBeforeReady).into());
             }
-            thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if !is_endpoint_reachable(&private_config.entry.host, private_config.entry.port)
+        if !is_endpoint_reachable(&private_config.entry.host, startup_entry_port)
             || !is_endpoint_reachable("127.0.0.1", private_config.controller_port)
         {
             terminate_child(&mut child);
             return Err(format!(
                 "Mihomo 启动超时，{}:{} 或本机 Controller 未就绪",
-                private_config.entry.host, private_config.entry.port
+                private_config.entry.host, startup_entry_port
             ));
+        }
+
+        let controller = match ControllerClient::new(
+            &format!("http://127.0.0.1:{}", private_config.controller_port),
+            controller_secret.clone(),
+            10_000,
+        ) {
+            Ok(controller) => controller,
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(format!("无法连接本机 Mihomo Controller：{error}"));
+            }
+        };
+        for selector in [MASTER_SELECTOR, UDP_SELECTOR] {
+            if let Err(error) = controller.select(selector, FAIL_CLOSED_PROXY).await {
+                terminate_child(&mut child);
+                return Err(format!("无法锁定 {selector} Fail Closed 选择器：{error}"));
+            }
+        }
+        if let Some(target) = private_config.probe_targets.first() {
+            for outlet in private_config
+                .enabled_outlets()
+                .filter(|outlet| matches!(outlet.kind, OutletKind::Subscription { .. }))
+            {
+                let group = outlet_proxy_name(&outlet.id);
+                if controller.select(MASTER_SELECTOR, &group).await.is_ok() {
+                    let _ = probe_https_through_entry(startup_entry_port, target, 1_500).await;
+                }
+            }
+            if let Err(error) = controller.select(MASTER_SELECTOR, FAIL_CLOSED_PROXY).await {
+                terminate_child(&mut child);
+                return Err(format!("无法恢复主 Fail Closed 选择器：{error}"));
+            }
+        }
+        if let Err(error) = fs::write(&config_path, full_yaml) {
+            terminate_child(&mut child);
+            return Err(format!("无法写入完整 Mihomo 运行配置：{error}"));
+        }
+        if let Err(error) = harden_private_path(&config_path) {
+            terminate_child(&mut child);
+            return Err(error);
+        }
+        if let Err(error) = controller.reload_config(&config_path).await {
+            terminate_child(&mut child);
+            return Err(format!("无法加载完整 Mihomo 配置：{error}"));
+        }
+        for _ in 0..20 {
+            if is_endpoint_reachable(&private_config.entry.host, private_config.entry.port)
+                && !is_endpoint_reachable(&private_config.entry.host, startup_entry_port)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !is_endpoint_reachable(&private_config.entry.host, private_config.entry.port)
+            || is_endpoint_reachable(&private_config.entry.host, startup_entry_port)
+        {
+            terminate_child(&mut child);
+            return Err("完整配置入口切换未完成；开发核心已停止".into());
+        }
+        match controller
+            .is_selected(UDP_SELECTOR, FAIL_CLOSED_PROXY)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                terminate_child(&mut child);
+                return Err("UDP 选择器未保持 Fail Closed；开发核心已停止".into());
+            }
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(format!("无法确认 UDP Fail Closed 初始状态：{error}"));
+            }
+        }
+        match controller
+            .is_selected(MASTER_SELECTOR, FAIL_CLOSED_PROXY)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                terminate_child(&mut child);
+                return Err("主选择器未保持 Fail Closed；开发核心已停止".into());
+            }
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(format!("无法确认主选择器 Fail Closed 初始状态：{error}"));
+            }
         }
 
         let pid = child.id();
@@ -508,6 +954,14 @@ impl AppState {
         if let Err(error) = self.reset_routing_session() {
             terminate_child(&mut child);
             return Err(error);
+        }
+        let mut guard = self
+            .managed_core
+            .lock()
+            .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?;
+        if guard.is_some() {
+            terminate_child(&mut child);
+            return Err("本应用已经持有一个 Mihomo 开发进程".into());
         }
         *guard = Some(ManagedCore {
             child,
@@ -702,6 +1156,25 @@ fn is_endpoint_reachable(host: &str, port: u16) -> bool {
     TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
 }
 
+async fn probe_https_through_entry(entry_port: u16, target: &str, timeout_ms: u64) -> bool {
+    let Ok(proxy) = reqwest::Proxy::all(format!("http://127.0.0.1:{entry_port}")) else {
+        return false;
+    };
+    let Ok(client) = reqwest::Client::builder()
+        .no_proxy()
+        .proxy(proxy)
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(target)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+}
+
 #[cfg(target_os = "windows")]
 fn harden_private_path(path: &Path) -> Result<(), String> {
     let username = env::var("USERNAME").map_err(|_| "无法确定当前 Windows 用户".to_string())?;
@@ -760,12 +1233,30 @@ fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut command = Command::new(program);
     command.creation_flags(CREATE_NO_WINDOW);
+    remove_proxy_environment(&mut command);
     command
 }
 
 #[cfg(not(target_os = "windows"))]
 fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    Command::new(program)
+    let mut command = Command::new(program);
+    remove_proxy_environment(&mut command);
+    command
+}
+
+fn remove_proxy_environment(command: &mut Command) {
+    for name in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+    ] {
+        command.env_remove(name);
+    }
 }
 
 #[cfg(all(test, target_os = "windows"))]
@@ -987,16 +1478,16 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires the pinned Mihomo binary and a configured live local outlet"]
-    fn starts_and_stops_only_the_isolated_development_core() {
+    async fn starts_and_stops_only_the_isolated_development_core() {
         let state = AppState::new();
         let config = state.private_config().expect("config");
         assert!(!is_endpoint_reachable(
             &config.entry.host,
             config.entry.port
         ));
-        let running = state.start_development_core().expect("start core");
+        let running = state.start_development_core().await.expect("start core");
         assert_eq!(running.state, "running");
         assert!(is_endpoint_reachable(&config.entry.host, config.entry.port));
         let stopped = state.stop_development_core().expect("stop core");
@@ -1007,9 +1498,9 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         ));
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires the pinned Mihomo binary, a configured live local outlet, and external HTTPS"]
-    fn controller_selects_local_outlet_for_real_https() {
+    async fn controller_selects_local_outlet_for_real_https() {
         let state = AppState::new();
         let config = state.private_config().expect("config");
         let local_id = config
@@ -1021,14 +1512,14 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             &config.entry.host,
             config.entry.port
         ));
-        state.start_development_core().expect("start core");
+        state.start_development_core().await.expect("start core");
         let controller = state
             .controller_client()
             .expect("controller state")
             .expect("controller");
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        runtime
-            .block_on(controller.select(MASTER_SELECTOR, &outlet_proxy_name(&local_id)))
+        controller
+            .select(MASTER_SELECTOR, &outlet_proxy_name(&local_id))
+            .await
             .expect("select local outlet");
         let response = hidden_command("curl.exe")
             .args([
@@ -1047,16 +1538,16 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         state.stop_development_core().expect("stop core");
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires the pinned Mihomo binary and external HTTPS"]
-    fn initial_selector_is_fail_closed() {
+    async fn initial_selector_is_fail_closed() {
         let state = AppState::new();
         let config = state.private_config().expect("config");
         assert!(!is_endpoint_reachable(
             &config.entry.host,
             config.entry.port
         ));
-        state.start_development_core().expect("start core");
+        state.start_development_core().await.expect("start core");
         let response = hidden_command("curl.exe")
             .args([
                 "--silent",

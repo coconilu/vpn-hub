@@ -82,6 +82,15 @@ h1, h2, p { margin: 0; }
 .subscription-setup input { min-width: 0; height: 34px; padding: 0 10px; border: 1px solid #d8c390; border-radius: 7px; background: #fff; font-size: 12px; }
 .subscription-setup .secondary-button { height: 34px; }
 
+.udp-validation-setup { display: grid; grid-template-columns: minmax(220px, .8fr) minmax(260px, 1.2fr) max-content max-content; align-items: center; gap: 14px; margin-bottom: 12px; padding: 10px 12px; border: 1px solid #b9d3f5; border-radius: 8px; background: #f4f9ff; }
+.udp-validation-setup > div { display: grid; gap: 3px; }
+.udp-validation-setup strong { font-size: 12px; }
+.udp-validation-setup small { color: var(--muted); font-size: 10px; }
+.udp-validation-setup > input { min-width: 0; height: 34px; padding: 0 10px; border: 1px solid #afc7e5; border-radius: 7px; background: #fff; font-family: "Cascadia Code", Consolas, monospace; font-size: 11px; }
+.udp-validation-setup > label { display: flex; align-items: center; gap: 7px; color: #345a8b; font-size: 11px; white-space: nowrap; }
+.udp-validation-setup > label input { width: 15px; height: 15px; margin: 0; accent-color: var(--accent); }
+.udp-validation-setup .secondary-button { height: 34px; }
+
 .mode-row { display: flex; align-items: center; min-height: 38px; margin-bottom: 10px; gap: 30px; }
 .mode-row h2, .route-section h2, .table-section h2, .chart-panel h2, .events-panel h2 { font-size: 14px; line-height: 20px; font-weight: 700; }
 .mode-row label { display: flex; align-items: center; gap: 8px; color: #344054; font-size: 13px; cursor: pointer; }
@@ -180,6 +189,8 @@ tr.selected { background: #f1f7ff; box-shadow: inset 2px 0 0 var(--accent); }
   .protected-value.production { grid-column: 1 / -1; min-height: 34px; border-top: 1px solid #cfe0f5; border-left: 0; }
   .subscription-setup { grid-template-columns: 1fr max-content; }
   .subscription-setup > div { grid-column: 1 / -1; }
+  .udp-validation-setup { grid-template-columns: 1fr max-content; }
+  .udp-validation-setup > div, .udp-validation-setup > input { grid-column: 1 / -1; }
   .lower-grid { grid-template-columns: 1fr; }
   .chart-panel, .events-panel { height: 260px; }
   .main-content { padding-bottom: 26px; }

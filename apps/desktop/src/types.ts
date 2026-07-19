@@ -8,6 +8,8 @@ export interface UdpCapabilityEvidence {
   evidence_version: number;
   probe_version: string;
   model_version: number;
+  configuration_fingerprint: string;
+  configuration_generation: number;
   reason_code: string;
 }
 

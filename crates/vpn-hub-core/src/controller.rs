@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Duration;
 
 use reqwest::{StatusCode, Url};
@@ -41,6 +42,11 @@ struct VersionResponse {
 #[derive(Debug, Serialize)]
 struct SelectionRequest<'a> {
     name: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigReloadRequest<'a> {
+    path: &'a str,
 }
 
 impl ControllerClient {
@@ -237,6 +243,31 @@ impl ControllerClient {
             .client
             .put(url)
             .bearer_auth(&self.secret)
+            .send()
+            .await
+            .map_err(|_| ControllerError::Request)?;
+        if response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            Err(ControllerError::Http(response.status()))
+        }
+    }
+
+    /// Reloads a configuration file through the authenticated loopback-only
+    /// Controller. Callers own the file and must keep it protected.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized transport or HTTP error.
+    pub async fn reload_config(&self, path: &Path) -> Result<(), ControllerError> {
+        let path = path.to_str().ok_or(ControllerError::Request)?;
+        let mut url = self.endpoint(&["configs"])?;
+        url.query_pairs_mut().append_pair("force", "true");
+        let response = self
+            .client
+            .put(url)
+            .bearer_auth(&self.secret)
+            .json(&ConfigReloadRequest { path })
             .send()
             .await
             .map_err(|_| ControllerError::Request)?;

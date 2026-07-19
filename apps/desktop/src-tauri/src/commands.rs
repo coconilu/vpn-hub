@@ -44,7 +44,7 @@ fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
             .ensure_udp_capability(
                 &outlet.id,
                 &outlet.label,
-                &unknown_udp_evidence(&outlet.id, "not_yet_validated"),
+                &unknown_udp_evidence(outlet, "not_yet_validated"),
             )
             .map_err(|error| format!("无法初始化 UDP 能力状态：{error}"))?;
     }
@@ -84,7 +84,7 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
             .ensure_udp_capability(
                 &outlet.id,
                 &outlet.label,
-                &unknown_udp_evidence(&outlet.id, "not_yet_validated"),
+                &unknown_udp_evidence(outlet, "not_yet_validated"),
             )
             .map_err(|error| format!("无法初始化 UDP 能力状态：{error}"))?;
         let probe_outlet_config = virtual_outlet(outlet, &private.entry);
@@ -243,6 +243,7 @@ pub async fn refresh_guardian(state: State<'_, AppState>) -> Result<DashboardSna
 #[tauri::command]
 pub async fn revalidate_udp_capabilities(
     state: State<'_, AppState>,
+    authorized_subscription_targets: Vec<String>,
 ) -> Result<DashboardSnapshot, String> {
     let _transaction = state.lock_routing_transaction().await;
     if state.controller_client()?.is_some() {
@@ -256,12 +257,33 @@ pub async fn revalidate_udp_capabilities(
     let private = state.private_config()?;
     let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
+    if authorized_subscription_targets.len() > 8 {
+        return Err("一次最多允许 8 个受控 UDP 目标".into());
+    }
+    let mut subscription_targets = authorized_subscription_targets
+        .iter()
+        .map(|target| {
+            target
+                .parse::<SocketAddr>()
+                .map_err(|_| "受控 UDP 目标格式无效；请使用 IP:端口".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    subscription_targets.sort_unstable();
+    subscription_targets.dedup();
+    if subscription_targets
+        .iter()
+        .any(|target| matches!(target.port(), 3_666 | 6_666))
+    {
+        return Err("受保护端口不能用作 UDP 探测目标".into());
+    }
     let echo = OwnedUdpEcho::start()?;
 
     for outlet in private.enabled_outlets() {
         let evidence = match &outlet.kind {
             OutletKind::Subscription { .. } => {
-                unknown_udp_evidence(&outlet.id, "subscription_end_to_end_probe_required")
+                state
+                    .revalidate_subscription_udp(&private, outlet, &subscription_targets)
+                    .await?
             }
             OutletKind::LocalProxy { .. } => {
                 let target = UdpProbeTarget {
@@ -382,7 +404,7 @@ pub fn delete_subscription_credential(
 #[allow(clippy::needless_pass_by_value)]
 pub async fn start_development_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
     let _transaction = state.lock_routing_transaction().await;
-    let mut status = state.start_development_core()?;
+    let mut status = state.start_development_core().await?;
     if let Err(error) = record_routing_cycle_locked(&state).await {
         let _ = state.stop_development_core();
         return Err(format!(

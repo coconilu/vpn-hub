@@ -26,7 +26,8 @@ pub use mihomo::{
     OutletConfigSummary, OutletKind, PrivateConfigError, PrivateConfigSummary,
     PrivateRoutingConfig, ResolvedSubscriptionUrls, RuntimeConfigSummary, UDP_SELECTOR,
     UdpCapabilityMap, generate_controller_secret, generate_mihomo_config,
-    generate_mihomo_config_with_udp_capabilities, outlet_proxy_name,
+    generate_mihomo_config_with_udp_capabilities, generate_mihomo_startup_config,
+    outlet_proxy_name,
 };
 pub use model::{
     HealthStatus, LatencySample, OutletSummary, ProbeResult, RouteSwitchEvent, StateEvent,
@@ -43,6 +44,8 @@ pub use secret_store::{
 };
 pub use store::{GuardianStore, StoreError};
 pub use udp_capability::{
-    UDP_EVIDENCE_VERSION, UDP_MODEL_VERSION, UDP_PROBE_VERSION, UdpProbeTarget,
-    classify_subscription_udp, probe_local_proxy_udp, unknown_udp_evidence,
+    UDP_EVIDENCE_VERSION, UDP_MODEL_VERSION, UDP_PROBE_VERSION, UdpProbeError, UdpProbeTarget,
+    classify_subscription_udp, current_udp_status, is_current_udp_evidence,
+    outlet_udp_configuration, probe_authorized_socks5_udp, probe_local_proxy_udp,
+    unknown_udp_evidence,
 };

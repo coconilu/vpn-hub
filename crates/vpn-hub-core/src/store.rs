@@ -8,6 +8,8 @@ use crate::{
     StateEvent, UdpCapabilityEvidence, UdpCapabilityStatus,
 };
 
+const CURRENT_DATABASE_VERSION: i64 = 3;
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("failed to prepare database directory: {0}")]
@@ -18,6 +20,8 @@ pub enum StoreError {
     InvalidStatus(String),
     #[error("invalid stored UDP capability: {0}")]
     InvalidUdpCapability(String),
+    #[error("database version {0} is newer than this application supports")]
+    UnsupportedDatabaseVersion(i64),
 }
 
 pub struct GuardianStore {
@@ -51,10 +55,15 @@ impl GuardianStore {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, StoreError> {
+    fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
+        let user_version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if user_version > CURRENT_DATABASE_VERSION {
+            return Err(StoreError::UnsupportedDatabaseVersion(user_version));
+        }
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
             r"
             CREATE TABLE IF NOT EXISTS outlets (
                 id TEXT PRIMARY KEY,
@@ -111,6 +120,8 @@ impl GuardianStore {
                 evidence_version INTEGER NOT NULL,
                 probe_version TEXT NOT NULL,
                 model_version INTEGER NOT NULL,
+                configuration_fingerprint TEXT NOT NULL,
+                configuration_generation INTEGER NOT NULL,
                 reason_code TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_udp_capability_history_outlet_time
@@ -121,15 +132,16 @@ impl GuardianStore {
             );
             ",
         )?;
-        ensure_probe_column(&connection, "port_reachable", "INTEGER NOT NULL DEFAULT 0")?;
-        ensure_probe_column(&connection, "http_status", "INTEGER")?;
+        ensure_probe_column(&transaction, "port_reachable", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_probe_column(&transaction, "http_status", "INTEGER")?;
         ensure_probe_column(
-            &connection,
+            &transaction,
             "successful_targets",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
-        ensure_probe_column(&connection, "total_targets", "INTEGER NOT NULL DEFAULT 1")?;
-        connection.pragma_update(None, "user_version", 3_i64)?;
+        ensure_probe_column(&transaction, "total_targets", "INTEGER NOT NULL DEFAULT 1")?;
+        transaction.pragma_update(None, "user_version", CURRENT_DATABASE_VERSION)?;
+        transaction.commit()?;
         Ok(Self { connection })
     }
 
@@ -454,7 +466,7 @@ impl GuardianStore {
             params![outlet_id, label, evidence.observed_at],
         )?;
         transaction.execute(
-            "INSERT INTO udp_capability_history(outlet_id, status, observed_at, evidence_version, probe_version, model_version, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO udp_capability_history(outlet_id, status, observed_at, evidence_version, probe_version, model_version, configuration_fingerprint, configuration_generation, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 outlet_id,
                 evidence.status.as_str(),
@@ -462,6 +474,8 @@ impl GuardianStore {
                 evidence.evidence_version,
                 evidence.probe_version,
                 evidence.model_version,
+                evidence.configuration_fingerprint,
+                i64::try_from(evidence.configuration_generation).unwrap_or(i64::MAX),
                 evidence.reason_code,
             ],
         )?;
@@ -506,7 +520,8 @@ impl GuardianStore {
     pub fn udp_capabilities(&self) -> Result<Vec<UdpCapabilityEvidence>, StoreError> {
         let mut statement = self.connection.prepare(
             r"SELECT h.outlet_id, h.status, h.observed_at, h.evidence_version,
-                     h.probe_version, h.model_version, h.reason_code
+                     h.probe_version, h.model_version, h.configuration_fingerprint,
+                     h.configuration_generation, h.reason_code
               FROM udp_capability_current c
               JOIN udp_capability_history h ON h.id = c.history_id
               ORDER BY h.outlet_id",
@@ -527,7 +542,8 @@ impl GuardianStore {
     ) -> Result<Vec<UdpCapabilityEvidence>, StoreError> {
         let mut statement = self.connection.prepare(
             r"SELECT outlet_id, status, observed_at, evidence_version,
-                     probe_version, model_version, reason_code
+                     probe_version, model_version, configuration_fingerprint,
+                     configuration_generation, reason_code
               FROM udp_capability_history
               WHERE outlet_id=?1
               ORDER BY id DESC
@@ -538,7 +554,17 @@ impl GuardianStore {
     }
 }
 
-type StoredUdpCapability = (String, String, String, u32, String, u32, String);
+type StoredUdpCapability = (
+    String,
+    String,
+    String,
+    u32,
+    String,
+    u32,
+    String,
+    i64,
+    String,
+);
 
 fn read_udp_capability_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredUdpCapability> {
     Ok((
@@ -549,6 +575,8 @@ fn read_udp_capability_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredUd
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
     ))
 }
 
@@ -561,12 +589,14 @@ fn decode_udp_capability(row: StoredUdpCapability) -> Result<UdpCapabilityEviden
         evidence_version: row.3,
         probe_version: row.4,
         model_version: row.5,
-        reason_code: row.6,
+        configuration_fingerprint: row.6,
+        configuration_generation: u64::try_from(row.7).unwrap_or(u64::MAX),
+        reason_code: row.8,
     })
 }
 
 fn ensure_probe_column(
-    connection: &Connection,
+    connection: &rusqlite::Transaction<'_>,
     column_name: &str,
     definition: &str,
 ) -> Result<(), rusqlite::Error> {
@@ -775,6 +805,8 @@ mod tests {
                         evidence_version: 1,
                         probe_version: "test-probe-v1".into(),
                         model_version: 1,
+                        configuration_fingerprint: "test-fingerprint".into(),
+                        configuration_generation: 1,
                         reason_code: reason_code.into(),
                     },
                 )
@@ -793,5 +825,148 @@ mod tests {
             HealthStatus::Healthy,
             "UDP evidence must not alter Guardian TCP health"
         );
+    }
+
+    #[test]
+    fn migrates_v2_to_v3_transactionally_without_losing_existing_probe_data() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("guardian.db");
+        {
+            let connection = Connection::open(&path).expect("v2 database");
+            connection
+                .execute_batch(
+                    r"
+                    CREATE TABLE outlets (id TEXT PRIMARY KEY, label TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE probe_samples (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        outlet_id TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        port_reachable INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL,
+                        http_status INTEGER,
+                        latency_ms INTEGER,
+                        error_code TEXT,
+                        successful_targets INTEGER NOT NULL DEFAULT 0,
+                        total_targets INTEGER NOT NULL DEFAULT 1
+                    );
+                    CREATE TABLE outlet_state (
+                        outlet_id TEXT PRIMARY KEY,
+                        status TEXT NOT NULL,
+                        consecutive_successes INTEGER NOT NULL,
+                        consecutive_failures INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO outlets VALUES ('legacy-a', 'Legacy A', '2026-01-01T00:00:00Z');
+                    INSERT INTO probe_samples(outlet_id, observed_at, port_reachable, status, latency_ms, successful_targets, total_targets)
+                    VALUES ('legacy-a', '2026-01-01T00:00:00Z', 1, 'healthy', 42, 2, 2);
+                    INSERT INTO outlet_state VALUES ('legacy-a', 'healthy', 1, 0, '2026-01-01T00:00:00Z');
+                    PRAGMA user_version=2;
+                    ",
+                )
+                .expect("seed v2");
+        }
+
+        let store = GuardianStore::open(&path).expect("migrate v2");
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("version"),
+            3
+        );
+        let summaries = store.summaries().expect("preserved summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].outlet_id, "legacy-a");
+        assert_eq!(summaries[0].samples, 1);
+        assert_eq!(summaries[0].average_latency_ms, Some(42.0));
+    }
+
+    #[test]
+    fn failed_v2_migration_rolls_back_schema_and_user_version() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("guardian.db");
+        {
+            let connection = Connection::open(&path).expect("v2 database");
+            connection
+                .execute_batch(
+                    r"
+                    CREATE TABLE sentinel(value TEXT NOT NULL);
+                    INSERT INTO sentinel VALUES ('preserve-me');
+                    CREATE VIEW udp_capability_history AS SELECT value FROM sentinel;
+                    PRAGMA user_version=2;
+                    ",
+                )
+                .expect("seed broken v2");
+        }
+        assert!(matches!(
+            GuardianStore::open(&path),
+            Err(StoreError::Database(_))
+        ));
+        let connection = Connection::open(&path).expect("reopen rolled back database");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("version"),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM sentinel", [], |row| row
+                    .get::<_, String>(0))
+                .expect("sentinel"),
+            "preserve-me"
+        );
+        let current_exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='udp_capability_current')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("schema check");
+        assert!(!current_exists);
+    }
+
+    #[test]
+    fn future_database_version_is_rejected_without_any_mutation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("guardian.db");
+        {
+            let connection = Connection::open(&path).expect("future database");
+            connection
+                .execute_batch(
+                    r"
+                    CREATE TABLE sentinel(value TEXT NOT NULL);
+                    INSERT INTO sentinel VALUES ('future-data');
+                    PRAGMA user_version=99;
+                    ",
+                )
+                .expect("seed future database");
+        }
+        assert!(matches!(
+            GuardianStore::open(&path),
+            Err(StoreError::UnsupportedDatabaseVersion(99))
+        ));
+        let connection = Connection::open(&path).expect("reopen future database");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("version"),
+            99
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM sentinel", [], |row| row
+                    .get::<_, String>(0))
+                .expect("sentinel"),
+            "future-data"
+        );
+        let outlets_exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='outlets')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("schema check");
+        assert!(!outlets_exists);
     }
 }
