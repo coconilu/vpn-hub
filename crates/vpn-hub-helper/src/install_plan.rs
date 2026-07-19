@@ -35,6 +35,7 @@ pub enum PlanOperation {
         principals: Vec<String>,
     },
     ProvisionAuthorityLeaseFile,
+    ProvisionTunAuthorityLeaseFile,
     RegisterService {
         account: AccountContract,
         start_automatically: bool,
@@ -48,6 +49,7 @@ pub enum PlanOperation {
         reference_name: String,
         side: ProtectedMaterialSide,
     },
+    EnterFailClosed,
     StopOwnedJob,
     RestoreTunSnapshot,
     RemoveServiceRegistration,
@@ -69,6 +71,9 @@ pub struct InstallPlan {
     pub dry_run: bool,
     pub requires_elevation_by_signed_installer: bool,
     pub helper_self_elevation: bool,
+    /// The signed installer must execute this sequence in order and abort on
+    /// the first failure. Later cleanup/removal operations must never run
+    /// after fail-closed entry, owned-job stop, or TUN restoration fails.
     pub operations: Vec<PlanOperation>,
 }
 
@@ -89,6 +94,7 @@ impl From<AuthError> for InstallPlanError {
 }
 
 impl InstallPlan {
+    #[allow(clippy::too_many_lines)]
     pub fn build(
         action: InstallAction,
         install_id: &str,
@@ -110,6 +116,15 @@ impl InstallPlan {
                         "interactive-user-sid".into(),
                         "NT AUTHORITY\\LOCAL SERVICE".into(),
                         "SYSTEM".into(),
+                    ],
+                },
+                PlanOperation::ProvisionTunAuthorityLeaseFile,
+                PlanOperation::ApplyProgramDataAcl {
+                    relative_path: "tun-authority.lease".into(),
+                    principals: vec![
+                        "NT AUTHORITY\\LOCAL SERVICE".into(),
+                        "SYSTEM".into(),
+                        "BUILTIN\\Administrators".into(),
                     ],
                 },
                 PlanOperation::ProvisionAuthorityLeaseFile,
@@ -144,8 +159,9 @@ impl InstallPlan {
                 },
             ],
             InstallAction::Upgrade => vec![
-                PlanOperation::RestoreTunSnapshot,
+                PlanOperation::EnterFailClosed,
                 PlanOperation::StopOwnedJob,
+                PlanOperation::RestoreTunSnapshot,
                 PlanOperation::VerifySignedArtifact {
                     relative_path: "bin/vpn-hub-helper.exe".into(),
                     sha256: helper_sha256.into(),
@@ -161,8 +177,9 @@ impl InstallPlan {
                 PlanOperation::VerifyNoOwnedJob,
             ],
             InstallAction::Uninstall => vec![
-                PlanOperation::RestoreTunSnapshot,
+                PlanOperation::EnterFailClosed,
                 PlanOperation::StopOwnedJob,
+                PlanOperation::RestoreTunSnapshot,
                 PlanOperation::RemoveServiceRegistration,
                 PlanOperation::RemoveProtectedReference {
                     reference_name: format!("{protected_reference}/service"),
@@ -230,6 +247,24 @@ mod tests {
                 start_automatically: false
             }
         )));
+        assert!(matches!(
+            plan.operations.as_slice(),
+            [
+                PlanOperation::VerifySignedArtifact { .. },
+                PlanOperation::ApplyProgramDataAcl { .. },
+                PlanOperation::ProvisionTunAuthorityLeaseFile,
+                PlanOperation::ApplyProgramDataAcl {
+                    relative_path,
+                    principals,
+                },
+                ..
+            ] if relative_path == "tun-authority.lease"
+                && principals == &[
+                    "NT AUTHORITY\\LOCAL SERVICE",
+                    "SYSTEM",
+                    "BUILTIN\\Administrators",
+                ]
+        ));
         let rendered = serde_json::to_string(&plan).unwrap();
         assert!(!rendered.contains("LocalSystem"));
         assert!(!rendered.contains("protocol-key\":"));
@@ -242,8 +277,9 @@ mod tests {
         assert!(matches!(
             plan.operations.as_slice(),
             [
-                PlanOperation::RestoreTunSnapshot,
+                PlanOperation::EnterFailClosed,
                 PlanOperation::StopOwnedJob,
+                PlanOperation::RestoreTunSnapshot,
                 ..
             ]
         ));
@@ -269,8 +305,9 @@ mod tests {
         assert!(matches!(
             plan.operations.as_slice(),
             [
-                PlanOperation::RestoreTunSnapshot,
+                PlanOperation::EnterFailClosed,
                 PlanOperation::StopOwnedJob,
+                PlanOperation::RestoreTunSnapshot,
                 ..
             ]
         ));

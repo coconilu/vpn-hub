@@ -80,6 +80,11 @@ impl InstallationReference {
     pub fn authority_path(&self) -> PathBuf {
         self.program_data_root.join("authority.lease")
     }
+
+    #[must_use]
+    pub fn tun_authority_path(&self) -> PathBuf {
+        self.program_data_root.join("tun-authority.lease")
+    }
 }
 
 fn valid_id(value: &str) -> bool {
@@ -124,6 +129,10 @@ mod tests {
         assert_eq!(
             reference.authority_path(),
             program_data.join("VPN Hub/install-a/authority.lease")
+        );
+        assert_eq!(
+            reference.tun_authority_path(),
+            program_data.join("VPN Hub/install-a/tun-authority.lease")
         );
     }
 

@@ -23,7 +23,7 @@
 | 默认安装/升级 | TUN 关闭；不弹 UAC、不改系统网络 |
 | 首次请求启用 | 必须确认当前版本风险；能力 unsupported 时确认控件禁用，且不会记录为已启用或已同意 |
 | 普通统一入口模式 | 与 TUN 计划相互独立；TUN 失败会恢复切换前 snapshot，不影响普通模式配置 |
-| 多个订阅出口 | 每个保留稳定 outlet ID；凭据、订阅 URL、节点和 Controller secret 不进入 TUN plan/journal/status |
+| 多个订阅出口 | 每个保留稳定 outlet ID；TUN plan 只保存脱敏后的 outlet ID 与 transport，凭据、订阅 URL、节点和 Controller secret 不进入 plan/journal/status |
 | 多个本地出口 | 每个必须有稳定 outlet ID、明确 loopback endpoint、用户登记的本地绝对 executable path 和 SHA-256 |
 | 动态增删 outlet | settings preview generation 随草稿指纹变化；计划只包含当前启用且登记的 outlet，不残留已删除身份 |
 | all-down | IPv4/IPv6 × TCP/UDP/DNS 全部 `Rejected`，不生成或回退 `DIRECT` |
@@ -46,7 +46,7 @@
 计划对 IPv4/IPv6 各生成 Application TCP、Application UDP、DNS TCP、DNS UDP 四个验证向量：
 
 - 有健康 TCP 出口时 TCP 向量才可 `Tunneled`。
-- 只有带当前有效 UDP 证据的健康出口才能让 UDP 向量 `Tunneled`。
+- 只有带当前有效 UDP 证据的健康出口才能让 UDP 向量 `Tunneled`；有效性统一调用 Core 的版本、probe/model、outlet ID、配置 fingerprint 与 generation 校验。
 - TCP-only、unknown 或 stale UDP 证据不会被猜测为 UDP 可用。
 - all-down 或 backend capability 不完整时全部 `Rejected`。
 
@@ -54,19 +54,25 @@
 
 ```mermaid
 flowchart LR
-    A["authority + generation fence"] --> B["snapshot routes / DNS / adapters / TUN"]
-    B --> C["durable journal: snapshotted"]
-    C --> D["stage typed plan"]
-    D --> E["apply"]
-    E --> F["verify leak matrix"]
-    F --> G["commit"]
-    D -. failure/cancel .-> R["restore snapshot"]
-    E -. failure/crash .-> R
-    F -. failure .-> R
-    G -. stop/uninstall/recovery .-> R
+    A["preprovisioned protected authority file"] --> B["exclusive OS lock + identity/generation fence"]
+    B --> C["load journal, then snapshot routes / DNS / adapters / TUN"]
+    C --> D["durable journal: snapshotted"]
+    D --> E["stage typed plan"]
+    E --> F["apply"]
+    F --> G["verify leak matrix"]
+    G --> H["commit"]
+    E -. failure/cancel .-> R["restore + verify snapshot"]
+    F -. failure/crash .-> R
+    G -. failure .-> R
+    H -. disable/stop/uninstall/recovery .-> R
+    R --> I["persist restored, clear journal, release lock"]
 ```
 
-每个 OS 边界后先持久化 phase，再进入下一阶段。journal 使用同目录临时文件、文件和目录 durability barrier 与 Windows 可替换的备份策略；主文件损坏时可读相同的 `.bak`。第二 authority、stale generation 和未恢复的旧 journal 都被拒绝。恢复重复执行安全；只有恢复完成并持久化后才清理 journal。
+签名 installer 必须预置专用 `tun-authority.lease`，只允许 LocalService/SYSTEM/Administrators 写入，交互用户不能替换或删除；Helper 不会在关键路径创建它。事务先取得文件级排他 OS lock，再读取 journal 或创建 snapshot，并持有到 apply/recover/clear 完成；不能锁 journal inode，因为 journal 会原子替换。authority wrapper 同时校验 install ID、authority ID 与 generation。
+
+每个 OS 边界后先持久化 phase，再进入下一阶段。journal 使用同目录临时文件、文件和目录 durability barrier 与 Windows 可替换的备份策略；主文件损坏时可读相同的 `.bak`。第二 authority、stale generation 和未恢复的旧 journal 都被拒绝。Disable 不能走 apply，也绝不把当前已启用状态拍成恢复目标；它只能恢复已有 committed Enable snapshot，验证恢复后写入 `restored`，最后清理 journal。恢复或清理失败可安全重试。
+
+升级与卸载必须严格执行 `EnterFailClosed → StopOwnedJob → RestoreTunSnapshot → cleanup/replace → verify`，任一步失败即中止后续删除或替换。
 
 journal 只允许长度受限的 opaque route/DNS/adapter/TUN record；单条、总大小、数量和 secret-shaped 内容都有上限。它不保存命令文本、订阅、节点、token、密码、Controller secret 或访问目标。
 
@@ -75,9 +81,11 @@ journal 只允许长度受限的 opaque route/DNS/adapter/TUN record；单条、
 - 默认关闭、当前版本风险确认、生产 unsupported Fail Closed。
 - 多 subscription / 多 local_proxy、动态删除/新增、stable ID 和 exact identity。
 - GUI/Helper deny、Core 最小上游、local client 精确基础设施 bypass、unknown process no-touch。
-- TCP-only 与 UDP evidence 分离；all-down 全矩阵 Reject；序列化无 `DIRECT`。
+- canonical outlet registry 与 TCP/UDP eligible subset 防篡改；本地 endpoint 和 executable identity 一一对应；plan 不含订阅 secret。
+- TCP-only 与 UDP evidence 分离；Core 会拒绝 outlet ID、evidence/probe/model 版本、配置 fingerprint/generation 或状态被篡改的证据；all-down 全矩阵 Reject。
+- 专用 authority 文件必须预置；真实双 handle 排他锁、plan identity/generation 在 snapshot 前拒绝。
 - snapshot/stage/apply/verify/commit 每个 OS 失败点与每个 journal save 失败点回滚。
-- crash/cancel/restart/uninstall 恢复幂等；stale generation 与第二 authority 拒绝。
+- Disable 不重新 snapshot；crash/cancel/restart/uninstall 统一恢复并验证 committed Enable snapshot，`restored` 保存/清理失败均可幂等重试。
 - 真实 `FileTunJournalStore` 连续多 phase save/load/backup/clear（仅文件系统，不执行网络系统调用）。
 
 ## 真实 Windows destructive acceptance 剩余 gate

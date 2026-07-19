@@ -440,7 +440,7 @@ sequenceDiagram
 | 6666 被局域网访问 | 默认只监听 127.0.0.1，不开启 Allow LAN |
 | 全部出口失败后真实 IP 泄漏 | 默认 Fail Closed，不自动 DIRECT |
 | DNS 泄漏 | DNS 由统一 Mihomo 接管并遵守路由规则 |
-| 循环代理 | TUN 排除两个上游 Core/GUI/Helper 进程 |
+| 循环代理 | GUI/Helper 外网拒绝；Core 仅允许计划内上游；只有已登记的本地客户端基础设施可按 normalized application identity 精确 bypass；未知进程不扫描、不放行 |
 | 浏览历史泄漏 | 不持久化真实访问目标，只保存人工探测结果 |
 | 明文运行配置 | 当前用户 ACL；正式版支持 DPAPI 加密静态配置 |
 | DLL/核心被替换 | 版本锁定、SHA-256 校验和受信更新源 |

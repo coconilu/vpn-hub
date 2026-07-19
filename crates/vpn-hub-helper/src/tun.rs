@@ -14,13 +14,19 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use vpn_hub_core::{
+    OutletConfig, OutletKind, UdpCapabilityEvidence, UdpCapabilityStatus, current_udp_status,
+};
 
-const JOURNAL_SCHEMA_VERSION: u16 = 1;
-const PLAN_SCHEMA_VERSION: u16 = 1;
+use crate::{AuthorityFileGuard, InstallationReference, SupervisorAuthority};
+
+const JOURNAL_SCHEMA_VERSION: u16 = 2;
+const PLAN_SCHEMA_VERSION: u16 = 2;
 const CONSENT_VERSION: u16 = 1;
 const MAX_OUTLETS: usize = 128;
 const MAX_IDENTITIES: usize = 131;
 const MAX_JOURNAL_BYTES: usize = 512 * 1024;
+const MAX_PLAN_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -124,18 +130,26 @@ pub enum OutletTransport {
     LocalProxy,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredOutlet {
-    pub outlet_id: String,
-    pub transport: OutletTransport,
-    /// Local proxies must use an explicit loopback URL. Subscriptions have none.
-    pub loopback_endpoint: Option<String>,
-    pub enabled: bool,
+    /// Current private routing declaration. It is input-only: subscription
+    /// secret references are never copied into `TunPlan` or its journal.
+    pub config: OutletConfig,
     pub healthy: bool,
-    pub udp_supported: bool,
+    /// Versioned Issue #11 evidence. Missing, stale, unknown and TCP-only
+    /// evidence are all excluded from the UDP eligible set.
+    pub udp_evidence: Option<UdpCapabilityEvidence>,
     /// Required only for local proxies, and must carry the same stable outlet ID.
     pub executable: Option<ExecutableIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OutletDeclaration {
+    pub outlet_id: String,
+    pub transport: OutletTransport,
+    /// Present only for local proxies; subscriptions remain credential-free.
+    pub loopback_endpoint: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -231,6 +245,7 @@ pub struct TunPlan {
     pub dns_hijack_tcp: bool,
     pub dns_hijack_udp: bool,
     pub process_rules: Vec<ProcessRule>,
+    pub outlet_registry: Vec<OutletDeclaration>,
     pub local_endpoints: BTreeMap<String, String>,
     pub tcp_eligible_outlets: Vec<String>,
     pub udp_eligible_outlets: Vec<String>,
@@ -263,6 +278,7 @@ impl TunPlan {
             TunPlanAction::Disable
                 if self.consent_version.is_some()
                     || !self.process_rules.is_empty()
+                    || !self.outlet_registry.is_empty()
                     || !self.local_endpoints.is_empty()
                     || !self.tcp_eligible_outlets.is_empty()
                     || !self.udp_eligible_outlets.is_empty() =>
@@ -318,36 +334,58 @@ impl TunPlan {
         {
             return Err(TunError::ApplicationIdentityMissing);
         }
-        for (outlet_id, endpoint) in &self.local_endpoints {
-            validate_id(outlet_id)?;
-            validate_loopback_endpoint(endpoint)?;
-            if !local_rule_ids.contains(outlet_id.as_str()) {
-                return Err(TunError::LocalProcessIdentityRequired);
+        let mut declared_ids = BTreeSet::new();
+        let mut declared_local_ids = BTreeSet::new();
+        for declaration in &self.outlet_registry {
+            validate_id(&declaration.outlet_id)?;
+            if !declared_ids.insert(declaration.outlet_id.as_str()) {
+                return Err(TunError::DuplicateOutlet);
+            }
+            match declaration.transport {
+                OutletTransport::Subscription if declaration.loopback_endpoint.is_none() => {}
+                OutletTransport::LocalProxy => {
+                    let endpoint = declaration
+                        .loopback_endpoint
+                        .as_deref()
+                        .ok_or(TunError::LoopbackEndpointRequired)?;
+                    validate_loopback_endpoint(endpoint)?;
+                    declared_local_ids.insert(declaration.outlet_id.as_str());
+                    if self
+                        .local_endpoints
+                        .get(&declaration.outlet_id)
+                        .map(String::as_str)
+                        != Some(endpoint)
+                    {
+                        return Err(TunError::InvalidOutlet);
+                    }
+                }
+                OutletTransport::Subscription => return Err(TunError::InvalidOutlet),
             }
         }
-        if local_rule_ids
-            != self
-                .local_endpoints
-                .keys()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>()
+        if local_rule_ids != declared_local_ids
+            || declared_local_ids
+                != self
+                    .local_endpoints
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<BTreeSet<_>>()
         {
             return Err(TunError::LocalProcessIdentityRequired);
         }
         let tcp = validate_unique_ids(&self.tcp_eligible_outlets)?;
         let udp = validate_unique_ids(&self.udp_eligible_outlets)?;
         let expected_all_down = self.action == TunPlanAction::Enable && tcp.is_empty();
-        if !udp.is_subset(&tcp)
+        if !tcp.is_subset(&declared_ids)
+            || !udp.is_subset(&declared_ids)
+            || !udp.is_subset(&tcp)
             || self.all_down != expected_all_down
             || self.leak_checks != leak_matrix(!tcp.is_empty(), !udp.is_empty())
         {
             return Err(TunError::LeakPolicyInvalid);
         }
-        let json = serde_json::to_string(self).map_err(|_| TunError::InvalidPlan)?;
-        let lower = json.to_ascii_lowercase();
-        if lower.contains("direct") || lower.contains("subscription_url") || lower.contains("token")
-        {
-            return Err(TunError::UnsafeSerializedState);
+        let json = serde_json::to_vec(self).map_err(|_| TunError::InvalidPlan)?;
+        if json.len() > MAX_PLAN_BYTES {
+            return Err(TunError::InvalidPlan);
         }
         Ok(())
     }
@@ -386,6 +424,7 @@ impl TunPlanBuilder<'_> {
                 dns_hijack_tcp: true,
                 dns_hijack_udp: true,
                 process_rules: Vec::new(),
+                outlet_registry: Vec::new(),
                 local_endpoints: BTreeMap::new(),
                 tcp_eligible_outlets: Vec::new(),
                 udp_eligible_outlets: Vec::new(),
@@ -428,31 +467,36 @@ impl TunPlanBuilder<'_> {
         }
 
         let mut outlet_ids = BTreeSet::new();
+        let mut outlet_registry = Vec::new();
         let mut endpoints = BTreeMap::new();
         let mut tcp_eligible_outlets = Vec::new();
         let mut udp_eligible_outlets = Vec::new();
-        for outlet in self.outlets.iter().filter(|outlet| outlet.enabled) {
-            validate_id(&outlet.outlet_id)?;
-            if !outlet_ids.insert(outlet.outlet_id.as_str()) {
+        for outlet in self.outlets.iter().filter(|outlet| outlet.config.enabled) {
+            let outlet_id = outlet.config.id.as_str();
+            validate_id(outlet_id)?;
+            if !outlet_ids.insert(outlet_id) {
                 return Err(TunError::DuplicateOutlet);
             }
             if outlet.healthy {
-                tcp_eligible_outlets.push(outlet.outlet_id.clone());
-                if outlet.udp_supported {
-                    udp_eligible_outlets.push(outlet.outlet_id.clone());
+                tcp_eligible_outlets.push(outlet_id.to_owned());
+                if current_udp_status(&outlet.config, outlet.udp_evidence.as_ref())
+                    == UdpCapabilityStatus::Supported
+                {
+                    udp_eligible_outlets.push(outlet_id.to_owned());
                 }
             }
-            match outlet.transport {
-                OutletTransport::Subscription => {
-                    if outlet.loopback_endpoint.is_some() || outlet.executable.is_some() {
+            match &outlet.config.kind {
+                OutletKind::Subscription { .. } => {
+                    if outlet.executable.is_some() {
                         return Err(TunError::InvalidOutlet);
                     }
+                    outlet_registry.push(OutletDeclaration {
+                        outlet_id: outlet_id.to_owned(),
+                        transport: OutletTransport::Subscription,
+                        loopback_endpoint: None,
+                    });
                 }
-                OutletTransport::LocalProxy => {
-                    let endpoint = outlet
-                        .loopback_endpoint
-                        .as_deref()
-                        .ok_or(TunError::LoopbackEndpointRequired)?;
+                OutletKind::LocalProxy { endpoint } => {
                     validate_loopback_endpoint(endpoint)?;
                     let executable = outlet
                         .executable
@@ -460,11 +504,16 @@ impl TunPlanBuilder<'_> {
                         .ok_or(TunError::LocalProcessIdentityRequired)?;
                     executable.validate()?;
                     if executable.role != ExecutableRole::LocalOutlet
-                        || executable.outlet_id.as_deref() != Some(outlet.outlet_id.as_str())
+                        || executable.outlet_id.as_deref() != Some(outlet_id)
                     {
                         return Err(TunError::LocalProcessIdentityRequired);
                     }
-                    endpoints.insert(outlet.outlet_id.clone(), endpoint.into());
+                    endpoints.insert(outlet_id.to_owned(), endpoint.clone());
+                    outlet_registry.push(OutletDeclaration {
+                        outlet_id: outlet_id.to_owned(),
+                        transport: OutletTransport::LocalProxy,
+                        loopback_endpoint: Some(endpoint.clone()),
+                    });
                     process_rules.push(ProcessRule {
                         identity: executable.clone(),
                         policy: ProcessNetworkPolicy::RegisteredOutletInfrastructureBypass,
@@ -486,6 +535,7 @@ impl TunPlanBuilder<'_> {
             dns_hijack_tcp: true,
             dns_hijack_udp: true,
             process_rules,
+            outlet_registry,
             local_endpoints: endpoints,
             tcp_eligible_outlets,
             udp_eligible_outlets,
@@ -559,6 +609,7 @@ pub enum TunJournalPhase {
     Verified,
     Committed,
     RolledBack,
+    Restored,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -568,6 +619,7 @@ pub struct TunJournal {
     pub install_id: String,
     pub authority_id: String,
     pub generation: u64,
+    pub action: TunPlanAction,
     pub plan_fingerprint: String,
     pub phase: TunJournalPhase,
     pub snapshot: NetworkSnapshot,
@@ -665,21 +717,95 @@ pub trait TunBackend {
     fn verify(&mut self, plan: &TunPlan) -> Result<(), TunError>;
     fn commit(&mut self, plan: &TunPlan) -> Result<(), TunError>;
     fn restore(&mut self, snapshot: &NetworkSnapshot) -> Result<(), TunError>;
+    fn verify_restored(&mut self, snapshot: &NetworkSnapshot) -> Result<(), TunError>;
+}
+
+/// OS-backed cross-process authority held for the complete TUN transaction.
+/// The signed installer must pre-provision the dedicated lease file with the
+/// reviewed `ProgramData` ACL; this API never creates it.
+pub struct TunAuthorityGuard {
+    _file_guard: AuthorityFileGuard,
+    install_id: String,
+    authority_id: String,
+    generation: u64,
+}
+
+impl TunAuthorityGuard {
+    pub fn acquire_existing(
+        installation: &InstallationReference,
+        authority_id: &str,
+        generation: u64,
+    ) -> Result<Self, TunError> {
+        if !installation.helper_enabled {
+            return Err(TunError::AuthorityConflict);
+        }
+        let program_data = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .ok_or(TunError::AuthorityConflict)?;
+        installation
+            .validate(&program_data)
+            .map_err(|_| TunError::AuthorityConflict)?;
+        Self::acquire_at(
+            &installation.tun_authority_path(),
+            &installation.install_id,
+            authority_id,
+            generation,
+        )
+    }
+
+    fn acquire_at(
+        path: &Path,
+        install_id: &str,
+        authority_id: &str,
+        generation: u64,
+    ) -> Result<Self, TunError> {
+        validate_id(install_id)?;
+        validate_id(authority_id)?;
+        if generation == 0 {
+            return Err(TunError::StaleGeneration);
+        }
+        let file_guard =
+            AuthorityFileGuard::acquire_existing(path, SupervisorAuthority::Helper, generation)
+                .map_err(|_| TunError::AuthorityConflict)?;
+        Ok(Self {
+            _file_guard: file_guard,
+            install_id: install_id.into(),
+            authority_id: authority_id.into(),
+            generation,
+        })
+    }
+
+    fn validates(&self, plan: &TunPlan) -> bool {
+        self.install_id == plan.install_id
+            && self.authority_id == plan.authority_id
+            && self.generation == plan.generation
+    }
 }
 
 pub struct TunTransaction<B, J> {
     backend: B,
     journal: J,
+    authority: TunAuthorityGuard,
 }
 
 impl<B: TunBackend, J: TunJournalStore> TunTransaction<B, J> {
     #[must_use]
-    pub const fn new(backend: B, journal: J) -> Self {
-        Self { backend, journal }
+    pub const fn new(backend: B, journal: J, authority: TunAuthorityGuard) -> Self {
+        Self {
+            backend,
+            journal,
+            authority,
+        }
     }
 
     pub fn apply(&mut self, plan: &TunPlan) -> Result<TunJournal, TunError> {
         plan.validate()?;
+        if plan.action != TunPlanAction::Enable {
+            return Err(TunError::DisableRequiresCommittedSnapshot);
+        }
+        if !self.authority.validates(plan) {
+            return Err(TunError::AuthorityConflict);
+        }
         require_platform_capabilities(&self.backend.capabilities())?;
         self.fence(plan)?;
         let snapshot = self.backend.snapshot()?;
@@ -688,6 +814,7 @@ impl<B: TunBackend, J: TunJournalStore> TunTransaction<B, J> {
             install_id: plan.install_id.clone(),
             authority_id: plan.authority_id.clone(),
             generation: plan.generation,
+            action: TunPlanAction::Enable,
             plan_fingerprint: plan.fingerprint(),
             phase: TunJournalPhase::Snapshotted,
             snapshot,
@@ -713,18 +840,65 @@ impl<B: TunBackend, J: TunJournalStore> TunTransaction<B, J> {
         Ok(state)
     }
 
+    /// Disables only by restoring the outstanding pre-enable snapshot. It
+    /// never snapshots the currently enabled TUN state as a recovery target.
+    pub fn disable(&mut self, plan: &TunPlan) -> Result<bool, TunError> {
+        plan.validate()?;
+        if plan.action != TunPlanAction::Disable {
+            return Err(TunError::DisableRequiresCommittedSnapshot);
+        }
+        if !self.authority.validates(plan) {
+            return Err(TunError::AuthorityConflict);
+        }
+        let Some(state) = self.journal.load()? else {
+            return Ok(false);
+        };
+        if state.install_id != plan.install_id || state.authority_id != plan.authority_id {
+            return Err(TunError::AuthorityConflict);
+        }
+        if plan.generation < state.generation {
+            return Err(TunError::StaleGeneration);
+        }
+        self.restore_outstanding(state, Some(plan.generation))
+    }
+
     /// Restores any recorded pre-TUN snapshot. Used for cancellation, crash,
-    /// forced restart, normal stop, disable and uninstall. Repetition is safe.
+    /// forced restart, normal stop and uninstall. Repetition is safe.
     pub fn recover(&mut self, install_id: &str, authority_id: &str) -> Result<bool, TunError> {
-        let Some(mut state) = self.journal.load()? else {
+        if self.authority.install_id != install_id || self.authority.authority_id != authority_id {
+            return Err(TunError::AuthorityConflict);
+        }
+        let Some(state) = self.journal.load()? else {
             return Ok(false);
         };
         if state.install_id != install_id || state.authority_id != authority_id {
             return Err(TunError::AuthorityConflict);
         }
-        self.backend.restore(&state.snapshot)?;
-        state.phase = TunJournalPhase::RolledBack;
-        self.journal.save(&state)?;
+        if self.authority.generation < state.generation {
+            return Err(TunError::StaleGeneration);
+        }
+        self.restore_outstanding(state, None)
+    }
+
+    fn restore_outstanding(
+        &mut self,
+        mut state: TunJournal,
+        completed_generation: Option<u64>,
+    ) -> Result<bool, TunError> {
+        if state.action != TunPlanAction::Enable {
+            return Err(TunError::JournalCorrupt);
+        }
+        if state.phase == TunJournalPhase::Restored {
+            self.backend.verify_restored(&state.snapshot)?;
+        } else {
+            self.backend.restore(&state.snapshot)?;
+            self.backend.verify_restored(&state.snapshot)?;
+            state.phase = TunJournalPhase::Restored;
+            if let Some(generation) = completed_generation {
+                state.generation = generation;
+            }
+            self.journal.save(&state)?;
+        }
         self.journal.clear()?;
         Ok(true)
     }
@@ -816,6 +990,10 @@ impl TunBackend for WindowsPlanOnlyTunBackend {
     fn restore(&mut self, _snapshot: &NetworkSnapshot) -> Result<(), TunError> {
         Err(TunError::PlatformCapabilityUnsupported)
     }
+
+    fn verify_restored(&mut self, _snapshot: &NetworkSnapshot) -> Result<(), TunError> {
+        Err(TunError::PlatformCapabilityUnsupported)
+    }
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -852,6 +1030,8 @@ pub enum TunError {
     StaleGeneration,
     #[error("an interrupted TUN transaction must be recovered first")]
     RecoveryRequired,
+    #[error("TUN disable requires an outstanding committed enable snapshot")]
+    DisableRequiresCommittedSnapshot,
     #[error("TUN journal could not be read")]
     JournalRead,
     #[error("TUN journal could not be written")]
@@ -877,6 +1057,7 @@ fn validate_journal(journal: &TunJournal) -> Result<(), TunError> {
     validate_id(&journal.authority_id)?;
     if journal.schema_version != JOURNAL_SCHEMA_VERSION
         || journal.generation == 0
+        || journal.action != TunPlanAction::Enable
         || !valid_sha256(&journal.plan_fingerprint)
         || journal.snapshot.route_records.len() > 4096
         || journal.snapshot.dns_records.len() > 4096
@@ -1022,42 +1203,63 @@ mod tests {
         ]
     }
 
+    fn subscription_config(id: &str) -> OutletConfig {
+        OutletConfig {
+            id: id.into(),
+            label: format!("Subscription {id}"),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: format!("private.{id}"),
+                provider_update_seconds: 180,
+            },
+        }
+    }
+
+    fn local_config(id: &str, endpoint: &str) -> OutletConfig {
+        OutletConfig {
+            id: id.into(),
+            label: format!("Local {id}"),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: endpoint.into(),
+            },
+        }
+    }
+
+    fn supported_evidence(config: &OutletConfig) -> UdpCapabilityEvidence {
+        let mut evidence = vpn_hub_core::unknown_udp_evidence(config, "test_fixture");
+        evidence.status = UdpCapabilityStatus::Supported;
+        evidence
+    }
+
     fn outlets() -> Vec<RegisteredOutlet> {
+        let sub_a = subscription_config("sub-a");
+        let sub_b = subscription_config("sub-b");
+        let local_a = local_config("local-a", "socks5h://127.0.0.1:42661");
+        let local_b = local_config("local-b", "http://[::1]:42662");
         vec![
             RegisteredOutlet {
-                outlet_id: "sub-a".into(),
-                transport: OutletTransport::Subscription,
-                loopback_endpoint: None,
-                enabled: true,
+                udp_evidence: Some(supported_evidence(&sub_a)),
+                config: sub_a,
                 healthy: true,
-                udp_supported: true,
                 executable: None,
             },
             RegisteredOutlet {
-                outlet_id: "sub-b".into(),
-                transport: OutletTransport::Subscription,
-                loopback_endpoint: None,
-                enabled: true,
+                config: sub_b,
                 healthy: false,
-                udp_supported: false,
+                udp_evidence: None,
                 executable: None,
             },
             RegisteredOutlet {
-                outlet_id: "local-a".into(),
-                transport: OutletTransport::LocalProxy,
-                loopback_endpoint: Some("socks5h://127.0.0.1:42661".into()),
-                enabled: true,
+                udp_evidence: Some(supported_evidence(&local_a)),
+                config: local_a,
                 healthy: true,
-                udp_supported: true,
                 executable: Some(identity(ExecutableRole::LocalOutlet, Some("local-a"), 'd')),
             },
             RegisteredOutlet {
-                outlet_id: "local-b".into(),
-                transport: OutletTransport::LocalProxy,
-                loopback_endpoint: Some("http://[::1]:42662".into()),
-                enabled: true,
+                config: local_b,
                 healthy: false,
-                udp_supported: false,
+                udp_evidence: None,
                 executable: Some(identity(ExecutableRole::LocalOutlet, Some("local-b"), 'e')),
             },
         ]
@@ -1078,6 +1280,48 @@ mod tests {
             outlets,
         }
         .build()
+    }
+
+    fn disable_plan(generation: u64) -> TunPlan {
+        TunPlanBuilder {
+            install_id: "install-a",
+            authority_id: "helper-a",
+            generation,
+            requested_enabled: false,
+            consent: TunConsent::default(),
+            capabilities: &PlatformCapability::plan_only_windows(),
+            application_identities: &[],
+            outlets: &[],
+        }
+        .build()
+        .unwrap()
+    }
+
+    fn test_authority(generation: u64) -> (tempfile::TempDir, TunAuthorityGuard) {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("tun-authority.lease");
+        fs::write(&path, b"preprovisioned-by-installer").unwrap();
+        let authority =
+            TunAuthorityGuard::acquire_at(&path, "install-a", "helper-a", generation).unwrap();
+        (temporary, authority)
+    }
+
+    fn committed_state(plan: &TunPlan) -> TunJournal {
+        TunJournal {
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            install_id: plan.install_id.clone(),
+            authority_id: plan.authority_id.clone(),
+            generation: plan.generation,
+            action: TunPlanAction::Enable,
+            plan_fingerprint: plan.fingerprint(),
+            phase: TunJournalPhase::Committed,
+            snapshot: NetworkSnapshot {
+                route_records: vec!["route-snapshot-a".into()],
+                dns_records: vec!["dns-snapshot-a".into()],
+                adapter_records: vec!["adapter-snapshot-a".into()],
+                tun_records: vec!["tun-snapshot-a".into()],
+            },
+        }
     }
 
     #[test]
@@ -1123,13 +1367,11 @@ mod tests {
         assert_eq!(first.process_rules.len(), 5);
         let mut changed = current.clone();
         changed.remove(2);
+        let local_c = local_config("local-c", "socks5://localhost:42663");
         changed.push(RegisteredOutlet {
-            outlet_id: "local-c".into(),
-            transport: OutletTransport::LocalProxy,
-            loopback_endpoint: Some("socks5://localhost:42663".into()),
-            enabled: true,
+            udp_evidence: Some(supported_evidence(&local_c)),
+            config: local_c,
             healthy: true,
-            udp_supported: true,
             executable: Some(identity(ExecutableRole::LocalOutlet, Some("local-c"), 'f')),
         });
         let second = plan_with(&changed).unwrap();
@@ -1144,9 +1386,13 @@ mod tests {
     #[test]
     fn local_proxy_requires_loopback_and_exact_executable_identity() {
         let mut current = outlets();
-        current[2].loopback_endpoint = Some("socks5://192.0.2.10:42".into());
+        current[2].config.kind = OutletKind::LocalProxy {
+            endpoint: "socks5://192.0.2.10:42".into(),
+        };
         assert_eq!(plan_with(&current), Err(TunError::LoopbackEndpointRequired));
-        current[2].loopback_endpoint = Some("socks5://127.0.0.1:42".into());
+        current[2].config.kind = OutletKind::LocalProxy {
+            endpoint: "socks5://127.0.0.1:42".into(),
+        };
         current[2].executable = None;
         assert_eq!(
             plan_with(&current),
@@ -1205,7 +1451,9 @@ mod tests {
     fn tcp_only_outlets_reject_udp_vectors_but_keep_tcp_tunneled() {
         let mut current = outlets();
         for outlet in &mut current {
-            outlet.udp_supported = false;
+            let mut evidence = vpn_hub_core::unknown_udp_evidence(&outlet.config, "tcp_only");
+            evidence.status = UdpCapabilityStatus::TcpOnly;
+            outlet.udp_evidence = Some(evidence);
         }
         let plan = plan_with(&current).unwrap();
         assert!(!plan.all_down);
@@ -1259,12 +1507,110 @@ mod tests {
         udp_escape.udp_eligible_outlets.push("unknown-udp".into());
         assert_eq!(udp_escape.validate(), Err(TunError::LeakPolicyInvalid));
 
+        let mut tcp_escape = original.clone();
+        tcp_escape.tcp_eligible_outlets.push("unknown-tcp".into());
+        assert_eq!(tcp_escape.validate(), Err(TunError::LeakPolicyInvalid));
+
+        let mut missing_declaration = original.clone();
+        missing_declaration
+            .outlet_registry
+            .retain(|item| item.outlet_id != "sub-a");
+        assert_eq!(
+            missing_declaration.validate(),
+            Err(TunError::LeakPolicyInvalid)
+        );
+
+        let mut orphan_local_declaration = original.clone();
+        orphan_local_declaration
+            .outlet_registry
+            .push(OutletDeclaration {
+                outlet_id: "local-orphan".into(),
+                transport: OutletTransport::LocalProxy,
+                loopback_endpoint: Some("socks5://127.0.0.1:42663".into()),
+            });
+        assert_eq!(
+            orphan_local_declaration.validate(),
+            Err(TunError::InvalidOutlet)
+        );
+
         let mut duplicate_vector = original;
         duplicate_vector.leak_checks[0] = duplicate_vector.leak_checks[1].clone();
         assert_eq!(
             duplicate_vector.validate(),
             Err(TunError::LeakPolicyInvalid)
         );
+    }
+
+    #[test]
+    fn plan_registry_is_sanitized_and_contains_no_subscription_secrets() {
+        let plan = plan_with(&outlets()).unwrap();
+        assert_eq!(plan.outlet_registry.len(), 4);
+        let encoded = serde_json::to_string(&plan).unwrap();
+        assert!(!encoded.contains("private.sub-a"));
+        assert!(!encoded.contains("secret_ref"));
+        assert!(!encoded.contains("subscription_url"));
+        assert!(!encoded.contains("controller"));
+    }
+
+    #[test]
+    fn every_malformed_stale_or_non_supported_udp_evidence_field_is_rejected_by_core() {
+        let mutations: [fn(&mut UdpCapabilityEvidence); 9] = [
+            |item| item.outlet_id = "other-outlet".into(),
+            |item| item.status = UdpCapabilityStatus::Unknown,
+            |item| item.observed_at.clear(),
+            |item| item.evidence_version += 1,
+            |item| item.probe_version.push_str("-stale"),
+            |item| item.model_version += 1,
+            |item| item.configuration_fingerprint.push('0'),
+            |item| item.configuration_generation = item.configuration_generation.saturating_add(1),
+            |item| item.reason_code.clear(),
+        ];
+        for mutate in mutations {
+            let mut current = outlets();
+            mutate(current[0].udp_evidence.as_mut().unwrap());
+            let plan = plan_with(&current).unwrap();
+            assert!(!plan.udp_eligible_outlets.iter().any(|id| id == "sub-a"));
+        }
+
+        let mut changed_configuration = outlets();
+        changed_configuration[0].config.label.push_str(" changed");
+        let plan = plan_with(&changed_configuration).unwrap();
+        assert!(!plan.udp_eligible_outlets.iter().any(|id| id == "sub-a"));
+    }
+
+    #[test]
+    fn authority_file_must_exist_and_is_exclusive_across_handles() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing = temporary.path().join("missing-tun-authority.lease");
+        assert!(matches!(
+            TunAuthorityGuard::acquire_at(&missing, "install-a", "helper-a", 7),
+            Err(TunError::AuthorityConflict)
+        ));
+        assert!(!missing.exists());
+
+        let path = temporary.path().join("tun-authority.lease");
+        fs::write(&path, b"preprovisioned-by-installer").unwrap();
+        let first = TunAuthorityGuard::acquire_at(&path, "install-a", "helper-a", 7).unwrap();
+        assert!(matches!(
+            TunAuthorityGuard::acquire_at(&path, "install-a", "helper-a", 8),
+            Err(TunError::AuthorityConflict)
+        ));
+        drop(first);
+        assert!(TunAuthorityGuard::acquire_at(&path, "install-a", "helper-a", 8).is_ok());
+    }
+
+    #[test]
+    fn authority_identity_and_generation_are_checked_before_snapshot() {
+        let plan = plan_with(&outlets()).unwrap();
+        let (_authority_directory, wrong_generation) = test_authority(plan.generation + 1);
+        let mut transaction = TunTransaction::new(
+            FakeBackend::default(),
+            MemoryJournal::default(),
+            wrong_generation,
+        );
+        assert_eq!(transaction.apply(&plan), Err(TunError::AuthorityConflict));
+        assert!(transaction.backend.events.is_empty());
+        assert_eq!(transaction.journal.save_count, 0);
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1275,6 +1621,7 @@ mod tests {
         Verify,
         Commit,
         Restore,
+        VerifyRestored,
     }
 
     #[derive(Default)]
@@ -1299,7 +1646,7 @@ mod tests {
                 return Err(match point {
                     FailurePoint::Stage => TunError::BackendStage,
                     FailurePoint::Apply => TunError::BackendApply,
-                    FailurePoint::Verify => TunError::BackendVerify,
+                    FailurePoint::Verify | FailurePoint::VerifyRestored => TunError::BackendVerify,
                     FailurePoint::Commit => TunError::BackendCommit,
                     FailurePoint::Snapshot | FailurePoint::Restore => TunError::RollbackFailed,
                 });
@@ -1343,6 +1690,10 @@ mod tests {
         fn restore(&mut self, _snapshot: &NetworkSnapshot) -> Result<(), TunError> {
             self.boundary(FailurePoint::Restore, "restore")
         }
+
+        fn verify_restored(&mut self, _snapshot: &NetworkSnapshot) -> Result<(), TunError> {
+            self.boundary(FailurePoint::VerifyRestored, "verify-restored")
+        }
     }
 
     #[derive(Default)]
@@ -1350,6 +1701,8 @@ mod tests {
         state: Option<TunJournal>,
         fail_on_save: Option<usize>,
         save_count: usize,
+        fail_clear_once: bool,
+        clear_count: usize,
     }
 
     impl TunJournalStore for MemoryJournal {
@@ -1367,6 +1720,11 @@ mod tests {
         }
 
         fn clear(&mut self) -> Result<(), TunError> {
+            self.clear_count += 1;
+            if self.fail_clear_once {
+                self.fail_clear_once = false;
+                return Err(TunError::JournalWrite);
+            }
             self.state = None;
             Ok(())
         }
@@ -1375,7 +1733,9 @@ mod tests {
     #[test]
     fn transaction_persists_every_boundary_and_commits() {
         let plan = plan_with(&outlets()).unwrap();
-        let mut transaction = TunTransaction::new(FakeBackend::default(), MemoryJournal::default());
+        let (_authority_directory, authority) = test_authority(plan.generation);
+        let mut transaction =
+            TunTransaction::new(FakeBackend::default(), MemoryJournal::default(), authority);
         let state = transaction.apply(&plan).unwrap();
         assert_eq!(state.phase, TunJournalPhase::Committed);
         assert_eq!(transaction.journal.save_count, 5);
@@ -1401,8 +1761,12 @@ mod tests {
             FailurePoint::Verify,
             FailurePoint::Commit,
         ] {
-            let mut transaction =
-                TunTransaction::new(FakeBackend::fail(point), MemoryJournal::default());
+            let (_authority_directory, authority) = test_authority(plan.generation);
+            let mut transaction = TunTransaction::new(
+                FakeBackend::fail(point),
+                MemoryJournal::default(),
+                authority,
+            );
             assert!(transaction.apply(&plan).is_err());
             assert_eq!(transaction.backend.events.last(), Some(&"restore"));
             assert_eq!(
@@ -1420,7 +1784,8 @@ mod tests {
                 fail_on_save: Some(save),
                 ..MemoryJournal::default()
             };
-            let mut transaction = TunTransaction::new(FakeBackend::default(), journal);
+            let (_authority_directory, authority) = test_authority(plan.generation);
+            let mut transaction = TunTransaction::new(FakeBackend::default(), journal, authority);
             assert!(transaction.apply(&plan).is_err());
             assert_eq!(transaction.backend.events.last(), Some(&"restore"));
         }
@@ -1433,19 +1798,125 @@ mod tests {
             fail_on_save: Some(1),
             ..MemoryJournal::default()
         };
+        let (_authority_directory, authority) = test_authority(plan.generation);
         let mut transaction =
-            TunTransaction::new(FakeBackend::fail(FailurePoint::Restore), journal);
+            TunTransaction::new(FakeBackend::fail(FailurePoint::Restore), journal, authority);
         assert_eq!(transaction.apply(&plan), Err(TunError::RollbackFailed));
     }
 
     #[test]
     fn crash_cancel_restart_and_uninstall_recovery_are_idempotent() {
         let plan = plan_with(&outlets()).unwrap();
-        let mut transaction = TunTransaction::new(FakeBackend::default(), MemoryJournal::default());
+        let (_authority_directory, authority) = test_authority(plan.generation);
+        let mut transaction =
+            TunTransaction::new(FakeBackend::default(), MemoryJournal::default(), authority);
         transaction.apply(&plan).unwrap();
         assert!(transaction.recover("install-a", "helper-a").unwrap());
         assert!(!transaction.recover("install-a", "helper-a").unwrap());
-        assert_eq!(transaction.backend.events.last(), Some(&"restore"));
+        assert_eq!(
+            transaction.backend.events,
+            [
+                "snapshot",
+                "stage",
+                "apply",
+                "verify",
+                "commit",
+                "restore",
+                "verify-restored"
+            ]
+        );
+    }
+
+    #[test]
+    fn disable_restores_committed_enable_snapshot_without_taking_a_new_snapshot() {
+        let enable = plan_with(&outlets()).unwrap();
+        let disable = disable_plan(enable.generation + 1);
+        let (_authority_directory, authority) = test_authority(disable.generation);
+        let mut transaction = TunTransaction::new(
+            FakeBackend::default(),
+            MemoryJournal {
+                state: Some(committed_state(&enable)),
+                ..MemoryJournal::default()
+            },
+            authority,
+        );
+
+        assert!(transaction.disable(&disable).unwrap());
+        assert_eq!(transaction.backend.events, ["restore", "verify-restored"]);
+        assert!(transaction.journal.state.is_none());
+        assert_eq!(transaction.journal.clear_count, 1);
+        assert!(!transaction.disable(&disable).unwrap());
+    }
+
+    #[test]
+    fn apply_rejects_disable_before_snapshot_or_mutation() {
+        let disable = disable_plan(8);
+        let (_authority_directory, authority) = test_authority(disable.generation);
+        let mut transaction =
+            TunTransaction::new(FakeBackend::default(), MemoryJournal::default(), authority);
+        assert_eq!(
+            transaction.apply(&disable),
+            Err(TunError::DisableRequiresCommittedSnapshot)
+        );
+        assert!(transaction.backend.events.is_empty());
+        assert_eq!(transaction.journal.save_count, 0);
+    }
+
+    #[test]
+    fn disable_retries_restore_when_restored_phase_save_fails() {
+        let enable = plan_with(&outlets()).unwrap();
+        let disable = disable_plan(enable.generation + 1);
+        let (_authority_directory, authority) = test_authority(disable.generation);
+        let mut transaction = TunTransaction::new(
+            FakeBackend::default(),
+            MemoryJournal {
+                state: Some(committed_state(&enable)),
+                fail_on_save: Some(1),
+                ..MemoryJournal::default()
+            },
+            authority,
+        );
+
+        assert_eq!(transaction.disable(&disable), Err(TunError::JournalWrite));
+        assert_eq!(
+            transaction.journal.state.as_ref().map(|state| state.phase),
+            Some(TunJournalPhase::Committed)
+        );
+        assert!(transaction.disable(&disable).unwrap());
+        assert_eq!(
+            transaction.backend.events,
+            ["restore", "verify-restored", "restore", "verify-restored"]
+        );
+        assert!(transaction.journal.state.is_none());
+    }
+
+    #[test]
+    fn disable_retries_only_verification_when_journal_clear_fails() {
+        let enable = plan_with(&outlets()).unwrap();
+        let disable = disable_plan(enable.generation + 1);
+        let (_authority_directory, authority) = test_authority(disable.generation);
+        let mut transaction = TunTransaction::new(
+            FakeBackend::default(),
+            MemoryJournal {
+                state: Some(committed_state(&enable)),
+                fail_clear_once: true,
+                ..MemoryJournal::default()
+            },
+            authority,
+        );
+
+        assert_eq!(transaction.disable(&disable), Err(TunError::JournalWrite));
+        assert_eq!(
+            transaction.journal.state.as_ref().map(|state| state.phase),
+            Some(TunJournalPhase::Restored)
+        );
+        assert!(transaction.disable(&disable).unwrap());
+        assert_eq!(
+            transaction.backend.events,
+            ["restore", "verify-restored", "verify-restored"]
+        );
+        assert_eq!(transaction.journal.clear_count, 2);
+        assert!(transaction.journal.state.is_none());
     }
 
     #[test]
@@ -1456,16 +1927,19 @@ mod tests {
             install_id: plan.install_id.clone(),
             authority_id: plan.authority_id.clone(),
             generation: plan.generation,
+            action: TunPlanAction::Enable,
             plan_fingerprint: plan.fingerprint(),
             phase: TunJournalPhase::Applied,
             snapshot: NetworkSnapshot::default(),
         };
+        let (_authority_directory, authority) = test_authority(plan.generation);
         let mut transaction = TunTransaction::new(
             FakeBackend::default(),
             MemoryJournal {
                 state: Some(existing.clone()),
                 ..MemoryJournal::default()
             },
+            authority,
         );
         assert_eq!(transaction.apply(&plan), Err(TunError::StaleGeneration));
         let mut other = plan.clone();
@@ -1478,9 +1952,11 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let path = temporary.path().join("tun-transaction.json");
         let plan = plan_with(&outlets()).unwrap();
+        let (_authority_directory, authority) = test_authority(plan.generation);
         let mut transaction = TunTransaction::new(
             FakeBackend::default(),
             FileTunJournalStore::new(path.clone()),
+            authority,
         );
         transaction.apply(&plan).unwrap();
         let bytes = fs::read(&path).unwrap();
@@ -1503,6 +1979,7 @@ mod tests {
             install_id: plan.install_id.clone(),
             authority_id: plan.authority_id.clone(),
             generation: plan.generation,
+            action: TunPlanAction::Enable,
             plan_fingerprint: plan.fingerprint(),
             phase: TunJournalPhase::Snapshotted,
             snapshot: NetworkSnapshot::default(),
@@ -1523,6 +2000,7 @@ mod tests {
             install_id: plan.install_id.clone(),
             authority_id: plan.authority_id.clone(),
             generation: plan.generation,
+            action: TunPlanAction::Enable,
             plan_fingerprint: plan.fingerprint(),
             phase: TunJournalPhase::Snapshotted,
             snapshot: NetworkSnapshot::default(),

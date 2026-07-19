@@ -55,10 +55,11 @@ pub use supervisor::{
 pub use transport::{NamedPipeClient, TransportError, serve_one_named_pipe_request};
 pub use tun::{
     AddressFamily, ExecutableIdentity, ExecutableRole, ExpectedDisposition, FileTunJournalStore,
-    LeakCheck, NetworkSnapshot, OutletTransport, PlatformCapability, ProcessExclusionCapability,
-    ProcessNetworkPolicy, ProcessRule, RegisteredOutlet, TrafficClass, TransportProtocol,
-    TunBackend, TunConsent, TunError, TunJournal, TunJournalPhase, TunJournalStore, TunPlan,
-    TunPlanAction, TunPlanBuilder, TunTransaction, WindowsPlanOnlyTunBackend,
+    LeakCheck, NetworkSnapshot, OutletDeclaration, OutletTransport, PlatformCapability,
+    ProcessExclusionCapability, ProcessNetworkPolicy, ProcessRule, RegisteredOutlet, TrafficClass,
+    TransportProtocol, TunAuthorityGuard, TunBackend, TunConsent, TunError, TunJournal,
+    TunJournalPhase, TunJournalStore, TunPlan, TunPlanAction, TunPlanBuilder, TunTransaction,
+    WindowsPlanOnlyTunBackend,
 };
 
 /// Current helper protocol major version.

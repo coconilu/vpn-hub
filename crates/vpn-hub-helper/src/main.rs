@@ -78,6 +78,9 @@ fn provisioned_service(signals: Arc<vpn_hub_helper::ServiceSignals>) -> Result<(
         (root.join("runtime/mihomo.yaml"), Mutable),
         (root.join("data/guardian.db"), Mutable),
         (root.join("authority.lease"), Mutable),
+        // Non-secret exclusive lock: SecretMaterial policy is reused so the
+        // interactive user cannot replace/delete the installer-owned inode.
+        (root.join("tun-authority.lease"), SecretMaterial),
     ];
     vpn_hub_windows_security::validate_protected_installation(
         &root,
