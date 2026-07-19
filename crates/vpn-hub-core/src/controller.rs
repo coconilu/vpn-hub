@@ -28,6 +28,11 @@ struct DelayResponse {
     delay: u64,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProxyResponse {
+    now: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SelectionRequest<'a> {
     name: &'a str,
@@ -101,6 +106,55 @@ impl ControllerClient {
             .put(url)
             .bearer_auth(&self.secret)
             .json(&SelectionRequest { name: target })
+            .send()
+            .await
+            .map_err(|_| ControllerError::Request)?;
+        if response.status().is_success() || response.status() == StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            Err(ControllerError::Http(response.status()))
+        }
+    }
+
+    /// Confirms whether a Mihomo selector currently points to an expected target.
+    ///
+    /// # Errors
+    ///
+    /// Returns sanitized transport, HTTP, or response errors.
+    pub async fn is_selected(
+        &self,
+        selector: &str,
+        expected: &str,
+    ) -> Result<bool, ControllerError> {
+        let url = self.endpoint(&["proxies", selector])?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.secret)
+            .send()
+            .await
+            .map_err(|_| ControllerError::Request)?;
+        if !response.status().is_success() {
+            return Err(ControllerError::Http(response.status()));
+        }
+        response
+            .json::<ProxyResponse>()
+            .await
+            .map(|body| body.now == expected)
+            .map_err(|_| ControllerError::Response)
+    }
+
+    /// Requests an immediate refresh of one configured proxy provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns sanitized transport or HTTP errors.
+    pub async fn update_proxy_provider(&self, provider_name: &str) -> Result<(), ControllerError> {
+        let url = self.endpoint(&["providers", "proxies", provider_name])?;
+        let response = self
+            .client
+            .put(url)
+            .bearer_auth(&self.secret)
             .send()
             .await
             .map_err(|_| ControllerError::Request)?;

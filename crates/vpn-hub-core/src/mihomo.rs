@@ -650,7 +650,7 @@ pub fn generate_mihomo_config(
                 groups.push(ProxyGroup {
                     name: proxy_name.clone(),
                     group_type: "url-test".into(),
-                    proxies: Vec::new(),
+                    proxies: vec![FAIL_CLOSED_PROXY.into()],
                     use_providers: vec![provider_name],
                     url: Some(config.probe_targets[0].clone()),
                     interval: Some(*provider_update_seconds),
@@ -1162,6 +1162,29 @@ probe_targets = ["https://a.invalid/", "https://b.invalid/"]
         assert!(yaml.contains("mixed-port: 3666"));
         for id in ["sub-a", "sub-b", "sub-c", "local-a", "local-b"] {
             assert!(yaml.contains(&outlet_proxy_name(id)));
+        }
+        let document = serde_yaml::from_str::<serde_yaml::Value>(&yaml).expect("runtime yaml");
+        let groups = document
+            .get("proxy-groups")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("proxy groups");
+        for id in ["sub-a", "sub-b", "sub-c"] {
+            let group = groups
+                .iter()
+                .find(|group| {
+                    group.get("name").and_then(serde_yaml::Value::as_str)
+                        == Some(outlet_proxy_name(id).as_str())
+                })
+                .expect("subscription group");
+            assert!(
+                group
+                    .get("proxies")
+                    .and_then(serde_yaml::Value::as_sequence)
+                    .is_some_and(|proxies| proxies
+                        .iter()
+                        .any(|proxy| { proxy.as_str() == Some(FAIL_CLOSED_PROXY) })),
+                "subscription group must have an explicit REJECT fallback"
+            );
         }
         assert!(yaml.contains("REJECT"));
         assert!(!yaml.contains("DIRECT"));
