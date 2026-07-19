@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
-import { Construction } from "lucide-react";
 import { Dashboard } from "./Dashboard";
 import { HistoryPage } from "./HistoryPage";
+import { SettingsPage } from "./SettingsPage";
 import { Sidebar, type ViewId } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
 import {
@@ -102,12 +102,7 @@ export default function App() {
         ) : view === "history" ? (
           <HistoryPage onNotice={setNotice} />
         ) : (
-          <main className="placeholder-view">
-            <Construction />
-            <h1>设置</h1>
-            <p>通用设置页面仍在后续范围内；历史保留策略已放在历史页就近管理。</p>
-            <button type="button" onClick={() => setView("overview")}>返回总览</button>
-          </main>
+          <SettingsPage currentOutletId={snapshot.routing.current_outlet} onApplied={load} onNotice={setNotice} />
         )}
         <StatusBar snapshot={snapshot} />
       </div>

@@ -13,6 +13,7 @@ mod model;
 mod probe;
 mod routing;
 mod secret_store;
+mod settings;
 mod store;
 mod udp_capability;
 
@@ -32,7 +33,7 @@ pub use mihomo::{
     PrivateRoutingConfig, ResolvedSubscriptionUrls, RuntimeConfigSummary, UDP_SELECTOR,
     UdpCapabilityMap, generate_controller_secret, generate_mihomo_config,
     generate_mihomo_config_with_udp_capabilities, generate_mihomo_startup_config,
-    normalize_loopback_host, outlet_proxy_name,
+    normalize_loopback_host, outlet_proxy_name, validate_subscription_url,
 };
 pub use model::{
     HealthStatus, LatencySample, OutletSummary, ProbeResult, RouteSwitchEvent, StateEvent,
@@ -46,6 +47,10 @@ pub use secret_store::{
     CredentialState, LegacyMigrationOutcome, SecretStore, SecretStoreError,
     SubscriptionCredentialStatus, SubscriptionSecrets, SystemSecretStore,
     migrate_legacy_subscription,
+};
+pub use settings::{
+    LocalProxyProtocol, SafeSettingsView, SafeSubscriptionStatus, SettingsChange, SettingsDiff,
+    SettingsDraft, SettingsOutletDraft, ValidationIssue,
 };
 pub use store::{GuardianStore, StoreError};
 pub use udp_capability::{

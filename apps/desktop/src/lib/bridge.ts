@@ -1,6 +1,18 @@
 import { invoke } from "@tauri-apps/api/core";
 import { mockSnapshot } from "../data/mock";
-import type { CoreStatus, DashboardSnapshot, HistoryExport, HistoryFilter, HistoryResponse, RouteMode } from "../types";
+import type {
+  CoreStatus,
+  DashboardSnapshot,
+  HistoryExport,
+  HistoryFilter,
+  HistoryResponse,
+  RouteMode,
+  SafeSettingsView,
+  SettingsApplyRequest,
+  SettingsApplyResult,
+  SettingsDraft,
+  SettingsPreview,
+} from "../types";
 
 declare global {
   interface Window {
@@ -11,6 +23,24 @@ declare global {
 export const isTauriRuntime = () => Boolean(window.__TAURI_INTERNALS__);
 
 let browserSnapshot = structuredClone(mockSnapshot);
+let browserSettings: SafeSettingsView = {
+  draft: {
+    entry: { host: "127.0.0.1", port: 3666 },
+    route_mode: "priority",
+    manual_outlet: null,
+    cooldown_seconds: 60,
+    minimum_improvement_ms: 150,
+    probe_targets: ["https://www.gstatic.com/generate_204", "https://www.baidu.com/"],
+    refresh_interval_seconds: 180,
+    connect_timeout_ms: 1500,
+    request_timeout_ms: 8000,
+    failure_threshold: 2,
+    recovery_threshold: 3,
+    retention_days: 30,
+    outlets: [],
+  },
+  credentials: [],
+};
 
 export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
   if (!isTauriRuntime()) return structuredClone(browserSnapshot);
@@ -111,4 +141,65 @@ export async function exportHistory(filter: HistoryFilter): Promise<HistoryExpor
 export async function setHistoryRetention(days: number): Promise<number> {
   if (!isTauriRuntime()) return 0;
   return invoke<number>("set_history_retention", { days });
+}
+
+export async function getSettings(): Promise<SafeSettingsView> {
+  if (!isTauriRuntime()) return structuredClone(browserSettings);
+  return invoke<SafeSettingsView>("get_settings");
+}
+
+export async function previewSettings(
+  draft: SettingsDraft,
+  activeOutletReplacement: string | null,
+  failClosedOnRemovedActive: boolean,
+): Promise<SettingsPreview> {
+  if (!isTauriRuntime()) {
+    const issues = draft.outlets.some((outlet) => outlet.enabled)
+      ? []
+      : [{ field: "outlets", code: "enabled_outlet_required", message: "至少需要一个启用出口。" }];
+    return {
+      diff: {
+        changes: JSON.stringify(draft) === JSON.stringify(browserSettings.draft)
+          ? []
+          : [{ code: "browser_preview", summary: "浏览器预览：设置将更新" }],
+        runtime_changed: true,
+        monitor_changed: true,
+        retention_changed: draft.retention_days !== browserSettings.draft.retention_days,
+      },
+      issues,
+      can_apply: issues.length === 0 && JSON.stringify(draft) !== JSON.stringify(browserSettings.draft),
+    };
+  }
+  return invoke<SettingsPreview>("preview_settings", {
+    draft,
+    activeOutletReplacement,
+    failClosedOnRemovedActive,
+  });
+}
+
+export async function applySettings(request: SettingsApplyRequest): Promise<SettingsApplyResult> {
+  if (!isTauriRuntime()) {
+    browserSettings = {
+      draft: structuredClone(request.draft),
+      credentials: request.draft.outlets
+        .filter((outlet) => outlet.kind === "subscription")
+        .map((outlet) => ({
+          subscription_id: outlet.outlet_id,
+          state: request.credential_mutations.some(
+            (mutation) => mutation.subscription_id === outlet.outlet_id && mutation.action === "set",
+          ) ? "configured" : "missing",
+        })),
+    };
+    return {
+      settings: structuredClone(browserSettings),
+      diff: {
+        changes: [{ code: "browser_apply", summary: "浏览器预览设置已更新" }],
+        runtime_changed: true,
+        monitor_changed: true,
+        retention_changed: true,
+      },
+      removed_history_rows: 0,
+    };
+  }
+  return invoke<SettingsApplyResult>("apply_settings", { request });
 }

@@ -19,7 +19,10 @@ use vpn_hub_core::{
     probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle, unknown_udp_evidence,
 };
 
-use crate::runtime::{AppState, CoreStatus, PortSnapshot, RoutingStatus};
+use crate::runtime::{
+    AppState, CoreStatus, PortSnapshot, RoutingStatus, SettingsApplyRequest, SettingsApplyResult,
+    SettingsPreview,
+};
 
 #[derive(Debug, Serialize)]
 pub struct DashboardSnapshot {
@@ -177,6 +180,41 @@ pub async fn set_history_retention(state: State<'_, AppState>, days: u32) -> Res
     })
     .await
     .map_err(|_| "历史清理后台任务异常退出".to_string())?
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn get_settings(
+    state: State<'_, AppState>,
+) -> Result<vpn_hub_core::SafeSettingsView, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    state.settings_view()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn preview_settings(
+    state: State<'_, AppState>,
+    draft: vpn_hub_core::SettingsDraft,
+    active_outlet_replacement: Option<String>,
+    fail_closed_on_removed_active: bool,
+) -> Result<SettingsPreview, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    state.preview_settings(
+        &draft,
+        active_outlet_replacement.as_deref(),
+        fail_closed_on_removed_active,
+    )
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn apply_settings(
+    state: State<'_, AppState>,
+    request: SettingsApplyRequest,
+) -> Result<SettingsApplyResult, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    state.apply_settings(request)
 }
 
 async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {

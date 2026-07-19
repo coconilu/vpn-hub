@@ -820,7 +820,13 @@ fn provider_name(outlet_id: &str) -> String {
     format!("vpn-hub-provider-{outlet_id}")
 }
 
-pub(crate) fn validate_subscription_url(value: &str) -> Result<(), PrivateConfigError> {
+/// Validates a subscription URL without returning or embedding its value in
+/// diagnostics.
+///
+/// # Errors
+///
+/// Returns a sanitized validation error for unsupported or unsafe URLs.
+pub fn validate_subscription_url(value: &str) -> Result<(), PrivateConfigError> {
     let url = Url::parse(value)
         .map_err(|_| PrivateConfigError::Invalid("subscription URL is invalid".into()))?;
     if url.scheme() != "https" || url.host_str().is_none() || url.username() != "" {
