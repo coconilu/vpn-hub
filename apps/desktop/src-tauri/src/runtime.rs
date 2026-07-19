@@ -16,8 +16,8 @@ use vpn_hub_core::{
     SystemSecretStore, UDP_SELECTOR, UdpCapabilityEvidence, UdpCapabilityMap, UdpProbeTarget,
     classify_subscription_udp, generate_controller_secret,
     generate_mihomo_config_with_udp_capabilities, generate_mihomo_startup_config,
-    migrate_legacy_subscription, outlet_proxy_name, probe_authorized_socks5_udp,
-    unknown_udp_evidence,
+    migrate_legacy_subscription, normalize_loopback_host, outlet_proxy_name,
+    probe_authorized_socks5_udp, unknown_udp_evidence,
 };
 
 const DEFAULT_GUARDIAN_CONFIG: &str = r#"database_path = "guardian-desktop.db"
@@ -1190,11 +1190,7 @@ fn terminate_child(child: &mut Child) {
 }
 
 fn is_endpoint_reachable(host: &str, port: u16) -> bool {
-    let ip = if host.eq_ignore_ascii_case("localhost") {
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    } else if let Ok(ip) = host.parse() {
-        ip
-    } else {
+    let Some(ip) = normalize_loopback_host(host) else {
         return false;
     };
     let address = SocketAddr::new(ip, port);
@@ -1248,10 +1244,7 @@ fn harden_private_path(_path: &Path) -> Result<(), String> {
 }
 
 fn loopback_socket_address(host: &str, port: u16) -> Option<SocketAddr> {
-    host.parse::<IpAddr>()
-        .ok()
-        .filter(IpAddr::is_loopback)
-        .map(|ip| SocketAddr::new(ip, port))
+    normalize_loopback_host(host).map(|ip| SocketAddr::new(ip, port))
 }
 
 fn owns_loopback_listeners(pid: u32, addresses: &[SocketAddr]) -> bool {
@@ -1569,7 +1562,27 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         );
         assert!(loopback_socket_address("127.0.0.2", 45_121).is_some());
         assert!(loopback_socket_address("::1", 45_122).is_some());
+        assert_eq!(
+            loopback_socket_address("localhost", 45_125),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 45_125))
+        );
         assert!(loopback_socket_address("0.0.0.0", 45_123).is_none());
+        assert!(loopback_socket_address("example.invalid", 45_124).is_none());
+    }
+
+    #[test]
+    fn localhost_normalization_wires_lease_snapshot_and_pid_ownership() {
+        let normalized = loopback_socket_address("localhost", 0).expect("normalized localhost");
+        assert_eq!(normalized.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let lease = ProbePortLease::reserve_on(normalized.ip(), &[]).expect("localhost lease");
+        assert!(!matches!(lease.port(), 3_666 | 6_666));
+        assert!(owns_loopback_listeners(
+            std::process::id(),
+            &[lease.address()]
+        ));
+        let snapshot = AppState::port_snapshot("localhost", lease.port());
+        assert!(snapshot.reachable);
+        assert_eq!(snapshot.owner_pid, Some(std::process::id()));
     }
 
     #[test]
@@ -1653,6 +1666,50 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, entry_port)).is_ok());
         assert!(state.managed_core.lock().expect("managed core").is_none());
         drop(unknown_listener.lock().expect("unknown listener").take());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires repository-pinned Mihomo binary; uses only owned random loopback ports and no external traffic"]
+    async fn localhost_entry_startup_uses_normalized_socket_ownership() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_directory = directory.path().join("localhost-entry-startup");
+        let state = AppState::new_for_test(workspace_root, &data_directory);
+        let entry = ProbePortLease::reserve().expect("entry lease");
+        let entry_port = entry.port();
+        let controller =
+            ProbePortLease::reserve_excluding(&[entry_port]).expect("controller lease");
+        let controller_port = controller.port();
+        assert!(!matches!(entry_port, 3_666 | 6_666));
+        assert!(!matches!(controller_port, 3_666 | 6_666));
+        drop(entry);
+        drop(controller);
+
+        let mut config = PrivateRoutingConfig::default();
+        config.entry = EntryConfig {
+            host: "localhost".into(),
+            port: entry_port,
+        };
+        config.controller_port = controller_port;
+        config.outlets.clear();
+        config
+            .save(state.private_config_path_for_test())
+            .expect("localhost must pass shared config validation");
+
+        let running = state
+            .start_development_core()
+            .await
+            .expect("localhost startup must use normalized ownership");
+        let pid = running.pid.expect("managed PID");
+        let normalized = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), entry_port);
+        assert_eq!(listening_owner_pid(normalized), Some(pid));
+        assert_eq!(
+            AppState::port_snapshot("localhost", entry_port).owner_pid,
+            Some(pid)
+        );
+        state
+            .stop_development_core()
+            .expect("owned localhost core must stop");
     }
 
     #[tokio::test]

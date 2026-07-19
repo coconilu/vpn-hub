@@ -870,20 +870,21 @@ fn validate_outlet_id(id: &str) -> Result<(), PrivateConfigError> {
     Ok(())
 }
 
-fn parse_loopback(value: &str, field: &str) -> Result<IpAddr, PrivateConfigError> {
+/// Normalizes an explicitly local host without invoking DNS. `localhost`
+/// always maps to IPv4 loopback; IP literals retain their address family.
+#[must_use]
+pub fn normalize_loopback_host(value: &str) -> Option<IpAddr> {
     let ip = if value.eq_ignore_ascii_case("localhost") {
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     } else {
-        value
-            .parse::<IpAddr>()
-            .map_err(|_| PrivateConfigError::Invalid(format!("{field} must be loopback")))?
+        value.parse::<IpAddr>().ok()?
     };
-    if !ip.is_loopback() {
-        return Err(PrivateConfigError::Invalid(format!(
-            "{field} must be loopback"
-        )));
-    }
-    Ok(ip)
+    ip.is_loopback().then_some(ip)
+}
+
+fn parse_loopback(value: &str, field: &str) -> Result<IpAddr, PrivateConfigError> {
+    normalize_loopback_host(value)
+        .ok_or_else(|| PrivateConfigError::Invalid(format!("{field} must be loopback")))
 }
 
 fn parse_local_proxy_endpoint(
@@ -1105,6 +1106,29 @@ mod tests {
         assert_eq!(config.entry, EntryConfig::default());
         assert_eq!(config.outlets.len(), 5);
         assert_eq!(config.enabled_outlets().count(), 4);
+    }
+
+    #[test]
+    fn loopback_host_normalization_is_explicit_and_dns_free() {
+        assert_eq!(
+            normalize_loopback_host("localhost"),
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            normalize_loopback_host("LOCALHOST"),
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            normalize_loopback_host("127.0.0.2"),
+            Some("127.0.0.2".parse().expect("IPv4 loopback"))
+        );
+        assert_eq!(
+            normalize_loopback_host("::1"),
+            Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
+        for rejected in ["0.0.0.0", "::", "192.0.2.1", "example.invalid"] {
+            assert_eq!(normalize_loopback_host(rejected), None);
+        }
     }
 
     #[test]
