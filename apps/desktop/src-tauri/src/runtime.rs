@@ -5,10 +5,14 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
+};
+use vpn_hub_helper::{
+    AuthorityFileGuard, Command as HelperCommand, InstallationReference, NamedPipeClient,
+    ProtocolKey, RuntimeReply, SupervisorAuthority,
 };
 
 use serde::{Deserialize, Serialize};
@@ -413,10 +417,22 @@ pub struct AppState {
     settings_preview_ticket: Mutex<Option<String>>,
     routing_transaction: RoutingTransaction,
     initialization_error: Option<String>,
+    supervisor_route: SupervisorRoute,
     #[cfg(test)]
     entry_switch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     settings_validation_hook: Mutex<Option<SettingsValidationHook>>,
+}
+
+enum SupervisorRoute {
+    DesktopOwned {
+        _guard: AuthorityFileGuard,
+    },
+    HelperOwned {
+        client: NamedPipeClient,
+        last_status: Mutex<Option<RuntimeReply>>,
+    },
+    FailClosed,
 }
 
 #[cfg(test)]
@@ -661,6 +677,63 @@ struct MihomoLock {
     version: String,
 }
 
+fn select_supervisor_route(
+    data_directory: &Path,
+    secret_store: Option<&SystemSecretStore>,
+) -> SupervisorRoute {
+    let program_data = env::var_os("ProgramData").map_or_else(PathBuf::new, PathBuf::from);
+    select_supervisor_route_with_program_data(
+        data_directory,
+        secret_store.map(|store| store as &dyn SecretStore),
+        &program_data,
+    )
+}
+
+fn select_supervisor_route_with_program_data(
+    data_directory: &Path,
+    secret_store: Option<&dyn SecretStore>,
+    program_data: &Path,
+) -> SupervisorRoute {
+    let reference_path = data_directory.join("helper-installation.json");
+    if !reference_path.exists() {
+        return AuthorityFileGuard::acquire(
+            &data_directory.join("authority.lease"),
+            SupervisorAuthority::Desktop,
+            1,
+        )
+        .map_or(SupervisorRoute::FailClosed, |guard| {
+            SupervisorRoute::DesktopOwned { _guard: guard }
+        });
+    }
+    let Ok(reference) = InstallationReference::load(&reference_path, program_data) else {
+        return SupervisorRoute::FailClosed;
+    };
+    if !reference.helper_enabled {
+        return AuthorityFileGuard::acquire_existing(
+            &reference.authority_path(),
+            SupervisorAuthority::Desktop,
+            1,
+        )
+        .map_or(SupervisorRoute::FailClosed, |guard| {
+            SupervisorRoute::DesktopOwned { _guard: guard }
+        });
+    }
+    let Some(store) = secret_store else {
+        return SupervisorRoute::FailClosed;
+    };
+    let Ok(Some(key_hex)) = store.get(&reference.client_secret_ref) else {
+        return SupervisorRoute::FailClosed;
+    };
+    let key_hex = zeroize::Zeroizing::new(key_hex);
+    let Ok(key) = ProtocolKey::from_hex(&key_hex) else {
+        return SupervisorRoute::FailClosed;
+    };
+    SupervisorRoute::HelperOwned {
+        client: NamedPipeClient::new(reference.install_id, Arc::new(key)),
+        last_status: Mutex::new(None),
+    }
+}
+
 impl AppState {
     #[must_use]
     pub fn new() -> Self {
@@ -722,6 +795,12 @@ impl AppState {
             None
         };
         let _ = harden_private_config_files(&private_config_path);
+        let supervisor_route = select_supervisor_route(data_directory, secret_store.as_ref());
+        if matches!(supervisor_route, SupervisorRoute::FailClosed) {
+            initialization_error.get_or_insert_with(|| {
+                "监督 authority 配置不可用；桌面与 Helper 均保持 Fail Closed".into()
+            });
+        }
         let private_config = PrivateRoutingConfig::load(&private_config_path).unwrap_or_default();
         let mut routing_engine = RoutingEngine::new(
             private_config.route_mode,
@@ -743,6 +822,7 @@ impl AppState {
             settings_preview_ticket: Mutex::new(None),
             routing_transaction: RoutingTransaction::default(),
             initialization_error,
+            supervisor_route,
             #[cfg(test)]
             entry_switch_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1776,6 +1856,9 @@ impl AppState {
     }
 
     pub fn controller_client(&self) -> Result<Option<ControllerClient>, String> {
+        if !matches!(self.supervisor_route, SupervisorRoute::DesktopOwned { .. }) {
+            return Ok(None);
+        }
         let mut guard = self
             .managed_core
             .lock()
@@ -1804,6 +1887,28 @@ impl AppState {
     }
 
     pub fn core_status(&self) -> Result<CoreStatus, String> {
+        match &self.supervisor_route {
+            SupervisorRoute::HelperOwned { last_status, .. } => {
+                let status = last_status
+                    .lock()
+                    .map_err(|_| "Helper 状态锁不可用".to_owned())?
+                    .clone();
+                return Ok(status.map_or(
+                    CoreStatus {
+                        state: "helper".into(),
+                        managed: true,
+                        pid: None,
+                        started_at: None,
+                        message: "Helper authority 已启用，等待受认证状态".into(),
+                    },
+                    helper_core_status,
+                ));
+            }
+            SupervisorRoute::FailClosed => {
+                return Err("监督 authority 不可用；核心保持 Fail Closed".into());
+            }
+            SupervisorRoute::DesktopOwned { .. } => {}
+        }
         if let Some(client) = self.controller_client()? {
             drop(client);
             let guard = self
@@ -1857,6 +1962,18 @@ impl AppState {
         cancel: &AtomicBool,
     ) -> Result<CoreStatus, String> {
         ensure_core_start_not_cancelled(cancel)?;
+        match &self.supervisor_route {
+            SupervisorRoute::HelperOwned { .. } => {
+                return self
+                    .helper_command(HelperCommand::Start)
+                    .await
+                    .map(helper_core_status);
+            }
+            SupervisorRoute::FailClosed => {
+                return Err("监督 authority 不可用；拒绝启动核心".into());
+            }
+            SupervisorRoute::DesktopOwned { .. } => {}
+        }
         self.ensure_runtime_ready()?;
         let private_config = self.private_config()?;
         let configured_entry_address =
@@ -2122,6 +2239,9 @@ impl AppState {
     }
 
     pub fn owned_core_pid(&self) -> Option<u32> {
+        if let SupervisorRoute::HelperOwned { last_status, .. } = &self.supervisor_route {
+            return last_status.lock().ok()?.as_ref()?.owned_pid;
+        }
         let mut guard = self.managed_core.lock().ok()?;
         let core = guard.as_mut()?;
         if let Ok(None) = core.child.try_wait() {
@@ -2139,6 +2259,13 @@ impl AppState {
     }
 
     pub fn owned_core_controller_is_running(&self, expected_pid: u32) -> bool {
+        if let SupervisorRoute::HelperOwned { last_status, .. } = &self.supervisor_route {
+            return last_status.lock().is_ok_and(|status| {
+                status
+                    .as_ref()
+                    .is_some_and(|reply| reply.ok && reply.owned_pid == Some(expected_pid))
+            });
+        }
         let addresses = {
             let Ok(mut guard) = self.managed_core.lock() else {
                 return false;
@@ -2163,6 +2290,11 @@ impl AppState {
     }
 
     pub fn stop_owned_core_if_pid(&self, expected_pid: u32) -> Result<bool, String> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return Err(format!(
+                "Helper authority 持有核心；同步本地停止路径已旁路（pid {expected_pid}）"
+            ));
+        }
         let mut guard = self
             .managed_core
             .lock()
@@ -2181,6 +2313,9 @@ impl AppState {
     }
 
     pub fn stop_development_core_if_owned(&self) -> Result<bool, String> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return Err("Helper authority 持有核心；同步本地停止路径已旁路".into());
+        }
         let mut guard = self
             .managed_core
             .lock()
@@ -2233,6 +2368,89 @@ impl AppState {
         self.initialization_error
             .as_ref()
             .map_or(Ok(()), |error| Err(error.clone()))
+    }
+
+    pub async fn stop_supervised_core(&self) -> Result<bool, String> {
+        match &self.supervisor_route {
+            SupervisorRoute::HelperOwned { .. } => self
+                .helper_command(HelperCommand::Stop)
+                .await
+                .map(|status| status.owned_pid.is_none()),
+            SupervisorRoute::DesktopOwned { .. } => self.stop_development_core_if_owned(),
+            SupervisorRoute::FailClosed => Err("监督 authority 不可用；保持 Fail Closed".into()),
+        }
+    }
+
+    pub async fn stop_supervised_core_if_pid(&self, expected_pid: u32) -> Result<bool, String> {
+        match &self.supervisor_route {
+            SupervisorRoute::HelperOwned { last_status, .. } => {
+                let owns_pid = last_status
+                    .lock()
+                    .map_err(|_| "Helper 状态锁不可用".to_owned())?
+                    .as_ref()
+                    .is_some_and(|status| status.owned_pid == Some(expected_pid));
+                if !owns_pid {
+                    return Ok(false);
+                }
+                self.helper_command(HelperCommand::Stop)
+                    .await
+                    .map(|status| status.owned_pid.is_none())
+            }
+            SupervisorRoute::DesktopOwned { .. } => self.stop_owned_core_if_pid(expected_pid),
+            SupervisorRoute::FailClosed => Err("监督 authority 不可用；保持 Fail Closed".into()),
+        }
+    }
+
+    #[must_use]
+    pub fn uses_helper_authority(&self) -> bool {
+        matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. })
+    }
+
+    async fn helper_command(&self, command: HelperCommand) -> Result<RuntimeReply, String> {
+        let SupervisorRoute::HelperOwned {
+            client,
+            last_status,
+        } = &self.supervisor_route
+        else {
+            return Err("Helper authority 未启用".into());
+        };
+        let bytes = client
+            .send(command)
+            .await
+            .map_err(|_| "Helper IPC 不可用；保持 Fail Closed".to_owned())?;
+        let reply: RuntimeReply = serde_json::from_slice(&bytes)
+            .map_err(|_| "Helper 返回无效；保持 Fail Closed".to_owned())?;
+        *last_status
+            .lock()
+            .map_err(|_| "Helper 状态锁不可用".to_owned())? = Some(reply.clone());
+        if !reply.ok {
+            let reason = match reply.reason.as_deref() {
+                Some("corrupt-config") => "配置损坏",
+                Some("corrupt-database") => "数据库损坏",
+                Some("port-conflict") => "动态入口端口冲突",
+                Some("ownership-lost") => "核心所有权丢失",
+                Some("authority-lost") => "监督 authority 丢失",
+                _ => "未知安全原因",
+            };
+            return Err(format!("Helper Fail Closed：{reason}"));
+        }
+        Ok(reply)
+    }
+}
+
+fn helper_core_status(reply: RuntimeReply) -> CoreStatus {
+    CoreStatus {
+        state: reply.state,
+        managed: true,
+        pid: reply.owned_pid,
+        started_at: None,
+        message: format!(
+            "Helper authority：{}:{}，generation {}，{} 个脱敏出口",
+            reply.entry_host,
+            reply.entry_port,
+            reply.generation,
+            reply.outlets.len()
+        ),
     }
 }
 
@@ -2979,6 +3197,42 @@ mod tests {
             self.values.lock().expect("values").remove(secret_ref);
             Ok(())
         }
+    }
+
+    #[test]
+    fn provisioned_helper_reference_selects_helper_and_default_selects_desktop() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let program_data = directory.path().join("ProgramData");
+        let install_root = program_data.join("VPN Hub/install-a");
+        fs::create_dir_all(&install_root).expect("install root");
+        let data = directory.path().join("client-data");
+        fs::create_dir_all(&data).expect("client data");
+        let default_route = select_supervisor_route_with_program_data(&data, None, &program_data);
+        assert!(matches!(
+            default_route,
+            SupervisorRoute::DesktopOwned { .. }
+        ));
+        drop(default_route);
+
+        let reference = InstallationReference {
+            schema_version: 1,
+            install_id: "install-a".into(),
+            helper_enabled: true,
+            program_data_root: install_root,
+            client_secret_ref: "helper.install-a.protocol".into(),
+        };
+        fs::write(
+            data.join("helper-installation.json"),
+            serde_json::to_vec(&reference).expect("reference json"),
+        )
+        .expect("reference");
+        let store = TestSecretStore::default();
+        store
+            .set("helper.install-a.protocol", &"ab".repeat(32))
+            .expect("protected key");
+        let helper_route =
+            select_supervisor_route_with_program_data(&data, Some(&store), &program_data);
+        assert!(matches!(helper_route, SupervisorRoute::HelperOwned { .. }));
     }
 
     #[test]

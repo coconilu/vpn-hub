@@ -598,10 +598,18 @@ pub async fn start_development_core(
         coordinator.complete_manual_start_failure(start_epoch);
         return Err("应用自管核心未发布可验证 PID；已保持 Fail Closed".into());
     };
+    if state.uses_helper_authority() {
+        if !coordinator.complete_manual_start(pid, start_epoch) {
+            let _ = state.stop_supervised_core_if_pid(pid).await;
+            return Err("停止请求优先于 Helper 启动结果；核心已安全停止".into());
+        }
+        status.message = "Helper authority 已启动并监督核心".into();
+        return Ok(status);
+    }
     if !coordinator.manual_start_allowed(start_epoch)
         || !state.owned_core_controller_is_running(pid)
     {
-        let _ = state.stop_owned_core_if_pid(pid);
+        let _ = state.stop_supervised_core_if_pid(pid).await;
         coordinator.complete_manual_start_failure(start_epoch);
         return Err("应用自管核心在首次 Guardian 前失去 PID 或 Controller ownership；已停止并保持 Fail Closed".into());
     }
@@ -610,14 +618,14 @@ pub async fn start_development_core(
         || !coordinator.manual_start_allowed(start_epoch)
         || !state.owned_core_controller_is_running(pid)
     {
-        let _ = state.stop_owned_core_if_pid(pid);
+        let _ = state.stop_supervised_core_if_pid(pid).await;
         coordinator.complete_manual_start_failure(start_epoch);
         return Err("应用自管核心未通过首次 Guardian 的 PID 与 Controller ownership 复核；已停止并保持 Fail Closed".into());
     }
     if !coordinator.complete_manual_start(pid, start_epoch)
         || !state.owned_core_controller_is_running(pid)
     {
-        let _ = state.stop_owned_core_if_pid(pid);
+        let _ = state.stop_supervised_core_if_pid(pid).await;
         return Err("停止请求已优先于迟到的启动结果；应用自管核心已清理".into());
     }
     status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();

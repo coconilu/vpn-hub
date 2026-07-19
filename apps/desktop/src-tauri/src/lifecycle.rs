@@ -937,7 +937,8 @@ impl ActiveWork {
             if published_pid != 0 {
                 let _ = app
                     .state::<AppState>()
-                    .stop_owned_core_if_pid(published_pid);
+                    .stop_supervised_core_if_pid(published_pid)
+                    .await;
             }
         }
         app.state::<DesktopCoordinator>().set_active_cancel(None);
@@ -959,7 +960,7 @@ async fn stop_owned_core_bounded(app: &AppHandle) -> bool {
 async fn stop_owned_core_with_timeout(state: &AppState, timeout: Duration) -> bool {
     let cleanup = async {
         let _transaction = state.lock_routing_transaction().await;
-        state.stop_development_core_if_owned()?;
+        state.stop_supervised_core().await?;
         Ok::<bool, String>(state.owned_core_pid().is_none())
     };
     tokio::time::timeout(timeout, cleanup)
@@ -1103,7 +1104,7 @@ async fn run_restart_task(
     let still_current = app.state::<DesktopCoordinator>().recovery_epoch() == epoch;
     let child_alive = state.owned_core_controller_is_running(pid);
     if cancel.load(Ordering::Acquire) || !still_current || !child_alive {
-        let _ = state.stop_owned_core_if_pid(pid);
+        let _ = state.stop_supervised_core_if_pid(pid).await;
         let outcome = if owned_child_exited.load(Ordering::Acquire) || !child_alive {
             RestartOutcome::Failed(StartupFailure::Other)
         } else {
@@ -1112,7 +1113,8 @@ async fn run_restart_task(
         send_restart_finished(&sender, id, Some(pid), outcome).await;
         return;
     }
-    let guardian_succeeded = commands::record_routing_cycle_locked(&state).await.is_ok();
+    let guardian_succeeded = state.uses_helper_authority()
+        || commands::record_routing_cycle_locked(&state).await.is_ok();
     let child_alive = state.owned_core_controller_is_running(pid);
     let epoch_current = app.state::<DesktopCoordinator>().recovery_epoch() == epoch;
     let deliberately_cancelled = cancel.load(Ordering::Acquire)
@@ -1120,7 +1122,7 @@ async fn run_restart_task(
         || !epoch_current;
     let committed = guardian_succeeded && !deliberately_cancelled && child_alive;
     if !committed {
-        let _ = state.stop_owned_core_if_pid(pid);
+        let _ = state.stop_supervised_core_if_pid(pid).await;
     }
     let outcome = if committed {
         RestartOutcome::Succeeded
