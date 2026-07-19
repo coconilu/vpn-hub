@@ -93,7 +93,7 @@ struct ManagedCore {
 
 struct ProbePortLease {
     _listener: TcpListener,
-    port: u16,
+    address: SocketAddr,
 }
 
 impl ProbePortLease {
@@ -102,17 +102,23 @@ impl ProbePortLease {
     }
 
     fn reserve_excluding(excluded: &[u16]) -> Result<Self, String> {
+        Self::reserve_on(IpAddr::V4(Ipv4Addr::LOCALHOST), excluded)
+    }
+
+    fn reserve_on(ip: IpAddr, excluded: &[u16]) -> Result<Self, String> {
+        if !ip.is_loopback() {
+            return Err("隔离端口只允许绑定 loopback 地址".into());
+        }
         for _ in 0..32 {
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            let listener = TcpListener::bind(SocketAddr::new(ip, 0))
                 .map_err(|_| "无法保留隔离 UDP 探测端口".to_string())?;
-            let port = listener
+            let address = listener
                 .local_addr()
-                .map_err(|_| "无法读取隔离 UDP 探测端口".to_string())?
-                .port();
-            if !matches!(port, 3_666 | 6_666) && !excluded.contains(&port) {
+                .map_err(|_| "无法读取隔离 UDP 探测端口".to_string())?;
+            if !matches!(address.port(), 3_666 | 6_666) && !excluded.contains(&address.port()) {
                 return Ok(Self {
                     _listener: listener,
-                    port,
+                    address,
                 });
             }
         }
@@ -120,7 +126,11 @@ impl ProbePortLease {
     }
 
     const fn port(&self) -> u16 {
-        self.port
+        self.address.port()
+    }
+
+    const fn address(&self) -> SocketAddr {
+        self.address
     }
 }
 
@@ -188,7 +198,13 @@ impl OwnedProbeCore {
                 return Err("隔离 UDP 进程在就绪前退出".into());
             }
             let pid = owned.child.id();
-            let owns_ports = owns_loopback_listeners(pid, &[entry_port, controller_port]);
+            let owns_ports = owns_loopback_listeners(
+                pid,
+                &[
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), entry_port),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), controller_port),
+                ],
+            );
             if owns_ports && owned.controller.is_ready().await.unwrap_or(false) {
                 return Ok(owned);
             }
@@ -416,7 +432,7 @@ impl AppState {
             host: host.into(),
             port,
             reachable: is_endpoint_reachable(host, port),
-            owner_pid: listening_owner_pid(port),
+            owner_pid: loopback_socket_address(host, port).and_then(listening_owner_pid),
         }
     }
 
@@ -763,7 +779,8 @@ impl AppState {
             return Ok(CoreStatus {
                 state: "external".into(),
                 managed: false,
-                pid: listening_owner_pid(config.entry.port),
+                pid: loopback_socket_address(&config.entry.host, config.entry.port)
+                    .and_then(listening_owner_pid),
                 started_at: None,
                 message: format!(
                     "{}:{} 已被其他进程占用，本应用不会停止它",
@@ -784,6 +801,13 @@ impl AppState {
     pub async fn start_development_core(&self) -> Result<CoreStatus, String> {
         self.ensure_runtime_ready()?;
         let private_config = self.private_config()?;
+        let configured_entry_address =
+            loopback_socket_address(&private_config.entry.host, private_config.entry.port)
+                .ok_or_else(|| "配置入口必须是明确的 loopback socket 地址".to_string())?;
+        let controller_address = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            private_config.controller_port,
+        );
         if is_endpoint_reachable(&private_config.entry.host, private_config.entry.port) {
             return Err(format!(
                 "配置入口 {}:{} 已被占用；本应用不会接管未知进程",
@@ -808,11 +832,12 @@ impl AppState {
             .map_err(|error| format!("无法创建 Mihomo 运行目录：{error}"))?;
         harden_private_path(&self.runtime_directory)?;
         let controller_secret = generate_controller_secret();
-        let startup_entry = ProbePortLease::reserve_excluding(&[
-            private_config.entry.port,
-            private_config.controller_port,
-        ])?;
+        let startup_entry = ProbePortLease::reserve_on(
+            configured_entry_address.ip(),
+            &[private_config.entry.port, private_config.controller_port],
+        )?;
         let startup_entry_port = startup_entry.port();
+        let startup_entry_address = startup_entry.address();
         let yaml = self.generate_bootstrap_config(
             &private_config,
             &controller_secret,
@@ -852,7 +877,7 @@ impl AppState {
 
         let pid = child.id();
         for _ in 0..50 {
-            if owns_loopback_listeners(pid, &[startup_entry_port, private_config.controller_port]) {
+            if owns_loopback_listeners(pid, &[startup_entry_address, controller_address]) {
                 break;
             }
             if child
@@ -864,7 +889,7 @@ impl AppState {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if !owns_loopback_listeners(pid, &[startup_entry_port, private_config.controller_port]) {
+        if !owns_loopback_listeners(pid, &[startup_entry_address, controller_address]) {
             terminate_child(&mut child);
             return Err(format!(
                 "Mihomo 启动超时，{}:{} 或本机 Controller 未就绪",
@@ -926,17 +951,17 @@ impl AppState {
             return Err(format!("无法加载完整 Mihomo 配置：{error}"));
         }
         for _ in 0..20 {
-            if listening_owner_pid(private_config.entry.port) == Some(pid)
-                && listening_owner_pid(private_config.controller_port) == Some(pid)
-                && listening_owner_pid(startup_entry_port).is_none()
+            if listening_owner_pid(configured_entry_address) == Some(pid)
+                && listening_owner_pid(controller_address) == Some(pid)
+                && listening_owner_pid(startup_entry_address).is_none()
             {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if listening_owner_pid(private_config.entry.port) != Some(pid)
-            || listening_owner_pid(private_config.controller_port) != Some(pid)
-            || listening_owner_pid(startup_entry_port).is_some()
+        if listening_owner_pid(configured_entry_address) != Some(pid)
+            || listening_owner_pid(controller_address) != Some(pid)
+            || listening_owner_pid(startup_entry_address).is_some()
         {
             terminate_child(&mut child);
             return Err("完整配置入口监听器不属于刚启动的 Mihomo；开发核心已安全停止".into());
@@ -1222,34 +1247,42 @@ fn harden_private_path(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn owns_loopback_listeners(pid: u32, ports: &[u16]) -> bool {
-    ports
+fn loopback_socket_address(host: &str, port: u16) -> Option<SocketAddr> {
+    host.parse::<IpAddr>()
+        .ok()
+        .filter(IpAddr::is_loopback)
+        .map(|ip| SocketAddr::new(ip, port))
+}
+
+fn owns_loopback_listeners(pid: u32, addresses: &[SocketAddr]) -> bool {
+    addresses
         .iter()
-        .all(|port| listening_owner_pid(*port) == Some(pid))
+        .all(|address| listening_owner_pid(*address) == Some(pid))
+}
+
+fn netstat_listener_owner(output: &str, expected_address: SocketAddr) -> Option<u32> {
+    if !expected_address.ip().is_loopback() {
+        return None;
+    }
+    output.lines().find_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        (fields.len() >= 5
+            && fields[0].eq_ignore_ascii_case("TCP")
+            && fields[1].parse::<SocketAddr>().ok() == Some(expected_address)
+            && fields[3].eq_ignore_ascii_case("LISTENING"))
+        .then(|| fields[4].parse::<u32>().ok())
+        .flatten()
+    })
 }
 
 #[cfg(target_os = "windows")]
-fn listening_owner_pid(port: u16) -> Option<u32> {
-    let output = hidden_command("netstat")
-        .args(["-ano", "-p", "tcp"])
-        .output()
-        .ok()?;
-    let expected_address = format!("127.0.0.1:{port}");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find_map(|line| {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            (fields.len() >= 5
-                && fields[0].eq_ignore_ascii_case("TCP")
-                && fields[1] == expected_address
-                && fields[3].eq_ignore_ascii_case("LISTENING"))
-            .then(|| fields[4].parse::<u32>().ok())
-            .flatten()
-        })
+fn listening_owner_pid(address: SocketAddr) -> Option<u32> {
+    let output = hidden_command("netstat").arg("-ano").output().ok()?;
+    netstat_listener_owner(&String::from_utf8_lossy(&output.stdout), address)
 }
 
 #[cfg(not(target_os = "windows"))]
-const fn listening_owner_pid(_port: u16) -> Option<u32> {
+const fn listening_owner_pid(_address: SocketAddr) -> Option<u32> {
     None
 }
 
@@ -1508,8 +1541,66 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     fn listener_ownership_rejects_reachable_unknown_pid() {
         let lease = ProbePortLease::reserve().expect("random loopback lease");
         assert!(!matches!(lease.port(), 3_666 | 6_666));
-        assert!(owns_loopback_listeners(std::process::id(), &[lease.port()]));
-        assert!(!owns_loopback_listeners(u32::MAX, &[lease.port()]));
+        assert!(owns_loopback_listeners(
+            std::process::id(),
+            &[lease.address()]
+        ));
+        assert!(!owns_loopback_listeners(u32::MAX, &[lease.address()]));
+    }
+
+    #[test]
+    fn netstat_parser_matches_non_default_ipv4_and_bracketed_ipv6_only() {
+        let ipv4 = "127.0.0.2:45121".parse().expect("IPv4 socket");
+        let ipv6 = "[::1]:45122".parse().expect("IPv6 socket");
+        let output = "\
+  TCP    127.0.0.2:45121      0.0.0.0:0      LISTENING       12001\n\
+  TCP    [::1]:45122          [::]:0         LISTENING       12002\n\
+  TCP    0.0.0.0:45123        0.0.0.0:0      LISTENING       12003\n\
+  TCP    [::]:45124           [::]:0         LISTENING       12004\n";
+        assert_eq!(netstat_listener_owner(output, ipv4), Some(12_001));
+        assert_eq!(netstat_listener_owner(output, ipv6), Some(12_002));
+        assert_eq!(
+            netstat_listener_owner(output, "0.0.0.0:45123".parse().expect("wildcard")),
+            None
+        );
+        assert_eq!(
+            netstat_listener_owner(output, "192.0.2.1:45121".parse().expect("remote")),
+            None
+        );
+        assert!(loopback_socket_address("127.0.0.2", 45_121).is_some());
+        assert!(loopback_socket_address("::1", 45_122).is_some());
+        assert!(loopback_socket_address("0.0.0.0", 45_123).is_none());
+    }
+
+    #[test]
+    fn non_default_ipv4_loopback_listener_ownership_is_detected() {
+        let lease = ProbePortLease::reserve_on(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), &[])
+            .expect("Windows must support the IPv4 loopback block");
+        assert!(!matches!(lease.port(), 3_666 | 6_666));
+        for _ in 0..20 {
+            if listening_owner_pid(lease.address()) == Some(std::process::id()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("non-default IPv4 loopback listener owner was not detected");
+    }
+
+    #[test]
+    fn ipv6_loopback_listener_ownership_is_detected_when_available() {
+        let Ok(lease) = ProbePortLease::reserve_on(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), &[])
+        else {
+            eprintln!("SKIP: IPv6 loopback is unavailable on this Windows host");
+            return;
+        };
+        assert!(!matches!(lease.port(), 3_666 | 6_666));
+        for _ in 0..20 {
+            if listening_owner_pid(lease.address()) == Some(std::process::id()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("IPv6 loopback listener bound but its owner was not detected");
     }
 
     #[tokio::test]
@@ -1555,7 +1646,10 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             error.contains("入口监听器不属于刚启动的 Mihomo"),
             "ownership failure must be explicit and sanitized: {error}"
         );
-        assert_eq!(listening_owner_pid(entry_port), Some(std::process::id()));
+        assert_eq!(
+            listening_owner_pid(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), entry_port)),
+            Some(std::process::id())
+        );
         assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, entry_port)).is_ok());
         assert!(state.managed_core.lock().expect("managed core").is_none());
         drop(unknown_listener.lock().expect("unknown listener").take());
