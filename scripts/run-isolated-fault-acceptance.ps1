@@ -10,9 +10,9 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 
 Push-Location $repoRoot
 try {
-    cargo test -p vpn-hub-core --test dynamic_fault_acceptance isolated_dynamic_fault_runtime -- --ignored --exact --nocapture
+    cargo test -p vpn-hub-core --test dynamic_fault_acceptance -- --ignored --nocapture --test-threads=1
     if ($LASTEXITCODE -ne 0) {
-        throw "Isolated dynamic fault acceptance failed."
+        throw "One or more isolated fault acceptance scenarios failed."
     }
 }
 finally {

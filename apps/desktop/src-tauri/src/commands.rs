@@ -1,16 +1,12 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use vpn_hub_core::{
-    ControllerClient, GuardianConfig, GuardianStore, HealthStatus, LatencySample, OutletConfig,
-    OutletHealth, OutletKind, OutletSummary, ProbeOutletConfig, ProbeResult, RouteMode,
-    RouteSwitchEvent, RoutingPolicy, StateEvent, SubscriptionCredentialStatus, outlet_proxy_name,
-    probe_outlet,
+    GuardianConfig, GuardianStore, HealthStatus, LatencySample, OutletConfig, OutletKind,
+    OutletSummary, ProbeOutletConfig, ProbeResult, RouteMode, RouteSwitchEvent, StateEvent,
+    SubscriptionCredentialStatus, probe_outlet, run_controller_guardian_cycle,
 };
 
 use crate::runtime::{AppState, CoreStatus, PortSnapshot, RoutingStatus};
@@ -107,150 +103,18 @@ async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
     let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
 
-    let observed = probe_configured_outlets(
+    run_controller_guardian_cycle(
         &controller,
         &private,
         &state.resolved_subscription_urls(&private)?,
-        guardian.monitor.request_timeout_ms,
+        &guardian.monitor,
+        &mut store,
+        state,
+        unix_time_ms(),
     )
-    .await;
-
-    for (outlet, result) in &observed {
-        store
-            .record_probe(
-                outlet,
-                result,
-                guardian.monitor.failure_threshold,
-                guardian.monitor.recovery_threshold,
-            )
-            .map_err(|error| format!("无法写入多目标检测结果：{error}"))?;
-    }
-
-    let enabled_ids = private
-        .enabled_outlets()
-        .map(|outlet| outlet.id.as_str())
-        .collect::<HashSet<_>>();
-    let summaries = store
-        .summaries()
-        .map_err(|error| format!("无法读取稳定健康状态：{error}"))?;
-    let latest_latency = observed
-        .iter()
-        .map(|(outlet, result)| (outlet.id.as_str(), result.latency_ms))
-        .collect::<BTreeMap<_, _>>();
-    let health = summaries
-        .into_iter()
-        .filter(|item| enabled_ids.contains(item.outlet_id.as_str()))
-        .map(|item| {
-            let latency_ms = latest_latency
-                .get(item.outlet_id.as_str())
-                .copied()
-                .flatten();
-            (
-                item.outlet_id,
-                OutletHealth {
-                    status: item.last_status,
-                    latency_ms,
-                },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let policy = RoutingPolicy {
-        priority: private.priority(),
-        cooldown_ms: private.cooldown_seconds.saturating_mul(1_000),
-        minimum_improvement_ms: private.minimum_improvement_ms,
-    };
-    let now_ms = unix_time_ms();
-    if let Some(decision) = state.evaluate_route(now_ms, &health, &policy)? {
-        let proxy_name = outlet_proxy_name(&decision.to_outlet);
-        let started = Instant::now();
-        controller
-            .select(vpn_hub_core::MASTER_SELECTOR, &proxy_name)
-            .await
-            .map_err(|error| format!("Mihomo 真实选择器切换失败：{error}"))?;
-        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        state.apply_route(&decision, now_ms)?;
-        store
-            .record_route_switch(&RouteSwitchEvent {
-                occurred_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                from_outlet: decision.from_outlet,
-                to_outlet: decision.to_outlet,
-                mode: private.route_mode.as_str().into(),
-                reason: decision.reason,
-                duration_ms,
-            })
-            .map_err(|error| format!("无法记录真实路由切换：{error}"))?;
-    }
+    .await
+    .map_err(|error| format!("Guardian 路由周期失败：{error}"))?;
     Ok(guardian.monitor.interval_seconds)
-}
-
-async fn probe_configured_outlets(
-    controller: &ControllerClient,
-    private: &vpn_hub_core::PrivateRoutingConfig,
-    resolved: &vpn_hub_core::ResolvedSubscriptionUrls,
-    timeout_ms: u64,
-) -> Vec<(ProbeOutletConfig, ProbeResult)> {
-    let mut observed = Vec::new();
-    for outlet in private.enabled_outlets() {
-        let result = match &outlet.kind {
-            OutletKind::Subscription { secret_ref, .. } if !resolved.contains_key(secret_ref) => {
-                unavailable_result(
-                    outlet,
-                    ProbeFailureCode::SubscriptionNotConfigured,
-                    private.probe_targets.len(),
-                )
-            }
-            _ => {
-                probe_controller_outlet(controller, outlet, &private.probe_targets, timeout_ms)
-                    .await
-            }
-        };
-        observed.push((virtual_outlet(outlet, &private.entry), result));
-    }
-    observed
-}
-
-async fn probe_controller_outlet(
-    controller: &ControllerClient,
-    outlet: &OutletConfig,
-    targets: &[String],
-    timeout_ms: u64,
-) -> ProbeResult {
-    let proxy_name = outlet_proxy_name(&outlet.id);
-    let mut delays = Vec::new();
-    for target in targets {
-        if let Ok(delay) = controller.delay(&proxy_name, target, timeout_ms).await {
-            delays.push(delay);
-        }
-    }
-    delays.sort_unstable();
-    let successful_targets = u32::try_from(delays.len()).unwrap_or(u32::MAX);
-    let total_targets = u32::try_from(targets.len()).unwrap_or(u32::MAX);
-    let (status, latency_ms) = classify_delays(&delays, targets.len());
-    ProbeResult {
-        outlet_id: outlet.id.clone(),
-        label: outlet.label.clone(),
-        observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-        port_reachable: true,
-        status,
-        http_status: None,
-        latency_ms,
-        error_code: (status == HealthStatus::Down).then(|| "multi_target_quorum_failed".into()),
-        successful_targets,
-        total_targets,
-    }
-}
-
-fn classify_delays(delays: &[u64], total_targets: usize) -> (HealthStatus, Option<u64>) {
-    let quorum = total_targets / 2 + 1;
-    let latency_ms = delays.get(delays.len() / 2).copied();
-    let status = if delays.len() < quorum {
-        HealthStatus::Down
-    } else if latency_ms.is_some_and(|latency| latency > 2_500) || delays.len() < total_targets {
-        HealthStatus::Degraded
-    } else {
-        HealthStatus::Healthy
-    };
-    (status, latency_ms)
 }
 
 fn unavailable_result(
@@ -439,19 +303,6 @@ mod tests {
             assert!(!serialized.contains(sensitive_part));
         }
         assert_eq!(result.total_targets, 3);
-    }
-
-    #[test]
-    fn multi_target_quorum_avoids_single_target_false_down() {
-        assert_eq!(
-            classify_delays(&[80, 120], 3),
-            (HealthStatus::Degraded, Some(120))
-        );
-        assert_eq!(classify_delays(&[80], 3).0, HealthStatus::Down);
-        assert_eq!(
-            classify_delays(&[80, 100, 120], 3),
-            (HealthStatus::Healthy, Some(100))
-        );
     }
 
     #[tokio::test]

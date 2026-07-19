@@ -33,6 +33,11 @@ struct ProxyResponse {
     now: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct VersionResponse {
+    version: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SelectionRequest<'a> {
     name: &'a str,
@@ -114,6 +119,83 @@ impl ControllerClient {
         } else {
             Err(ControllerError::Http(response.status()))
         }
+    }
+
+    /// Measures a selected proxy-provider member through Mihomo's provider API.
+    ///
+    /// Provider member names remain internal and are never returned or
+    /// persisted. Mihomo exposes provider members through a distinct
+    /// healthcheck route rather than the inline-proxy delay route.
+    ///
+    /// # Errors
+    ///
+    /// Returns sanitized transport, HTTP, or response errors.
+    pub async fn delay_selected_provider_member(
+        &self,
+        group: &str,
+        provider: &str,
+        target: &str,
+        timeout_ms: u64,
+    ) -> Result<u64, ControllerError> {
+        let url = self.endpoint(&["proxies", group])?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.secret)
+            .send()
+            .await
+            .map_err(|_| ControllerError::Request)?;
+        if !response.status().is_success() {
+            return Err(ControllerError::Http(response.status()));
+        }
+        let member = response
+            .json::<ProxyResponse>()
+            .await
+            .map_err(|_| ControllerError::Response)?
+            .now;
+        let mut url = self.endpoint(&["providers", "proxies", provider, &member, "healthcheck"])?;
+        url.query_pairs_mut()
+            .append_pair("timeout", &timeout_ms.to_string())
+            .append_pair("url", target);
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.secret)
+            .send()
+            .await
+            .map_err(|_| ControllerError::Request)?;
+        if !response.status().is_success() {
+            return Err(ControllerError::Http(response.status()));
+        }
+        response
+            .json::<DelayResponse>()
+            .await
+            .map(|body| body.delay)
+            .map_err(|_| ControllerError::Response)
+    }
+
+    /// Confirms that the authenticated loopback Controller is a Mihomo API.
+    ///
+    /// # Errors
+    ///
+    /// Returns sanitized transport, HTTP, or response errors.
+    pub async fn is_ready(&self) -> Result<bool, ControllerError> {
+        let url = self.endpoint(&["version"])?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(&self.secret)
+            .send()
+            .await
+            .map_err(|_| ControllerError::Request)?;
+        if !response.status().is_success() {
+            return Err(ControllerError::Http(response.status()));
+        }
+        response
+            .json::<VersionResponse>()
+            .await
+            .map(|body| !body.version.trim().is_empty())
+            .map_err(|_| ControllerError::Response)
     }
 
     /// Confirms whether a Mihomo selector currently points to an expected target.
