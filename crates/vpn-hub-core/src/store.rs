@@ -1534,33 +1534,62 @@ fn record_predicate(
         format!("{alias}.{time_column} <= ?"),
     ];
     let mut values = vec![Value::Text(start.into()), Value::Text(end.into())];
-    if let Some(outlet_id) = &filter.outlet_id {
-        clauses.push(if route_switch {
-            format!("({alias}.from_outlet = ? OR {alias}.to_outlet = ?)")
-        } else {
-            format!("{alias}.outlet_id = ?")
-        });
-        values.push(Value::Text(outlet_id.clone()));
-        if route_switch {
+    if route_switch {
+        if let Some((participant_predicate, participant_values)) =
+            route_switch_participant_predicate(filter, alias)
+        {
+            clauses.push(participant_predicate);
+            values.extend(participant_values);
+        }
+    } else {
+        if let Some(outlet_id) = &filter.outlet_id {
+            clauses.push(format!("{alias}.outlet_id = ?"));
             values.push(Value::Text(outlet_id.clone()));
         }
-    }
-    if let Some(kind) = filter.kind {
-        clauses.push(if route_switch {
-            format!("({alias}.from_kind = ? OR {alias}.to_kind = ?)")
-        } else {
-            format!("{alias}.outlet_kind = ?")
-        });
-        values.push(Value::Text(kind.as_str().into()));
-        if route_switch {
+        if let Some(kind) = filter.kind {
+            clauses.push(format!("{alias}.outlet_kind = ?"));
             values.push(Value::Text(kind.as_str().into()));
         }
-    }
-    if !route_switch && let Some(status) = filter.status {
-        clauses.push(format!("{alias}.{status_column} = ?"));
-        values.push(Value::Text(status.as_str().into()));
+        if let Some(status) = filter.status {
+            clauses.push(format!("{alias}.{status_column} = ?"));
+            values.push(Value::Text(status.as_str().into()));
+        }
     }
     (clauses.join(" AND "), values)
+}
+
+fn route_switch_participant_predicate(
+    filter: &HistoryFilter,
+    alias: &str,
+) -> Option<(String, Vec<Value>)> {
+    match (&filter.outlet_id, filter.kind) {
+        (Some(outlet_id), Some(kind)) => Some((
+            format!(
+                "(({alias}.from_outlet = ? AND {alias}.from_kind = ?) OR ({alias}.to_outlet = ? AND {alias}.to_kind = ?))"
+            ),
+            vec![
+                Value::Text(outlet_id.clone()),
+                Value::Text(kind.as_str().into()),
+                Value::Text(outlet_id.clone()),
+                Value::Text(kind.as_str().into()),
+            ],
+        )),
+        (Some(outlet_id), None) => Some((
+            format!("({alias}.from_outlet = ? OR {alias}.to_outlet = ?)"),
+            vec![
+                Value::Text(outlet_id.clone()),
+                Value::Text(outlet_id.clone()),
+            ],
+        )),
+        (None, Some(kind)) => Some((
+            format!("({alias}.from_kind = ? OR {alias}.to_kind = ?)"),
+            vec![
+                Value::Text(kind.as_str().into()),
+                Value::Text(kind.as_str().into()),
+            ],
+        )),
+        (None, None) => None,
+    }
 }
 
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, StoreError> {
@@ -2197,6 +2226,108 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(3), Some(2), Some(1)]
         );
+    }
+
+    #[test]
+    fn route_switch_filters_match_one_participant_across_records_metrics_and_csv() {
+        let mut store = GuardianStore::open_in_memory().expect("store");
+        let local_id = "switch-local-a";
+        let subscription_id = "switch-subscription-b";
+        let local = history_snapshot(local_id, "Local A");
+        let subscription = HistoryOutletSnapshot {
+            outlet_id: subscription_id.into(),
+            label: "Subscription B".into(),
+            kind: HistoryOutletKind::Subscription,
+            enabled: true,
+        };
+        store
+            .sync_history_outlets(&[local, subscription], "2026-02-01T00:00:00Z")
+            .expect("catalogue");
+        store
+            .record_route_switch(&RouteSwitchEvent {
+                occurred_at: "2026-02-01T00:01:00Z".into(),
+                from_outlet: Some(local_id.into()),
+                to_outlet: subscription_id.into(),
+                mode: "priority".into(),
+                reason: "confirmed".into(),
+                duration_ms: 1,
+            })
+            .expect("cross-kind switch");
+
+        let cases = [
+            (
+                "cross-participant-mismatch",
+                Some(local_id),
+                Some(HistoryOutletKind::Subscription),
+                0,
+                None,
+            ),
+            (
+                "local-participant",
+                Some(local_id),
+                Some(HistoryOutletKind::LocalProxy),
+                1,
+                Some(local_id),
+            ),
+            (
+                "subscription-participant",
+                Some(subscription_id),
+                Some(HistoryOutletKind::Subscription),
+                1,
+                Some(subscription_id),
+            ),
+            ("outlet-only", Some(local_id), None, 1, Some(local_id)),
+            (
+                "kind-only",
+                None,
+                Some(HistoryOutletKind::Subscription),
+                1,
+                Some(subscription_id),
+            ),
+        ];
+        let directory = tempfile::tempdir().expect("tempdir");
+        for (name, outlet_id, kind, expected_count, expected_metric_id) in cases {
+            let filter = HistoryFilter {
+                window: crate::HistoryWindow::OneHour,
+                outlet_id: outlet_id.map(str::to_owned),
+                kind,
+                event_type: Some(HistoryEventType::RouteSwitch),
+                ..HistoryFilter::default()
+            };
+            let history = store
+                .query_history(&filter, "2026-02-01T01:00:00Z")
+                .expect("filtered history");
+            assert_eq!(history.total_count, expected_count, "{name} total");
+            assert_eq!(
+                history.records.len(),
+                usize::try_from(expected_count).expect("small fixture count"),
+                "{name} records"
+            );
+            assert_eq!(history.outlets.len(), 2, "{name} historical catalogue");
+            match expected_metric_id {
+                Some(expected_metric_id) => {
+                    assert_eq!(history.metrics.len(), 1, "{name} metric count");
+                    assert_eq!(history.metrics[0].outlet_id, expected_metric_id, "{name}");
+                    assert_eq!(
+                        history.metrics[0].confirmed_route_switches, 1,
+                        "{name} switch metric"
+                    );
+                }
+                None => assert!(history.metrics.is_empty(), "{name} metrics"),
+            }
+
+            let csv_path = directory.path().join(format!("{name}.csv"));
+            let csv_count = store
+                .export_history_csv(&csv_path, &filter, "2026-02-01T01:00:00Z")
+                .expect("filtered CSV");
+            assert_eq!(csv_count, expected_count, "{name} CSV count");
+            let csv = fs::read_to_string(csv_path).expect("CSV contents");
+            assert_eq!(
+                csv.lines().count(),
+                usize::try_from(expected_count).expect("small fixture count") + 1,
+                "{name} CSV rows"
+            );
+        }
     }
 
     #[test]
