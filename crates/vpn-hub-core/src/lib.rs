@@ -10,6 +10,7 @@ mod mihomo;
 mod model;
 mod probe;
 mod routing;
+mod secret_store;
 mod store;
 
 pub use config::{ConfigError, GuardianConfig, MonitorConfig, ProbeOutletConfig};
@@ -26,5 +27,10 @@ pub use model::{
 pub use probe::probe_outlet;
 pub use routing::{
     FAIL_CLOSED_OUTLET, OutletHealth, RouteDecision, RouteMode, RoutingEngine, RoutingPolicy,
+};
+pub use secret_store::{
+    CredentialState, LegacyMigrationOutcome, SecretStore, SecretStoreError,
+    SubscriptionCredentialStatus, SubscriptionSecrets, SystemSecretStore,
+    migrate_legacy_subscription,
 };
 pub use store::{GuardianStore, StoreError};

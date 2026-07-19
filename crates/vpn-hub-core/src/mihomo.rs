@@ -272,6 +272,21 @@ impl PrivateRoutingConfig {
         self.legacy_subscription_urls.clone()
     }
 
+    pub(crate) fn is_legacy_format(&self) -> bool {
+        self.source_format == SourceFormat::Legacy
+    }
+
+    pub(crate) fn legacy_subscription_credential(&self) -> Option<(&str, &str, &str)> {
+        self.legacy_subscription_urls
+            .get(LEGACY_SECRET_REF)
+            .map(|url| (LEGACY_SUBSCRIPTION_ID, LEGACY_SECRET_REF, url.as_str()))
+    }
+
+    pub(crate) fn promote_legacy_format(&mut self) {
+        self.source_format = SourceFormat::Versioned;
+        self.legacy_subscription_urls.clear();
+    }
+
     #[must_use]
     pub fn summary(&self, resolved: &ResolvedSubscriptionUrls) -> PrivateConfigSummary {
         PrivateConfigSummary {
@@ -445,6 +460,7 @@ fn validate_outlets(
     entry_ip: IpAddr,
 ) -> Result<std::collections::HashSet<&str>, PrivateConfigError> {
     let mut ids = std::collections::HashSet::new();
+    let mut secret_refs = std::collections::HashSet::new();
     let mut local_endpoints = std::collections::HashSet::new();
     for outlet in &config.outlets {
         validate_outlet_id(&outlet.id)?;
@@ -463,7 +479,14 @@ fn validate_outlets(
             OutletKind::Subscription {
                 secret_ref,
                 provider_update_seconds,
-            } => validate_subscription_outlet(outlet, secret_ref, *provider_update_seconds)?,
+            } => {
+                validate_subscription_outlet(outlet, secret_ref, *provider_update_seconds)?;
+                if !secret_refs.insert(secret_ref.as_str()) {
+                    return Err(PrivateConfigError::Invalid(
+                        "duplicate subscription secret_ref".into(),
+                    ));
+                }
+            }
             OutletKind::LocalProxy { endpoint } => {
                 let endpoint = parse_local_proxy_endpoint(endpoint, &outlet.id)?;
                 if endpoint.ip() == entry_ip && endpoint.port() == config.entry.port {
@@ -495,12 +518,7 @@ fn validate_subscription_outlet(
     secret_ref: &str,
     provider_update_seconds: u64,
 ) -> Result<(), PrivateConfigError> {
-    if secret_ref.trim().is_empty() {
-        return Err(PrivateConfigError::Invalid(format!(
-            "secret_ref for {} must not be empty",
-            outlet.id
-        )));
-    }
+    validate_secret_ref(secret_ref)?;
     if provider_update_seconds < 60 {
         return Err(PrivateConfigError::Invalid(format!(
             "provider_update_seconds for {} must be at least 60",
@@ -717,12 +735,28 @@ fn provider_name(outlet_id: &str) -> String {
     format!("vpn-hub-provider-{outlet_id}")
 }
 
-fn validate_subscription_url(value: &str) -> Result<(), PrivateConfigError> {
+pub(crate) fn validate_subscription_url(value: &str) -> Result<(), PrivateConfigError> {
     let url = Url::parse(value)
         .map_err(|_| PrivateConfigError::Invalid("subscription URL is invalid".into()))?;
     if url.scheme() != "https" || url.host_str().is_none() || url.username() != "" {
         return Err(PrivateConfigError::Invalid(
             "subscription URL must be an HTTPS URL without userinfo".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_secret_ref(value: &str) -> Result<(), PrivateConfigError> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '.' | '-' | '_')
+        });
+    if !valid {
+        return Err(PrivateConfigError::Invalid(
+            "secret_ref must be 1-128 lowercase ASCII letters, digits, '.', '-' or '_'".into(),
         ));
     }
     Ok(())
@@ -1017,6 +1051,25 @@ mod tests {
             Err(PrivateConfigError::Invalid(message)) if message.contains("reserved")
         ));
         assert!(generate_mihomo_config(&config, &BTreeMap::new(), "test-secret").is_err());
+    }
+
+    #[test]
+    fn duplicate_subscription_secret_refs_are_rejected() {
+        let mut config = PrivateRoutingConfig {
+            outlets: vec![
+                subscription("subscription-a", "subscription.shared"),
+                subscription("subscription-b", "subscription.shared"),
+            ],
+            ..PrivateRoutingConfig::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(PrivateConfigError::Invalid(message))
+                if message == "duplicate subscription secret_ref"
+        ));
+
+        config.outlets[1] = subscription("subscription-b", "subscription.b");
+        assert!(config.validate().is_ok());
     }
 
     #[test]

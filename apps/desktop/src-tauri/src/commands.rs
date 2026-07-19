@@ -9,7 +9,8 @@ use tauri::{AppHandle, Manager, State};
 use vpn_hub_core::{
     ControllerClient, GuardianConfig, GuardianStore, HealthStatus, LatencySample, OutletConfig,
     OutletHealth, OutletKind, OutletSummary, ProbeOutletConfig, ProbeResult, RouteMode,
-    RouteSwitchEvent, RoutingPolicy, StateEvent, outlet_proxy_name, probe_outlet,
+    RouteSwitchEvent, RoutingPolicy, StateEvent, SubscriptionCredentialStatus, outlet_proxy_name,
+    probe_outlet,
 };
 
 use crate::runtime::{AppState, CoreStatus, PortSnapshot, RoutingStatus};
@@ -56,7 +57,7 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
     let private = state.private_config()?;
-    let resolved = private.resolved_subscription_urls();
+    let resolved = state.resolved_subscription_urls(&private)?;
     let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
 
@@ -106,8 +107,13 @@ async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
     let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
 
-    let observed =
-        probe_configured_outlets(&controller, &private, guardian.monitor.request_timeout_ms).await;
+    let observed = probe_configured_outlets(
+        &controller,
+        &private,
+        &state.resolved_subscription_urls(&private)?,
+        guardian.monitor.request_timeout_ms,
+    )
+    .await;
 
     for (outlet, result) in &observed {
         store
@@ -180,9 +186,9 @@ async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
 async fn probe_configured_outlets(
     controller: &ControllerClient,
     private: &vpn_hub_core::PrivateRoutingConfig,
+    resolved: &vpn_hub_core::ResolvedSubscriptionUrls,
     timeout_ms: u64,
 ) -> Vec<(ProbeOutletConfig, ProbeResult)> {
-    let resolved = private.resolved_subscription_urls();
     let mut observed = Vec::new();
     for outlet in private.enabled_outlets() {
         let result = match &outlet.kind {
@@ -355,6 +361,33 @@ pub async fn set_route_mode(
     state.set_route_mode(mode, manual_outlet)?;
     record_routing_cycle_locked(&state).await?;
     load_dashboard(&state)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn list_subscription_credentials(
+    state: State<'_, AppState>,
+) -> Result<Vec<SubscriptionCredentialStatus>, String> {
+    state.subscription_credential_statuses()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn set_subscription_credential(
+    state: State<'_, AppState>,
+    subscription_id: String,
+    credential: String,
+) -> Result<SubscriptionCredentialStatus, String> {
+    state.set_subscription_credential(&subscription_id, &credential)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn delete_subscription_credential(
+    state: State<'_, AppState>,
+    subscription_id: String,
+) -> Result<SubscriptionCredentialStatus, String> {
+    state.delete_subscription_credential(&subscription_id)
 }
 
 #[tauri::command]

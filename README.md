@@ -42,6 +42,7 @@ flowchart LR
 | [Mihomo 开发隔离](docs/mihomo-development.md) | 校验 sidecar 并在 `36666` 验证本地编排链路 |
 | [Issue #3 双出口开发版](docs/issue-3-dual-outlet.md) | 私密订阅、真实 Controller 策略、多目标健康与 Fail Closed |
 | [Issue #7 动态入口与出口](docs/issue-7-dynamic-outlets.md) | 版本化配置、动态 Mihomo/Guardian/UI、兼容迁移与回滚 |
+| [Issue #6 Windows 受保护凭据](docs/issue-6-windows-secret-store.md) | 多订阅 Secret Store、旧明文迁移、状态与生命周期 |
 | [兼容性实测](docs/compatibility/2026-07-18-chaoshihui.md) | 本地客户端 A 使用 `16666` 的首轮验证证据 |
 | [Mihomo 链路实测](docs/compatibility/2026-07-18-mihomo-chain.md) | `36666 → Mihomo → 16666` 的隔离验证证据 |
 | [Issue #3 Controller 实测](docs/compatibility/2026-07-18-issue-3-local-controller.md) | 初始 REJECT、真实选择器和 `36666 → 16666` HTTPS 证据 |
@@ -52,7 +53,7 @@ flowchart LR
 
 ## 当前优先事项
 
-当前主线是为动态配置接入 Windows 受保护凭据存储，并继续完成多出口故障注入、UDP 能力矩阵和设置页。历史兼容性文档中的 `16666`、`26666`、`36666` 是当时测试拓扑，不再是产品固定端口。
+动态配置已接入 Windows 受保护凭据存储；当前主线继续完成多出口故障注入、UDP 能力矩阵和设置页。历史兼容性文档中的 `16666`、`26666`、`36666` 是当时测试拓扑，不再是产品固定端口。
 
 ## Guardian CLI
 
