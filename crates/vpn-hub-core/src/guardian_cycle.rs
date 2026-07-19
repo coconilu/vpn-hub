@@ -9,7 +9,8 @@ use thiserror::Error;
 use crate::{
     ControllerClient, ControllerError, GuardianStore, HealthStatus, MonitorConfig, OutletConfig,
     OutletHealth, OutletKind, PrivateRoutingConfig, ProbeOutletConfig, ProbeResult, RouteDecision,
-    RouteSwitchEvent, RoutingEngine, RoutingPolicy, StoreError, outlet_proxy_name,
+    RouteSwitchEvent, RoutingEngine, RoutingPolicy, StoreError, UDP_SELECTOR, UdpCapabilityStatus,
+    outlet_proxy_name, unknown_udp_evidence,
 };
 
 #[derive(Debug, Error)]
@@ -94,6 +95,13 @@ pub async fn run_controller_guardian_cycle(
     routing: &impl RoutingSession,
     now_ms: u64,
 ) -> Result<GuardianCycleOutcome, GuardianCycleError> {
+    for outlet in private.enabled_outlets() {
+        store.ensure_udp_capability(
+            &outlet.id,
+            &outlet.label,
+            &unknown_udp_evidence(&outlet.id, "not_yet_validated"),
+        )?;
+    }
     let observed =
         probe_configured_outlets(controller, private, resolved, monitor.request_timeout_ms).await;
 
@@ -146,6 +154,21 @@ pub async fn run_controller_guardian_cycle(
                 &outlet_proxy_name(&decision.to_outlet),
             )
             .await?;
+        let udp_target = store
+            .udp_capabilities()?
+            .into_iter()
+            .find(|evidence| evidence.outlet_id == decision.to_outlet)
+            .filter(|evidence| evidence.status == UdpCapabilityStatus::Supported)
+            .map_or_else(
+                || crate::FAIL_CLOSED_PROXY.to_string(),
+                |evidence| outlet_proxy_name(&evidence.outlet_id),
+            );
+        if let Err(error) = controller.select(UDP_SELECTOR, &udp_target).await {
+            let _ = controller
+                .select(UDP_SELECTOR, crate::FAIL_CLOSED_PROXY)
+                .await;
+            return Err(error.into());
+        }
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         routing.apply_route(decision, now_ms)?;
         store.record_route_switch(&RouteSwitchEvent {

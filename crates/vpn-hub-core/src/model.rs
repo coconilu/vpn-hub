@@ -11,6 +11,49 @@ pub enum HealthStatus {
     Down,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UdpCapabilityStatus {
+    Supported,
+    TcpOnly,
+    Unknown,
+}
+
+impl UdpCapabilityStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supported => "supported",
+            Self::TcpOnly => "tcp_only",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl TryFrom<&str> for UdpCapabilityStatus {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "supported" => Ok(Self::Supported),
+            "tcp_only" => Ok(Self::TcpOnly),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!("unknown UDP capability status: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpCapabilityEvidence {
+    pub outlet_id: String,
+    pub status: UdpCapabilityStatus,
+    pub observed_at: String,
+    pub evidence_version: u32,
+    pub probe_version: String,
+    pub model_version: u32,
+    pub reason_code: String,
+}
+
 impl HealthStatus {
     #[must_use]
     pub const fn as_str(self) -> &'static str {

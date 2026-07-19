@@ -13,6 +13,7 @@ mod probe;
 mod routing;
 mod secret_store;
 mod store;
+mod udp_capability;
 
 pub use config::{ConfigError, GuardianConfig, MonitorConfig, ProbeOutletConfig};
 pub use controller::{ControllerClient, ControllerError};
@@ -23,11 +24,13 @@ pub use guardian_cycle::{
 pub use mihomo::{
     CURRENT_CONFIG_VERSION, EntryConfig, FAIL_CLOSED_PROXY, MASTER_SELECTOR, OutletConfig,
     OutletConfigSummary, OutletKind, PrivateConfigError, PrivateConfigSummary,
-    PrivateRoutingConfig, ResolvedSubscriptionUrls, RuntimeConfigSummary,
-    generate_controller_secret, generate_mihomo_config, outlet_proxy_name,
+    PrivateRoutingConfig, ResolvedSubscriptionUrls, RuntimeConfigSummary, UDP_SELECTOR,
+    UdpCapabilityMap, generate_controller_secret, generate_mihomo_config,
+    generate_mihomo_config_with_udp_capabilities, outlet_proxy_name,
 };
 pub use model::{
     HealthStatus, LatencySample, OutletSummary, ProbeResult, RouteSwitchEvent, StateEvent,
+    UdpCapabilityEvidence, UdpCapabilityStatus,
 };
 pub use probe::probe_outlet;
 pub use routing::{
@@ -39,3 +42,7 @@ pub use secret_store::{
     migrate_legacy_subscription,
 };
 pub use store::{GuardianStore, StoreError};
+pub use udp_capability::{
+    UDP_EVIDENCE_VERSION, UDP_MODEL_VERSION, UDP_PROBE_VERSION, UdpProbeTarget,
+    classify_subscription_udp, probe_local_proxy_udp, unknown_udp_evidence,
+};

@@ -1,4 +1,15 @@
 export type HealthStatus = "unknown" | "healthy" | "degraded" | "down";
+export type UdpCapabilityStatus = "supported" | "tcp_only" | "unknown";
+
+export interface UdpCapabilityEvidence {
+  outlet_id: string;
+  status: UdpCapabilityStatus;
+  observed_at: string;
+  evidence_version: number;
+  probe_version: string;
+  model_version: number;
+  reason_code: string;
+}
 
 export interface PortSnapshot {
   host: string;
@@ -82,6 +93,7 @@ export interface DashboardSnapshot {
   samples: LatencySample[];
   events: StateEvent[];
   route_switches: RouteSwitchEvent[];
+  udp_capabilities: UdpCapabilityEvidence[];
 }
 
 export type RouteMode = "priority" | "fastest" | "manual";

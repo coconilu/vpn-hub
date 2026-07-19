@@ -5,6 +5,7 @@ import { Sidebar, type ViewId } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
 import {
   getDashboardSnapshot,
+  revalidateUdpCapabilities,
   refreshGuardian,
   setRouteMode,
   startDevelopmentCore,
@@ -54,6 +55,11 @@ export default function App() {
     setNotice("多目标检测已完成；状态、延迟和真实切换已写入本机历史。");
   });
 
+  const handleUdpRevalidate = () => runBusy(async () => {
+    setSnapshot(await revalidateUdpCapabilities());
+    setNotice("UDP 能力已使用受控回环目标重新验证；订阅出口在没有获准的端到端目标时保持未知。重启开发核心后应用新约束。");
+  });
+
   const handleCoreToggle = () => runBusy(async () => {
     if (!snapshot) return;
     if (snapshot.mihomo.state === "running") {
@@ -87,6 +93,7 @@ export default function App() {
             notice={notice}
             onModeChange={handleModeChange}
             onRefresh={handleRefresh}
+            onUdpRevalidate={handleUdpRevalidate}
             onCoreToggle={handleCoreToggle}
           />
         ) : (

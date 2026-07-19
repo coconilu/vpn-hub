@@ -76,4 +76,24 @@ export const mockSnapshot: DashboardSnapshot = {
     },
   ],
   route_switches: [],
+  udp_capabilities: [
+    {
+      outlet_id: "local-a",
+      status: "tcp_only",
+      observed_at: new Date(now - 3 * 60 * 1000).toISOString(),
+      evidence_version: 1,
+      probe_version: "socks5-udp-associate-v1",
+      model_version: 1,
+      reason_code: "socks5_udp_associate_rejected",
+    },
+    {
+      outlet_id: "sub-a",
+      status: "unknown",
+      observed_at: new Date(now - 3 * 60 * 1000).toISOString(),
+      evidence_version: 1,
+      probe_version: "socks5-udp-associate-v1",
+      model_version: 1,
+      reason_code: "subscription_end_to_end_probe_required",
+    },
+  ],
 };

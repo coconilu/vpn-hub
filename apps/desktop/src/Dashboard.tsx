@@ -12,6 +12,7 @@ interface DashboardProps {
   notice: string | null;
   onModeChange: (mode: RouteMode, manualOutlet: string | null) => void;
   onRefresh: () => void;
+  onUdpRevalidate: () => void;
   onCoreToggle: () => void;
 }
 
@@ -22,7 +23,7 @@ const formatUpdatedAt = (value: string) => new Intl.DateTimeFormat("zh-CN", {
   hour12: false,
 }).format(new Date(value));
 
-export function Dashboard({ snapshot, busy, notice, onModeChange, onRefresh, onCoreToggle }: DashboardProps) {
+export function Dashboard({ snapshot, busy, notice, onModeChange, onRefresh, onUdpRevalidate, onCoreToggle }: DashboardProps) {
   const coreRunning = snapshot.mihomo.state === "running";
   const mode = snapshot.routing.mode;
   const selectableOutlets = snapshot.routing.outlets.filter((outlet) => outlet.enabled && outlet.configured);
@@ -39,6 +40,9 @@ export function Dashboard({ snapshot, busy, notice, onModeChange, onRefresh, onC
           </button>
           <button className="icon-button" aria-label="立即检测" title="立即检测" onClick={onRefresh} disabled={busy} type="button">
             <RefreshCw className={busy ? "spin" : ""} />
+          </button>
+          <button className="secondary-button" onClick={onUdpRevalidate} disabled={busy || coreRunning} type="button">
+            验证 UDP
           </button>
         </div>
       </header>

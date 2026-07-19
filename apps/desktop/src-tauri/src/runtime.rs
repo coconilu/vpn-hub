@@ -10,10 +10,12 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use vpn_hub_core::{
-    ControllerClient, OutletConfigSummary, PrivateRoutingConfig, ResolvedSubscriptionUrls,
-    RouteDecision, RouteMode, RoutingEngine, RoutingSession, RoutingStateError, SecretStore,
-    SubscriptionCredentialStatus, SubscriptionSecrets, SystemSecretStore,
-    generate_controller_secret, generate_mihomo_config, migrate_legacy_subscription,
+    ControllerClient, GuardianConfig, GuardianStore, OutletConfigSummary, PrivateRoutingConfig,
+    ResolvedSubscriptionUrls, RouteDecision, RouteMode, RoutingEngine, RoutingSession,
+    RoutingStateError, SecretStore, SubscriptionCredentialStatus, SubscriptionSecrets,
+    SystemSecretStore, UdpCapabilityMap, generate_controller_secret,
+    generate_mihomo_config_with_udp_capabilities, migrate_legacy_subscription,
+    unknown_udp_evidence,
 };
 
 const DEFAULT_GUARDIAN_CONFIG: &str = r#"database_path = "guardian-desktop.db"
@@ -282,6 +284,51 @@ impl AppState {
         })
     }
 
+    fn udp_capability_map(
+        &self,
+        private_config: &PrivateRoutingConfig,
+    ) -> Result<UdpCapabilityMap, String> {
+        let guardian = GuardianConfig::load(&self.guardian_config_path)
+            .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
+        let mut store = GuardianStore::open(&guardian.database_path)
+            .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
+        for outlet in private_config.enabled_outlets() {
+            store
+                .ensure_udp_capability(
+                    &outlet.id,
+                    &outlet.label,
+                    &unknown_udp_evidence(&outlet.id, "not_yet_validated"),
+                )
+                .map_err(|error| format!("无法初始化 UDP 能力状态：{error}"))?;
+        }
+        store
+            .udp_capabilities()
+            .map_err(|error| format!("无法读取 UDP 能力状态：{error}"))
+            .map(|evidence| {
+                evidence
+                    .into_iter()
+                    .map(|item| (item.outlet_id, item.status))
+                    .collect()
+            })
+    }
+
+    fn generate_runtime_config(
+        &self,
+        private_config: &PrivateRoutingConfig,
+        controller_secret: &str,
+    ) -> Result<String, String> {
+        let resolved = self.resolved_subscription_urls(private_config)?;
+        let udp_capabilities = self.udp_capability_map(private_config)?;
+        generate_mihomo_config_with_udp_capabilities(
+            private_config,
+            &resolved,
+            controller_secret,
+            &udp_capabilities,
+        )
+        .map(|(yaml, _)| yaml)
+        .map_err(|error| format!("无法生成 Mihomo 配置：{error}"))
+    }
+
     pub async fn lock_routing_transaction(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.routing_transaction.lock().await
     }
@@ -400,9 +447,7 @@ impl AppState {
             .map_err(|error| format!("无法创建 Mihomo 运行目录：{error}"))?;
         harden_private_path(&self.runtime_directory)?;
         let controller_secret = generate_controller_secret();
-        let resolved = self.resolved_subscription_urls(&private_config)?;
-        let (yaml, _) = generate_mihomo_config(&private_config, &resolved, &controller_secret)
-            .map_err(|error| format!("无法生成 Mihomo 配置：{error}"))?;
+        let yaml = self.generate_runtime_config(&private_config, &controller_secret)?;
         let config_path = self.runtime_directory.join("mihomo.yaml");
         fs::write(&config_path, yaml).map_err(|_| "无法写入本机 Mihomo 运行配置".to_string())?;
         harden_private_path(&config_path)?;
@@ -729,7 +774,7 @@ mod tests {
     use std::{collections::BTreeMap, sync::Arc};
     use vpn_hub_core::{
         HealthStatus, MASTER_SELECTOR, OutletConfig, OutletHealth, OutletKind, RoutingPolicy,
-        SecretStoreError, outlet_proxy_name,
+        SecretStoreError, generate_mihomo_config, outlet_proxy_name,
     };
 
     #[derive(Default)]

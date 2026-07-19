@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::{
     HealthStatus, LatencySample, OutletSummary, ProbeOutletConfig, ProbeResult, RouteSwitchEvent,
-    StateEvent,
+    StateEvent, UdpCapabilityEvidence, UdpCapabilityStatus,
 };
 
 #[derive(Debug, Error)]
@@ -16,6 +16,8 @@ pub enum StoreError {
     Database(#[from] rusqlite::Error),
     #[error("invalid stored status: {0}")]
     InvalidStatus(String),
+    #[error("invalid stored UDP capability: {0}")]
+    InvalidUdpCapability(String),
 }
 
 pub struct GuardianStore {
@@ -101,6 +103,22 @@ impl GuardianStore {
             );
             CREATE INDEX IF NOT EXISTS idx_route_switches_time
                 ON route_switches(occurred_at DESC);
+            CREATE TABLE IF NOT EXISTS udp_capability_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                outlet_id TEXT NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                evidence_version INTEGER NOT NULL,
+                probe_version TEXT NOT NULL,
+                model_version INTEGER NOT NULL,
+                reason_code TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_udp_capability_history_outlet_time
+                ON udp_capability_history(outlet_id, observed_at DESC);
+            CREATE TABLE IF NOT EXISTS udp_capability_current (
+                outlet_id TEXT PRIMARY KEY REFERENCES outlets(id) ON DELETE CASCADE,
+                history_id INTEGER NOT NULL REFERENCES udp_capability_history(id) ON DELETE CASCADE
+            );
             ",
         )?;
         ensure_probe_column(&connection, "port_reachable", "INTEGER NOT NULL DEFAULT 0")?;
@@ -111,7 +129,7 @@ impl GuardianStore {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_probe_column(&connection, "total_targets", "INTEGER NOT NULL DEFAULT 1")?;
-        connection.pragma_update(None, "user_version", 2_i64)?;
+        connection.pragma_update(None, "user_version", 3_i64)?;
         Ok(Self { connection })
     }
 
@@ -416,6 +434,135 @@ impl GuardianStore {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
+
+    /// Persists a sanitized, versioned UDP capability conclusion and updates
+    /// the current summary without changing the independent TCP health state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evidence transaction cannot be committed.
+    pub fn record_udp_capability(
+        &mut self,
+        outlet_id: &str,
+        label: &str,
+        evidence: &UdpCapabilityEvidence,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            r"INSERT INTO outlets(id, label, updated_at) VALUES (?1, ?2, ?3)
+               ON CONFLICT(id) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at",
+            params![outlet_id, label, evidence.observed_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO udp_capability_history(outlet_id, status, observed_at, evidence_version, probe_version, model_version, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                outlet_id,
+                evidence.status.as_str(),
+                evidence.observed_at,
+                evidence.evidence_version,
+                evidence.probe_version,
+                evidence.model_version,
+                evidence.reason_code,
+            ],
+        )?;
+        let history_id = transaction.last_insert_rowid();
+        transaction.execute(
+            r"INSERT INTO udp_capability_current(outlet_id, history_id) VALUES (?1, ?2)
+               ON CONFLICT(outlet_id) DO UPDATE SET history_id=excluded.history_id",
+            params![outlet_id, history_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Creates the initial auditable unknown conclusion when an outlet has no
+    /// UDP evidence yet. Existing conclusions and history are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current summary cannot be checked or written.
+    pub fn ensure_udp_capability(
+        &mut self,
+        outlet_id: &str,
+        label: &str,
+        evidence: &UdpCapabilityEvidence,
+    ) -> Result<(), StoreError> {
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM udp_capability_current WHERE outlet_id=?1)",
+            [outlet_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            self.record_udp_capability(outlet_id, label, evidence)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the newest UDP conclusion for every outlet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored evidence cannot be queried or decoded.
+    pub fn udp_capabilities(&self) -> Result<Vec<UdpCapabilityEvidence>, StoreError> {
+        let mut statement = self.connection.prepare(
+            r"SELECT h.outlet_id, h.status, h.observed_at, h.evidence_version,
+                     h.probe_version, h.model_version, h.reason_code
+              FROM udp_capability_current c
+              JOIN udp_capability_history h ON h.id = c.history_id
+              ORDER BY h.outlet_id",
+        )?;
+        let rows = statement.query_map([], read_udp_capability_row)?;
+        rows.map(|row| decode_udp_capability(row?)).collect()
+    }
+
+    /// Returns append-only UDP evidence for one outlet, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored evidence cannot be queried or decoded.
+    pub fn udp_capability_history(
+        &self,
+        outlet_id: &str,
+        limit: u32,
+    ) -> Result<Vec<UdpCapabilityEvidence>, StoreError> {
+        let mut statement = self.connection.prepare(
+            r"SELECT outlet_id, status, observed_at, evidence_version,
+                     probe_version, model_version, reason_code
+              FROM udp_capability_history
+              WHERE outlet_id=?1
+              ORDER BY id DESC
+              LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![outlet_id, limit], read_udp_capability_row)?;
+        rows.map(|row| decode_udp_capability(row?)).collect()
+    }
+}
+
+type StoredUdpCapability = (String, String, String, u32, String, u32, String);
+
+fn read_udp_capability_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredUdpCapability> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn decode_udp_capability(row: StoredUdpCapability) -> Result<UdpCapabilityEvidence, StoreError> {
+    Ok(UdpCapabilityEvidence {
+        outlet_id: row.0,
+        status: UdpCapabilityStatus::try_from(row.1.as_str())
+            .map_err(StoreError::InvalidUdpCapability)?,
+        observed_at: row.2,
+        evidence_version: row.3,
+        probe_version: row.4,
+        model_version: row.5,
+        reason_code: row.6,
+    })
 }
 
 fn ensure_probe_column(
@@ -585,6 +732,66 @@ mod tests {
         assert_eq!(
             store.recent_route_switches(1).expect("list")[0].reason,
             "priority_policy"
+        );
+    }
+
+    #[test]
+    fn udp_current_summary_updates_without_losing_audit_history_or_tcp_state() {
+        let mut store = GuardianStore::open_in_memory().expect("store");
+        let outlet = outlet();
+        store
+            .record_probe(
+                &outlet,
+                &result(HealthStatus::Healthy, "2026-01-01T00:00:00Z"),
+                2,
+                3,
+            )
+            .expect("TCP probe");
+        for (status, observed_at, reason_code) in [
+            (
+                UdpCapabilityStatus::Unknown,
+                "2026-01-01T00:00:01Z",
+                "not_yet_validated",
+            ),
+            (
+                UdpCapabilityStatus::TcpOnly,
+                "2026-01-01T00:00:02Z",
+                "socks5_udp_associate_rejected",
+            ),
+            (
+                UdpCapabilityStatus::Supported,
+                "2026-01-01T00:00:03Z",
+                "controlled_udp_echo_succeeded",
+            ),
+        ] {
+            store
+                .record_udp_capability(
+                    "a",
+                    "A",
+                    &UdpCapabilityEvidence {
+                        outlet_id: "a".into(),
+                        status,
+                        observed_at: observed_at.into(),
+                        evidence_version: 1,
+                        probe_version: "test-probe-v1".into(),
+                        model_version: 1,
+                        reason_code: reason_code.into(),
+                    },
+                )
+                .expect("record UDP evidence");
+        }
+
+        let current = store.udp_capabilities().expect("current");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].status, UdpCapabilityStatus::Supported);
+        let history = store.udp_capability_history("a", 10).expect("history");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].status, UdpCapabilityStatus::Supported);
+        assert_eq!(history[2].status, UdpCapabilityStatus::Unknown);
+        assert_eq!(
+            store.summaries().expect("TCP summary")[0].last_status,
+            HealthStatus::Healthy,
+            "UDP evidence must not alter Guardian TCP health"
         );
     }
 }

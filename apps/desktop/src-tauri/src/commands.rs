@@ -1,4 +1,12 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
@@ -6,7 +14,8 @@ use tauri::{AppHandle, Manager, State};
 use vpn_hub_core::{
     GuardianConfig, GuardianStore, HealthStatus, LatencySample, OutletConfig, OutletKind,
     OutletSummary, ProbeOutletConfig, ProbeResult, RouteMode, RouteSwitchEvent, StateEvent,
-    SubscriptionCredentialStatus, probe_outlet, run_controller_guardian_cycle,
+    SubscriptionCredentialStatus, UdpCapabilityEvidence, UdpProbeTarget, probe_local_proxy_udp,
+    probe_outlet, run_controller_guardian_cycle, unknown_udp_evidence,
 };
 
 use crate::runtime::{AppState, CoreStatus, PortSnapshot, RoutingStatus};
@@ -21,14 +30,24 @@ pub struct DashboardSnapshot {
     samples: Vec<LatencySample>,
     events: Vec<StateEvent>,
     route_switches: Vec<RouteSwitchEvent>,
+    udp_capabilities: Vec<UdpCapabilityEvidence>,
 }
 
 fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
     let private = state.private_config()?;
-    let store = GuardianStore::open(&guardian.database_path)
+    let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
+    for outlet in private.enabled_outlets() {
+        store
+            .ensure_udp_capability(
+                &outlet.id,
+                &outlet.label,
+                &unknown_udp_evidence(&outlet.id, "not_yet_validated"),
+            )
+            .map_err(|error| format!("无法初始化 UDP 能力状态：{error}"))?;
+    }
     Ok(DashboardSnapshot {
         updated_at: Utc::now().to_rfc3339(),
         entry: AppState::port_snapshot(&private.entry.host, private.entry.port),
@@ -46,6 +65,9 @@ fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
         route_switches: store
             .recent_route_switches(12)
             .map_err(|error| format!("无法读取路由切换事件：{error}"))?,
+        udp_capabilities: store
+            .udp_capabilities()
+            .map_err(|error| format!("无法读取 UDP 能力状态：{error}"))?,
     })
 }
 
@@ -58,6 +80,13 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
 
     for outlet in private.enabled_outlets() {
+        store
+            .ensure_udp_capability(
+                &outlet.id,
+                &outlet.label,
+                &unknown_udp_evidence(&outlet.id, "not_yet_validated"),
+            )
+            .map_err(|error| format!("无法初始化 UDP 能力状态：{error}"))?;
         let probe_outlet_config = virtual_outlet(outlet, &private.entry);
         let result = match &outlet.kind {
             OutletKind::LocalProxy { endpoint } => {
@@ -209,6 +238,101 @@ pub async fn refresh_guardian(state: State<'_, AppState>) -> Result<DashboardSna
     let _transaction = state.lock_routing_transaction().await;
     record_routing_cycle_locked(&state).await?;
     load_dashboard(&state)
+}
+
+#[tauri::command]
+pub async fn revalidate_udp_capabilities(
+    state: State<'_, AppState>,
+) -> Result<DashboardSnapshot, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    if state.controller_client()?.is_some() {
+        return Err(
+            "重新验证 UDP 能力前请先停止由本应用管理的开发核心；避免运行中配置继续使用过期结论"
+                .into(),
+        );
+    }
+    let guardian = GuardianConfig::load(state.guardian_config_path())
+        .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
+    let private = state.private_config()?;
+    let mut store = GuardianStore::open(&guardian.database_path)
+        .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
+    let echo = OwnedUdpEcho::start()?;
+
+    for outlet in private.enabled_outlets() {
+        let evidence = match &outlet.kind {
+            OutletKind::Subscription { .. } => {
+                unknown_udp_evidence(&outlet.id, "subscription_end_to_end_probe_required")
+            }
+            OutletKind::LocalProxy { .. } => {
+                let target = UdpProbeTarget {
+                    address: echo.address(),
+                    request: format!("vpn-hub-udp-probe:{}", outlet.id).into_bytes(),
+                    expected_response: format!("vpn-hub-udp-probe:{}", outlet.id).into_bytes(),
+                };
+                let owned_outlet = outlet.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    probe_local_proxy_udp(&owned_outlet, &[target], Duration::from_millis(1_500))
+                })
+                .await
+                .map_err(|_| "UDP 能力探测任务失败".to_string())?
+            }
+        };
+        store
+            .record_udp_capability(&outlet.id, &outlet.label, &evidence)
+            .map_err(|error| format!("无法写入 UDP 能力证据：{error}"))?;
+    }
+    drop(echo);
+    load_dashboard(&state)
+}
+
+struct OwnedUdpEcho {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl OwnedUdpEcho {
+    fn start() -> Result<Self, String> {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .map_err(|_| "无法创建隔离 UDP 回环目标".to_string())?;
+        let address = socket
+            .local_addr()
+            .map_err(|_| "无法读取隔离 UDP 回环目标".to_string())?;
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .map_err(|_| "无法配置隔离 UDP 回环目标".to_string())?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let mut buffer = [0_u8; 2_048];
+            while !thread_stop.load(Ordering::Acquire) {
+                if let Ok((length, peer)) = socket.recv_from(&mut buffer) {
+                    let _ = socket.send_to(&buffer[..length], peer);
+                }
+            }
+        });
+        Ok(Self {
+            address,
+            stop,
+            thread: Some(thread),
+        })
+    }
+
+    const fn address(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+impl Drop for OwnedUdpEcho {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Ok(wake) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
+            let _ = wake.send_to(&[0], self.address);
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 #[tauri::command]

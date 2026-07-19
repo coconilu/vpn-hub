@@ -6,7 +6,7 @@ use std::{
     fmt::Write as _,
     fs,
     io::{Read, Write},
-    net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket},
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -24,7 +24,9 @@ use vpn_hub_core::{
     ControllerClient, EntryConfig, FAIL_CLOSED_OUTLET, FAIL_CLOSED_PROXY, GuardianStore,
     HealthStatus, MASTER_SELECTOR, MonitorConfig, OutletConfig, OutletKind, PrivateRoutingConfig,
     ProbeOutletConfig, ProbeResult, ResolvedSubscriptionUrls, RouteMode, RoutingEngine,
-    generate_controller_secret, generate_mihomo_config, outlet_proxy_name,
+    UdpCapabilityEvidence, UdpCapabilityMap, UdpCapabilityStatus, UdpProbeTarget,
+    generate_controller_secret, generate_mihomo_config_with_udp_capabilities, outlet_proxy_name,
+    probe_local_proxy_udp,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -158,6 +160,51 @@ impl Drop for FixtureServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         let _ = TcpStream::connect_timeout(&self.address, Duration::from_millis(100));
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct OwnedUdpEcho {
+    address: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl OwnedUdpEcho {
+    fn start() -> Self {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .expect("owned UDP echo must bind a random loopback port");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("owned UDP echo timeout must configure");
+        let address = socket.local_addr().expect("owned UDP echo address");
+        assert!(!FORBIDDEN_PORTS.contains(&address.port()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let mut buffer = [0_u8; 2_048];
+            while !thread_stop.load(Ordering::Acquire) {
+                if let Ok((length, peer)) = socket.recv_from(&mut buffer) {
+                    let _ = socket.send_to(&buffer[..length], peer);
+                }
+            }
+        });
+        Self {
+            address,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for OwnedUdpEcho {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Ok(wake) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
+            let _ = wake.send_to(&[0], self.address);
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -738,10 +785,15 @@ fn fixture_runtime_yaml(
     provider_b: &FixtureServer,
     target: &FixtureServer,
 ) -> String {
-    let (yaml, summary) = generate_mihomo_config(
+    let capabilities = [SUB_A, SUB_B, LOCAL]
+        .into_iter()
+        .map(|outlet_id| (outlet_id.into(), UdpCapabilityStatus::Supported))
+        .collect();
+    let (yaml, summary) = generate_mihomo_config_with_udp_capabilities(
         config,
         &resolved_subscriptions(),
         &generate_controller_secret(),
+        &capabilities,
     )
     .expect("production runtime config generation must succeed");
     assert_eq!(summary.enabled_outlet_count, 3);
@@ -872,6 +924,18 @@ fn monitor() -> MonitorConfig {
     }
 }
 
+fn supported_udp_evidence(outlet_id: &str) -> UdpCapabilityEvidence {
+    UdpCapabilityEvidence {
+        outlet_id: outlet_id.into(),
+        status: UdpCapabilityStatus::Supported,
+        observed_at: "2026-07-19T00:00:00.000Z".into(),
+        evidence_version: 1,
+        probe_version: "isolated-controlled-udp-v1".into(),
+        model_version: 1,
+        reason_code: "controlled_udp_echo_succeeded".into(),
+    }
+}
+
 async fn run_production_cycle(
     controller: &ControllerClient,
     config: &PrivateRoutingConfig,
@@ -902,6 +966,21 @@ async fn run_production_cycle(
             .is_selected(MASTER_SELECTOR, &selected)
             .await
             .expect("real Controller selector state must be readable")
+    );
+    let udp_target = store
+        .udp_capabilities()
+        .expect("UDP capability summary must be readable")
+        .into_iter()
+        .find(|evidence| evidence.outlet_id == final_outlet)
+        .filter(|evidence| evidence.status == UdpCapabilityStatus::Supported)
+        .map_or(FAIL_CLOSED_PROXY.to_string(), |evidence| {
+            outlet_proxy_name(&evidence.outlet_id)
+        });
+    assert!(
+        controller
+            .is_selected(vpn_hub_core::UDP_SELECTOR, &udp_target)
+            .await
+            .expect("real UDP selector state must be readable")
     );
     selected
 }
@@ -1139,6 +1218,93 @@ async fn occupied_listener_is_rejected_without_terminating_its_owner() {
 }
 
 #[tokio::test]
+#[ignore = "requires the repository-pinned Mihomo binary; uses only owned loopback UDP fixtures and random ports"]
+async fn isolated_udp_selector_routes_only_evidence_backed_outlet() {
+    let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .expect("workspace root must resolve");
+    let executable = pinned_mihomo(&workspace);
+    let data = TempDir::new().expect("UDP data directory must exist");
+    let inner =
+        OwnedFixtureProxy::start(&executable, &data.path().join("udp-capable-inner"), None).await;
+    let entry = PortLease::reserve();
+    let controller = PortLease::reserve();
+    let entry_port = entry.port();
+    let controller_port = controller.port();
+    entry.release();
+    controller.release();
+
+    let mut config = PrivateRoutingConfig::default();
+    config.entry = EntryConfig {
+        host: Ipv4Addr::LOCALHOST.to_string(),
+        port: entry_port,
+    };
+    config.controller_port = controller_port;
+    config.outlets = vec![local(LOCAL, inner.port())];
+    let capabilities = UdpCapabilityMap::from([(LOCAL.into(), UdpCapabilityStatus::Supported)]);
+    let secret = generate_controller_secret();
+    let (yaml, summary) = generate_mihomo_config_with_udp_capabilities(
+        &config,
+        &ResolvedSubscriptionUrls::new(),
+        &secret,
+        &capabilities,
+    )
+    .expect("UDP constrained config must generate");
+    assert!(yaml.contains("NETWORK,UDP,VPN-HUB-UDP"));
+    assert!(!yaml.contains("DIRECT"));
+    assert_eq!(summary.udp_supported_outlet_count, 1);
+    let runtime_directory = data.path().join("udp-outer");
+    fs::create_dir_all(&runtime_directory).expect("UDP runtime directory");
+    let config_path = runtime_directory.join("config.yaml");
+    fs::write(&config_path, yaml).expect("UDP runtime config");
+    let mut outer = OwnedMihomo::start(
+        &executable,
+        &runtime_directory,
+        &config_path,
+        entry_port,
+        controller_port,
+        &secret,
+    )
+    .await
+    .expect("pinned Mihomo must accept the UDP rule and selector syntax");
+    let controller_client = ControllerClient::new(
+        &format!("http://127.0.0.1:{controller_port}"),
+        secret.clone(),
+        2_000,
+    )
+    .expect("owned UDP controller client");
+    controller_client
+        .select(vpn_hub_core::UDP_SELECTOR, &outlet_proxy_name(LOCAL))
+        .await
+        .expect("Guardian-equivalent UDP selection must succeed");
+    let echo = OwnedUdpEcho::start();
+    let target = UdpProbeTarget {
+        address: echo.address,
+        request: b"isolated-udp-nonce".to_vec(),
+        expected_response: b"isolated-udp-nonce".to_vec(),
+    };
+    let inner_result = probe_local_proxy_udp(
+        &local("inner-entry", inner.port()),
+        std::slice::from_ref(&target),
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        inner_result.status,
+        UdpCapabilityStatus::Supported,
+        "owned inner Mihomo fixture must prove SOCKS5 UDP before testing the constrained outer route"
+    );
+    let result = probe_local_proxy_udp(
+        &local("outer-entry", entry_port),
+        &[target],
+        Duration::from_secs(2),
+    );
+    assert_eq!(result.status, UdpCapabilityStatus::Supported);
+    assert_eq!(result.reason_code, "controlled_udp_echo_succeeded");
+    outer.finish().expect("UDP outer Mihomo must stop cleanly");
+}
+
+#[tokio::test]
 #[ignore = "requires the repository-pinned Mihomo binary; uses only owned loopback fixtures and random ports"]
 async fn panic_unwind_cleanup_remains_bounded_and_non_panicking() {
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1273,6 +1439,15 @@ async fn isolated_dynamic_fault_runtime() {
 
     let database_path = data.path().join("guardian.db");
     let mut store = GuardianStore::open(&database_path).expect("isolated SQLite must open");
+    for outlet in config.enabled_outlets() {
+        store
+            .record_udp_capability(
+                &outlet.id,
+                &outlet.label,
+                &supported_udp_evidence(&outlet.id),
+            )
+            .expect("isolated supported UDP evidence must persist");
+    }
     let engine = std::sync::Mutex::new(RoutingEngine::new(RouteMode::Priority, None));
 
     controller
