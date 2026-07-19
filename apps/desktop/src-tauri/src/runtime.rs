@@ -1504,7 +1504,16 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         );
     }
 
+    #[test]
+    fn listener_ownership_rejects_reachable_unknown_pid() {
+        let lease = ProbePortLease::reserve().expect("random loopback lease");
+        assert!(!matches!(lease.port(), 3_666 | 6_666));
+        assert!(owns_loopback_listeners(std::process::id(), &[lease.port()]));
+        assert!(!owns_loopback_listeners(u32::MAX, &[lease.port()]));
+    }
+
     #[tokio::test]
+    #[ignore = "requires repository-pinned Mihomo binary; uses only owned random loopback ports and a deterministic unknown-owner race"]
     async fn final_entry_port_race_fails_without_terminating_unknown_owner() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
