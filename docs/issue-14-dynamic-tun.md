@@ -28,6 +28,8 @@
 | 动态增删 outlet | settings preview generation 随草稿指纹变化；计划只包含当前启用且登记的 outlet，不残留已删除身份 |
 | all-down | IPv4/IPv6 × TCP/UDP/DNS 全部 `Rejected`，不生成或回退 `DIRECT` |
 
+交易层只接受 `TunPlanBuilder` 产生的 opaque validated plan：原始策略字段私有，类型不实现 `Deserialize`，因此 IPC、journal 或其他不可信字节不能直接构造交易输入。Builder 同时保留不参与序列化的 canonical outlet provenance；每次进入 transaction/backend 前都会从 registry、local endpoint 与 exact executable rule 重建并比对。即使攻击者把 subscription 的 registry/eligible 或 local 的 declaration/endpoint/process/eligible 一起改到内部自洽，也会因不匹配 Builder provenance 被拒绝；该 provenance 是完整结构，不是可随字段一起替换的 hash。
+
 ## 进程身份与 disposition
 
 “排除清单”不是“这些进程可以任意直连”。计划把身份与网络 disposition 分离：
@@ -70,7 +72,7 @@ flowchart LR
 
 签名 installer 必须预置专用 `tun-authority.lease`，只允许 LocalService/SYSTEM/Administrators 写入，交互用户不能替换或删除；Helper 不会在关键路径创建它。事务先取得文件级排他 OS lock，再读取 journal 或创建 snapshot，并持有到 apply/recover/clear 完成；不能锁 journal inode，因为 journal 会原子替换。authority wrapper 同时校验 install ID、authority ID 与 generation。
 
-每个 OS 边界后先持久化 phase，再进入下一阶段。journal 使用同目录临时文件、文件和目录 durability barrier 与 Windows 可替换的备份策略；主文件损坏时可读相同的 `.bak`。第二 authority、stale generation 和未恢复的旧 journal 都被拒绝。Disable 不能走 apply，也绝不把当前已启用状态拍成恢复目标；它只能恢复已有 committed Enable snapshot，验证恢复后写入 `restored`，最后清理 journal。恢复或清理失败可安全重试。
+每个 OS 边界后先持久化 phase，再进入下一阶段。journal 使用同目录临时文件、文件和目录 durability barrier 与 Windows 可替换的备份策略；主文件损坏时可读相同的 `.bak`。第二 authority、stale generation 和未恢复的旧 journal 都被拒绝。所有 rollback 都必须在 restore 后调用 `verify_restored`；只有验证成功才能写 `rolled_back`。restore 或验证失败统一返回 `RollbackFailed`，保留原 phase 的 journal；即使首次 journal save 失败，也会在回滚失败时 best-effort 保存 snapshot 状态供重启恢复。Disable 不能走 apply，也绝不把当前已启用状态拍成恢复目标；它只能恢复已有 committed Enable snapshot，验证恢复后写入 `restored`，最后清理 journal。恢复或清理失败可安全重试。
 
 升级与卸载必须严格执行 `EnterFailClosed → StopOwnedJob → RestoreTunSnapshot → cleanup/replace → verify`，任一步失败即中止后续删除或替换。
 
@@ -82,9 +84,11 @@ journal 只允许长度受限的 opaque route/DNS/adapter/TUN record；单条、
 - 多 subscription / 多 local_proxy、动态删除/新增、stable ID 和 exact identity。
 - GUI/Helper deny、Core 最小上游、local client 精确基础设施 bypass、unknown process no-touch。
 - canonical outlet registry 与 TCP/UDP eligible subset 防篡改；本地 endpoint 和 executable identity 一一对应；plan 不含订阅 secret。
+- opaque plan 不可反序列化或由外部改写；自洽 subscription 注入及自洽 local declaration/endpoint/process 注入均被 canonical Builder provenance 拒绝。
 - TCP-only 与 UDP evidence 分离；Core 会拒绝 outlet ID、evidence/probe/model 版本、配置 fingerprint/generation 或状态被篡改的证据；all-down 全矩阵 Reject。
 - 专用 authority 文件必须预置；真实双 handle 排他锁、plan identity/generation 在 snapshot 前拒绝。
 - snapshot/stage/apply/verify/commit 每个 OS 失败点与每个 journal save 失败点回滚。
+- 所有 backend mutation 与首次/后续 journal save 的 rollback 都执行 restore + verify；验证失败保留 journal，并覆盖 transaction 重建后的 recover 重试。
 - Disable 不重新 snapshot；crash/cancel/restart/uninstall 统一恢复并验证 committed Enable snapshot，`restored` 保存/清理失败均可幂等重试。
 - 真实 `FileTunJournalStore` 连续多 phase save/load/backup/clear（仅文件系统，不执行网络系统调用）。
 

@@ -230,26 +230,39 @@ pub struct ProcessRule {
     pub policy: ProcessNetworkPolicy,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CanonicalOutlet {
+    transport: OutletTransport,
+    loopback_endpoint: Option<String>,
+    executable: Option<ExecutableIdentity>,
+}
+
+/// Opaque, validated TUN transaction input. Only `TunPlanBuilder` can create a
+/// plan outside this module; untrusted serialized data cannot deserialize into
+/// this type and its raw policy fields cannot be mutated by callers.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct TunPlan {
-    pub schema_version: u16,
-    pub install_id: String,
-    pub authority_id: String,
-    pub generation: u64,
-    pub action: TunPlanAction,
-    pub consent_version: Option<u16>,
-    pub all_down: bool,
-    pub strict_route: bool,
-    pub dns_hijack_tcp: bool,
-    pub dns_hijack_udp: bool,
-    pub process_rules: Vec<ProcessRule>,
-    pub outlet_registry: Vec<OutletDeclaration>,
-    pub local_endpoints: BTreeMap<String, String>,
-    pub tcp_eligible_outlets: Vec<String>,
-    pub udp_eligible_outlets: Vec<String>,
-    pub leak_checks: Vec<LeakCheck>,
+    schema_version: u16,
+    install_id: String,
+    authority_id: String,
+    generation: u64,
+    action: TunPlanAction,
+    consent_version: Option<u16>,
+    all_down: bool,
+    strict_route: bool,
+    dns_hijack_tcp: bool,
+    dns_hijack_udp: bool,
+    process_rules: Vec<ProcessRule>,
+    outlet_registry: Vec<OutletDeclaration>,
+    local_endpoints: BTreeMap<String, String>,
+    tcp_eligible_outlets: Vec<String>,
+    udp_eligible_outlets: Vec<String>,
+    leak_checks: Vec<LeakCheck>,
+    /// Full, non-secret builder provenance used to reject a post-build policy
+    /// injection even when all public policy vectors are changed consistently.
+    #[serde(skip)]
+    canonical_outlets: BTreeMap<String, CanonicalOutlet>,
 }
 
 impl TunPlan {
@@ -372,6 +385,32 @@ impl TunPlan {
         {
             return Err(TunError::LocalProcessIdentityRequired);
         }
+        let observed_outlets = self
+            .outlet_registry
+            .iter()
+            .map(|declaration| {
+                let executable = self
+                    .process_rules
+                    .iter()
+                    .find(|rule| {
+                        rule.identity.role == ExecutableRole::LocalOutlet
+                            && rule.identity.outlet_id.as_deref()
+                                == Some(declaration.outlet_id.as_str())
+                    })
+                    .map(|rule| rule.identity.clone());
+                (
+                    declaration.outlet_id.clone(),
+                    CanonicalOutlet {
+                        transport: declaration.transport,
+                        loopback_endpoint: declaration.loopback_endpoint.clone(),
+                        executable,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        if observed_outlets != self.canonical_outlets {
+            return Err(TunError::CanonicalOutletMismatch);
+        }
         let tcp = validate_unique_ids(&self.tcp_eligible_outlets)?;
         let udp = validate_unique_ids(&self.udp_eligible_outlets)?;
         let expected_all_down = self.action == TunPlanAction::Enable && tcp.is_empty();
@@ -429,6 +468,7 @@ impl TunPlanBuilder<'_> {
                 tcp_eligible_outlets: Vec::new(),
                 udp_eligible_outlets: Vec::new(),
                 leak_checks: leak_matrix(false, false),
+                canonical_outlets: BTreeMap::new(),
             };
             plan.validate()?;
             return Ok(plan);
@@ -468,6 +508,7 @@ impl TunPlanBuilder<'_> {
 
         let mut outlet_ids = BTreeSet::new();
         let mut outlet_registry = Vec::new();
+        let mut canonical_outlets = BTreeMap::new();
         let mut endpoints = BTreeMap::new();
         let mut tcp_eligible_outlets = Vec::new();
         let mut udp_eligible_outlets = Vec::new();
@@ -495,6 +536,14 @@ impl TunPlanBuilder<'_> {
                         transport: OutletTransport::Subscription,
                         loopback_endpoint: None,
                     });
+                    canonical_outlets.insert(
+                        outlet_id.to_owned(),
+                        CanonicalOutlet {
+                            transport: OutletTransport::Subscription,
+                            loopback_endpoint: None,
+                            executable: None,
+                        },
+                    );
                 }
                 OutletKind::LocalProxy { endpoint } => {
                     validate_loopback_endpoint(endpoint)?;
@@ -518,6 +567,14 @@ impl TunPlanBuilder<'_> {
                         identity: executable.clone(),
                         policy: ProcessNetworkPolicy::RegisteredOutletInfrastructureBypass,
                     });
+                    canonical_outlets.insert(
+                        outlet_id.to_owned(),
+                        CanonicalOutlet {
+                            transport: OutletTransport::LocalProxy,
+                            loopback_endpoint: Some(endpoint.clone()),
+                            executable: Some(executable.clone()),
+                        },
+                    );
                 }
             }
         }
@@ -540,6 +597,7 @@ impl TunPlanBuilder<'_> {
             tcp_eligible_outlets,
             udp_eligible_outlets,
             leak_checks: leak_matrix(!all_down, has_udp),
+            canonical_outlets,
         };
         plan.validate()?;
         Ok(plan)
@@ -820,10 +878,7 @@ impl<B: TunBackend, J: TunJournalStore> TunTransaction<B, J> {
             snapshot,
         };
         if let Err(error) = self.journal.save(&state) {
-            self.backend
-                .restore(&state.snapshot)
-                .map_err(|_| TunError::RollbackFailed)?;
-            return Err(error);
+            return self.rollback_after_failure(&mut state, error, false);
         }
         self.step(&mut state, TunJournalPhase::Staged, |backend| {
             backend.stage(plan)
@@ -926,11 +981,11 @@ impl<B: TunBackend, J: TunJournalStore> TunTransaction<B, J> {
         F: FnOnce(&mut B) -> Result<(), TunError>,
     {
         if let Err(error) = operation(&mut self.backend) {
-            return self.rollback_after_failure(state, error);
+            return self.rollback_after_failure(state, error, true);
         }
         state.phase = next;
         if let Err(error) = self.journal.save(state) {
-            return self.rollback_after_failure(state, error);
+            return self.rollback_after_failure(state, error, true);
         }
         Ok(())
     }
@@ -939,10 +994,16 @@ impl<B: TunBackend, J: TunJournalStore> TunTransaction<B, J> {
         &mut self,
         state: &mut TunJournal,
         cause: TunError,
+        journal_persisted: bool,
     ) -> Result<T, TunError> {
-        self.backend
-            .restore(&state.snapshot)
-            .map_err(|_| TunError::RollbackFailed)?;
+        if self.backend.restore(&state.snapshot).is_err()
+            || self.backend.verify_restored(&state.snapshot).is_err()
+        {
+            if !journal_persisted {
+                let _ = self.journal.save(state);
+            }
+            return Err(TunError::RollbackFailed);
+        }
         state.phase = TunJournalPhase::RolledBack;
         self.journal
             .save(state)
@@ -1022,6 +1083,8 @@ pub enum TunError {
     InvalidPlan,
     #[error("TUN leak policy is invalid")]
     LeakPolicyInvalid,
+    #[error("TUN outlet policy does not match its validated builder provenance")]
+    CanonicalOutletMismatch,
     #[error("TUN state serialization is unsafe")]
     UnsafeSerializedState,
     #[error("another authority owns the TUN transaction")]
@@ -1517,7 +1580,7 @@ mod tests {
             .retain(|item| item.outlet_id != "sub-a");
         assert_eq!(
             missing_declaration.validate(),
-            Err(TunError::LeakPolicyInvalid)
+            Err(TunError::CanonicalOutletMismatch)
         );
 
         let mut orphan_local_declaration = original.clone();
@@ -1531,6 +1594,47 @@ mod tests {
         assert_eq!(
             orphan_local_declaration.validate(),
             Err(TunError::InvalidOutlet)
+        );
+
+        let mut self_consistent_subscription_injection = original.clone();
+        self_consistent_subscription_injection
+            .outlet_registry
+            .push(OutletDeclaration {
+                outlet_id: "injected-sub".into(),
+                transport: OutletTransport::Subscription,
+                loopback_endpoint: None,
+            });
+        self_consistent_subscription_injection
+            .tcp_eligible_outlets
+            .push("injected-sub".into());
+        assert_eq!(
+            self_consistent_subscription_injection.validate(),
+            Err(TunError::CanonicalOutletMismatch)
+        );
+
+        let mut self_consistent_local_injection = original.clone();
+        self_consistent_local_injection
+            .outlet_registry
+            .push(OutletDeclaration {
+                outlet_id: "injected-local".into(),
+                transport: OutletTransport::LocalProxy,
+                loopback_endpoint: Some("socks5://127.0.0.1:42664".into()),
+            });
+        self_consistent_local_injection
+            .local_endpoints
+            .insert("injected-local".into(), "socks5://127.0.0.1:42664".into());
+        self_consistent_local_injection
+            .process_rules
+            .push(ProcessRule {
+                identity: identity(ExecutableRole::LocalOutlet, Some("injected-local"), 'f'),
+                policy: ProcessNetworkPolicy::RegisteredOutletInfrastructureBypass,
+            });
+        self_consistent_local_injection
+            .tcp_eligible_outlets
+            .push("injected-local".into());
+        assert_eq!(
+            self_consistent_local_injection.validate(),
+            Err(TunError::CanonicalOutletMismatch)
         );
 
         let mut duplicate_vector = original;
@@ -1635,6 +1739,13 @@ mod tests {
         fn fail(point: FailurePoint) -> Self {
             Self {
                 failures: VecDeque::from([point]),
+                ..Self::default()
+            }
+        }
+
+        fn fail_in_order(points: impl IntoIterator<Item = FailurePoint>) -> Self {
+            Self {
+                failures: points.into_iter().collect(),
                 ..Self::default()
             }
         }
@@ -1768,7 +1879,7 @@ mod tests {
                 authority,
             );
             assert!(transaction.apply(&plan).is_err());
-            assert_eq!(transaction.backend.events.last(), Some(&"restore"));
+            assert_eq!(transaction.backend.events.last(), Some(&"verify-restored"));
             assert_eq!(
                 transaction.journal.state.as_ref().map(|state| state.phase),
                 Some(TunJournalPhase::RolledBack)
@@ -1787,8 +1898,103 @@ mod tests {
             let (_authority_directory, authority) = test_authority(plan.generation);
             let mut transaction = TunTransaction::new(FakeBackend::default(), journal, authority);
             assert!(transaction.apply(&plan).is_err());
-            assert_eq!(transaction.backend.events.last(), Some(&"restore"));
+            assert_eq!(transaction.backend.events.last(), Some(&"verify-restored"));
         }
+    }
+
+    #[test]
+    fn rollback_verification_failure_keeps_every_backend_boundary_recoverable() {
+        let plan = plan_with(&outlets()).unwrap();
+        for point in [
+            FailurePoint::Stage,
+            FailurePoint::Apply,
+            FailurePoint::Verify,
+            FailurePoint::Commit,
+        ] {
+            let (_authority_directory, authority) = test_authority(plan.generation);
+            let mut transaction = TunTransaction::new(
+                FakeBackend::fail_in_order([point, FailurePoint::VerifyRestored]),
+                MemoryJournal::default(),
+                authority,
+            );
+            assert_eq!(transaction.apply(&plan), Err(TunError::RollbackFailed));
+            assert_ne!(
+                transaction.journal.state.as_ref().map(|state| state.phase),
+                Some(TunJournalPhase::RolledBack)
+            );
+            assert!(transaction.recover("install-a", "helper-a").unwrap());
+            assert!(transaction.journal.state.is_none());
+        }
+    }
+
+    #[test]
+    fn rollback_verification_failure_keeps_every_journal_boundary_recoverable() {
+        let plan = plan_with(&outlets()).unwrap();
+        for save in 1..=5 {
+            let journal = MemoryJournal {
+                fail_on_save: Some(save),
+                ..MemoryJournal::default()
+            };
+            let (_authority_directory, authority) = test_authority(plan.generation);
+            let mut transaction = TunTransaction::new(
+                FakeBackend::fail(FailurePoint::VerifyRestored),
+                journal,
+                authority,
+            );
+            assert_eq!(transaction.apply(&plan), Err(TunError::RollbackFailed));
+            assert!(transaction.journal.state.is_some());
+            assert_ne!(
+                transaction.journal.state.as_ref().map(|state| state.phase),
+                Some(TunJournalPhase::RolledBack)
+            );
+            assert!(transaction.recover("install-a", "helper-a").unwrap());
+            assert!(transaction.journal.state.is_none());
+        }
+    }
+
+    #[test]
+    fn first_journal_save_and_rollback_verify_failure_survive_transaction_restart() {
+        let plan = plan_with(&outlets()).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let authority_path = temporary.path().join("tun-authority.lease");
+        fs::write(&authority_path, b"preprovisioned-by-installer").unwrap();
+        let authority = TunAuthorityGuard::acquire_at(
+            &authority_path,
+            &plan.install_id,
+            &plan.authority_id,
+            plan.generation,
+        )
+        .unwrap();
+        let mut transaction = TunTransaction::new(
+            FakeBackend::fail(FailurePoint::VerifyRestored),
+            MemoryJournal {
+                fail_on_save: Some(1),
+                ..MemoryJournal::default()
+            },
+            authority,
+        );
+        assert_eq!(transaction.apply(&plan), Err(TunError::RollbackFailed));
+        assert_eq!(
+            transaction.journal.state.as_ref().map(|state| state.phase),
+            Some(TunJournalPhase::Snapshotted)
+        );
+
+        let TunTransaction {
+            journal, authority, ..
+        } = transaction;
+        drop(authority);
+        let restarted_authority = TunAuthorityGuard::acquire_at(
+            &authority_path,
+            &plan.install_id,
+            &plan.authority_id,
+            plan.generation,
+        )
+        .unwrap();
+        let mut restarted =
+            TunTransaction::new(FakeBackend::default(), journal, restarted_authority);
+        assert!(restarted.recover("install-a", "helper-a").unwrap());
+        assert!(restarted.journal.state.is_none());
+        assert_eq!(restarted.backend.events, ["restore", "verify-restored"]);
     }
 
     #[test]
