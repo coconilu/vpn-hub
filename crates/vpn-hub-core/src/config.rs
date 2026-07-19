@@ -78,9 +78,25 @@ impl GuardianConfig {
     ///
     /// Returns a sanitized validation, serialization, or write failure.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
+        self.save_with_operations(path, &crate::SystemDurableFileOps)
+    }
+
+    /// Saves through an injectable durable I/O boundary. This is public so a
+    /// multi-file transaction can prove crash behavior at every persistence
+    /// barrier without changing the serialized format.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized validation, serialization, or write failure.
+    pub fn save_with_operations<O: crate::DurableFileOps + ?Sized>(
+        &self,
+        path: impl AsRef<Path>,
+        operations: &O,
+    ) -> Result<(), ConfigError> {
         self.validate()?;
         let content = toml::to_string_pretty(self).map_err(|_| ConfigError::Serialize)?;
-        atomic_save(path.as_ref(), content.as_bytes())
+        crate::durable_atomic_save_with_backup(path.as_ref(), content.as_bytes(), operations)
+            .map_err(|_| ConfigError::Write)
     }
 
     /// Loads a standalone Guardian configuration that must contain at least
@@ -216,30 +232,6 @@ fn default_degraded_latency_ms() -> u64 {
 }
 const fn default_true() -> bool {
     true
-}
-
-fn atomic_save(path: &Path, content: &[u8]) -> Result<(), ConfigError> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|_| ConfigError::Write)?;
-    }
-    let temporary = path.with_extension("toml.tmp");
-    let backup = path.with_extension("toml.bak");
-    fs::write(&temporary, content).map_err(|_| ConfigError::Write)?;
-    if path.exists() {
-        if backup.exists() {
-            fs::remove_file(&backup).map_err(|_| ConfigError::Write)?;
-        }
-        fs::rename(path, &backup).map_err(|_| ConfigError::Write)?;
-    }
-    if fs::rename(&temporary, path).is_err() {
-        if backup.exists() {
-            let _ = fs::rename(&backup, path);
-        }
-        let _ = fs::remove_file(&temporary);
-        return Err(ConfigError::Write);
-    }
-    fs::copy(path, &backup).map_err(|_| ConfigError::Write)?;
-    Ok(())
 }
 
 #[cfg(test)]

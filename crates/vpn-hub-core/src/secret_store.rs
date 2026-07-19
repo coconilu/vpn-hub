@@ -760,7 +760,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
 "#
         );
         std::fs::write(&path, &original).expect("legacy config");
-        std::fs::create_dir(path.with_extension("toml.tmp")).expect("block atomic temp file");
+        std::fs::create_dir(path.with_extension("toml.new")).expect("block atomic temp file");
         let store = MemorySecretStore::default();
 
         assert_eq!(

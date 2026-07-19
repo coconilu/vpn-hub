@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::Write as _,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -11,16 +10,18 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use vpn_hub_core::{
-    ControllerClient, CredentialState, EntryConfig, FAIL_CLOSED_PROXY, GuardianConfig,
-    GuardianStore, MASTER_SELECTOR, OutletConfig, OutletConfigSummary, OutletKind,
-    PrivateRoutingConfig, ResolvedSubscriptionUrls, RouteDecision, RouteMode, RoutingEngine,
-    RoutingSession, RoutingStateError, SafeSettingsView, SecretStore, SettingsDiff, SettingsDraft,
-    SubscriptionCredentialStatus, SubscriptionSecrets, SystemSecretStore, UDP_SELECTOR,
-    UdpCapabilityEvidence, UdpCapabilityMap, UdpProbeTarget, ValidationIssue,
-    classify_subscription_udp, generate_controller_secret, generate_mihomo_config,
-    generate_mihomo_config_with_udp_capabilities, generate_mihomo_startup_config,
-    migrate_legacy_subscription, normalize_loopback_host, outlet_proxy_name,
-    probe_authorized_socks5_udp, unknown_udp_evidence, validate_subscription_url,
+    ControllerClient, CredentialState, DurableFileOps, EntryConfig, FAIL_CLOSED_PROXY,
+    GuardianConfig, GuardianStore, HistoryOutletKind, HistoryOutletSnapshot, MASTER_SELECTOR,
+    OutletConfig, OutletConfigSummary, OutletKind, PrivateRoutingConfig, ResolvedSubscriptionUrls,
+    RouteDecision, RouteMode, RoutingEngine, RoutingSession, RoutingStateError, SafeSettingsView,
+    SecretStore, SettingsDiff, SettingsDraft, SubscriptionCredentialStatus, SubscriptionSecrets,
+    SystemDurableFileOps, SystemSecretStore, UDP_SELECTOR, UdpCapabilityEvidence, UdpCapabilityMap,
+    UdpProbeTarget, ValidationIssue, classify_subscription_udp, durable_atomic_save_with_backup,
+    durable_remove_if_exists, durable_replace, durable_write_new, generate_controller_secret,
+    generate_mihomo_config, generate_mihomo_config_with_udp_capabilities,
+    generate_mihomo_startup_config, migrate_legacy_subscription, normalize_loopback_host,
+    outlet_proxy_name, probe_authorized_socks5_udp, unknown_udp_evidence,
+    validate_subscription_url,
 };
 
 const DEFAULT_GUARDIAN_CONFIG: &str = r#"database_path = "guardian-desktop.db"
@@ -60,7 +61,7 @@ pub struct RoutingStatus {
     pub message: String,
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialMutationAction {
     Set,
@@ -76,6 +77,22 @@ pub struct CredentialMutation {
     pub credential: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialMutationIntent {
+    pub subscription_id: String,
+    pub action: CredentialMutationAction,
+}
+
+#[derive(Deserialize)]
+pub struct SettingsPreviewRequest {
+    pub draft: SettingsDraft,
+    pub credential_intents: Vec<CredentialMutationIntent>,
+    pub active_outlet_replacement: Option<String>,
+    #[serde(default)]
+    pub fail_closed_on_removed_active: bool,
+    pub request_fingerprint: String,
+}
+
 #[derive(Deserialize)]
 pub struct SettingsApplyRequest {
     pub draft: SettingsDraft,
@@ -84,6 +101,7 @@ pub struct SettingsApplyRequest {
     pub active_outlet_replacement: Option<String>,
     #[serde(default)]
     pub fail_closed_on_removed_active: bool,
+    pub preview_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -91,6 +109,7 @@ pub struct SettingsPreview {
     pub diff: SettingsDiff,
     pub issues: Vec<ValidationIssue>,
     pub can_apply: bool,
+    pub request_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,6 +139,17 @@ enum JournalSecretAction {
     Delete,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum JournalRoutingAction {
+    #[default]
+    Keep,
+    Replace {
+        outlet_id: String,
+    },
+    FailClosed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JournalSecretOperation {
     current_ref: String,
@@ -137,12 +167,236 @@ struct SettingsTransactionJournal {
     file_existed: [bool; 4],
     target_retention_days: u32,
     secret_operations: Vec<JournalSecretOperation>,
+    #[serde(default)]
+    routing_action: JournalRoutingAction,
 }
 
 struct PendingSecretOperation {
     journal: JournalSecretOperation,
     credential: Option<String>,
     previous: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SettingsFingerprintBasis<'a> {
+    draft: &'a SettingsDraft,
+    active_outlet_replacement: Option<&'a str>,
+    fail_closed_on_removed_active: bool,
+    credential_intents: &'a [CredentialMutationIntent],
+}
+
+fn settings_request_fingerprint(
+    draft: &SettingsDraft,
+    active_outlet_replacement: Option<&str>,
+    fail_closed_on_removed_active: bool,
+    credential_intents: &[CredentialMutationIntent],
+) -> Result<String, String> {
+    let mut intents = credential_intents.to_vec();
+    intents.sort_by(|left, right| {
+        left.subscription_id
+            .cmp(&right.subscription_id)
+            .then_with(|| action_order(left.action).cmp(&action_order(right.action)))
+    });
+    let canonical = serde_json::to_vec(&SettingsFingerprintBasis {
+        draft,
+        active_outlet_replacement,
+        fail_closed_on_removed_active,
+        credential_intents: &intents,
+    })
+    .map_err(|_| "无法计算设置预览指纹".to_string())?;
+    let hash = canonical
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    Ok(format!("{hash:016x}"))
+}
+
+const fn action_order(action: CredentialMutationAction) -> u8 {
+    match action {
+        CredentialMutationAction::Delete => 0,
+        CredentialMutationAction::Set => 1,
+    }
+}
+
+fn validate_credential_intents(
+    candidate: &PrivateRoutingConfig,
+    intents: &[CredentialMutationIntent],
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let subscriptions = candidate
+        .outlets
+        .iter()
+        .filter(|outlet| matches!(outlet.kind, OutletKind::Subscription { .. }))
+        .map(|outlet| outlet.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    for intent in intents {
+        if !subscriptions.contains(intent.subscription_id.as_str()) {
+            issues.push(ValidationIssue::new(
+                "credential_intents",
+                "credential_subscription_unknown",
+                "凭据动作引用了未知订阅",
+            ));
+        }
+        if !seen.insert(intent.subscription_id.as_str()) {
+            issues.push(ValidationIssue::new(
+                "credential_intents",
+                "credential_intent_duplicate",
+                "同一订阅只能预览一个凭据动作",
+            ));
+        }
+    }
+}
+
+fn settings_routing_action(
+    candidate: &PrivateRoutingConfig,
+    current_active: Option<&str>,
+    replacement: Option<&str>,
+    fail_closed: bool,
+    issues: &mut Vec<ValidationIssue>,
+) -> JournalRoutingAction {
+    if replacement.is_some() && fail_closed {
+        issues.push(ValidationIssue::new(
+            "active_outlet_replacement",
+            "routing_action_conflict",
+            "替代出口与明确 Fail Closed 不能同时选择",
+        ));
+        return JournalRoutingAction::Keep;
+    }
+    let replacement_valid = replacement.is_some_and(|replacement| {
+        candidate
+            .enabled_outlets()
+            .any(|outlet| outlet.id == replacement)
+    });
+    if replacement.is_some() && !replacement_valid {
+        issues.push(ValidationIssue::new(
+            "active_outlet_replacement",
+            "active_outlet_replacement_invalid",
+            "替代出口必须是候选设置中的启用出口",
+        ));
+    }
+    let active_removed = current_active.is_some_and(|active| {
+        !candidate
+            .enabled_outlets()
+            .any(|outlet| outlet.id == active)
+    });
+    if !active_removed {
+        return JournalRoutingAction::Keep;
+    }
+    if replacement_valid {
+        return JournalRoutingAction::Replace {
+            outlet_id: replacement.unwrap_or_default().into(),
+        };
+    }
+    if fail_closed {
+        return JournalRoutingAction::FailClosed;
+    }
+    issues.push(ValidationIssue::new(
+        "active_outlet_replacement",
+        "active_outlet_replacement_required",
+        "删除或停用当前出口前，必须选择启用的替代出口或明确进入 Fail Closed",
+    ));
+    JournalRoutingAction::Keep
+}
+
+fn generate_secret_free_validation_config(
+    candidate: &PrivateRoutingConfig,
+) -> Result<(String, vpn_hub_core::RuntimeConfigSummary), String> {
+    let mut isolated = candidate.clone();
+    let mut id_mapping = HashMap::new();
+    let mut resolved = ResolvedSubscriptionUrls::new();
+    for (index, outlet) in isolated.outlets.iter_mut().enumerate() {
+        let original_id = outlet.id.clone();
+        let validation_id = match &outlet.kind {
+            OutletKind::Subscription { .. } => format!("validation-sub-{index}"),
+            OutletKind::LocalProxy { .. } => format!("validation-local-{index}"),
+        };
+        id_mapping.insert(original_id, validation_id.clone());
+        outlet.id = validation_id;
+        outlet.label = format!("Validation Outlet {index}");
+        if let OutletKind::Subscription {
+            secret_ref,
+            provider_update_seconds: _,
+        } = &mut outlet.kind
+        {
+            *secret_ref = format!("validation-ref-{index}");
+            resolved.insert(
+                secret_ref.clone(),
+                format!("https://settings-validation.invalid/subscription/{index}"),
+            );
+        }
+    }
+    isolated.manual_outlet = isolated
+        .manual_outlet
+        .as_deref()
+        .and_then(|id| id_mapping.get(id).cloned());
+    generate_mihomo_config(
+        &isolated,
+        &resolved,
+        "settings-validation-controller-placeholder",
+    )
+    .map_err(|_| "无法生成候选 Fail Closed Mihomo 配置".to_string())
+}
+
+fn apply_recovered_routing_action(
+    engine: &mut RoutingEngine,
+    candidate: &PrivateRoutingConfig,
+    action: Option<&JournalRoutingAction>,
+) {
+    match action {
+        Some(JournalRoutingAction::Replace { outlet_id })
+            if candidate
+                .enabled_outlets()
+                .any(|outlet| outlet.id == *outlet_id) =>
+        {
+            engine.restore_current(Some(outlet_id.clone()), None);
+        }
+        Some(JournalRoutingAction::Replace { .. } | JournalRoutingAction::FailClosed) => {
+            engine.restore_current(None, None);
+        }
+        Some(JournalRoutingAction::Keep) | None => {}
+    }
+}
+
+fn settings_history_outlets(private: &PrivateRoutingConfig) -> Vec<HistoryOutletSnapshot> {
+    private
+        .outlets
+        .iter()
+        .map(|outlet| HistoryOutletSnapshot {
+            outlet_id: outlet.id.clone(),
+            label: outlet.label.clone(),
+            kind: match &outlet.kind {
+                OutletKind::Subscription { .. } => HistoryOutletKind::Subscription,
+                OutletKind::LocalProxy { .. } => HistoryOutletKind::LocalProxy,
+            },
+            enabled: outlet.enabled,
+        })
+        .collect()
+}
+
+fn finish_settings_database(
+    private: &PrivateRoutingConfig,
+    guardian: &GuardianConfig,
+    retention_days: u32,
+) -> Result<u64, String> {
+    let mut history = GuardianStore::open(&guardian.database_path)
+        .map_err(|_| "无法打开历史数据库以完成设置提交".to_string())?;
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    history
+        .sync_history_outlets(&settings_history_outlets(private), &observed_at)
+        .map_err(|_| "无法同步已提交的出口目录".to_string())?;
+    let outlet_ids = private
+        .outlets
+        .iter()
+        .map(|outlet| outlet.id.as_str())
+        .collect::<Vec<_>>();
+    history
+        .sync_udp_current_outlets(&outlet_ids)
+        .map_err(|_| "无法同步已提交的 UDP 当前状态".to_string())?;
+    history
+        .set_retention_days(retention_days, &observed_at)
+        .map_err(|_| "无法完成已提交的历史保留策略".to_string())
 }
 
 pub struct AppState {
@@ -153,11 +407,17 @@ pub struct AppState {
     secret_store: Option<SystemSecretStore>,
     managed_core: Mutex<Option<ManagedCore>>,
     routing_engine: Mutex<RoutingEngine>,
+    settings_preview_ticket: Mutex<Option<String>>,
     routing_transaction: RoutingTransaction,
     initialization_error: Option<String>,
     #[cfg(test)]
     entry_switch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    settings_validation_hook: Mutex<Option<SettingsValidationHook>>,
 }
+
+#[cfg(test)]
+type SettingsValidationHook = Box<dyn Fn(&Path, &Path) -> Result<(), String> + Send>;
 
 #[derive(Default)]
 struct RoutingTransaction {
@@ -384,20 +644,25 @@ impl AppState {
     ) -> Self {
         let runtime_directory = data_directory.join("runtime");
         let mut initialization_error = initialize_runtime_security(&runtime_directory).err();
+        if cleanup_stale_settings_validation_directories(&runtime_directory).is_err() {
+            initialization_error.get_or_insert_with(|| "无法清理遗留的隔离设置验证目录".into());
+        }
         let guardian_config_path = guardian_override
             .unwrap_or_else(|| prepare_local_guardian_config(data_directory, &workspace_root));
         let private_config_path = data_directory.join("private-routing.toml");
+        let mut recovered_routing_action = None;
         let secret_store = if let Ok(store) = SystemSecretStore::new() {
-            if recover_settings_transaction(
+            match recover_settings_transaction(
                 &runtime_directory,
                 &private_config_path,
                 &guardian_config_path,
                 &store,
-            )
-            .is_err()
-            {
-                initialization_error
-                    .get_or_insert_with(|| "设置事务恢复失败；开发核心保持 Fail Closed".into());
+            ) {
+                Ok(action) => recovered_routing_action = action,
+                Err(_) => {
+                    initialization_error
+                        .get_or_insert_with(|| "设置事务恢复失败；开发核心保持 Fail Closed".into());
+                }
             }
             if prepare_private_config(&private_config_path, &store).is_err() {
                 initialization_error.get_or_insert_with(|| {
@@ -421,9 +686,14 @@ impl AppState {
         };
         let _ = harden_private_config_files(&private_config_path);
         let private_config = PrivateRoutingConfig::load(&private_config_path).unwrap_or_default();
-        let routing_engine = RoutingEngine::new(
+        let mut routing_engine = RoutingEngine::new(
             private_config.route_mode,
             private_config.manual_outlet.clone(),
+        );
+        apply_recovered_routing_action(
+            &mut routing_engine,
+            &private_config,
+            recovered_routing_action.as_ref(),
         );
         Self {
             workspace_root,
@@ -433,10 +703,13 @@ impl AppState {
             secret_store,
             managed_core: Mutex::new(None),
             routing_engine: Mutex::new(routing_engine),
+            settings_preview_ticket: Mutex::new(None),
             routing_transaction: RoutingTransaction::default(),
             initialization_error,
             #[cfg(test)]
             entry_switch_hook: Mutex::new(None),
+            #[cfg(test)]
+            settings_validation_hook: Mutex::new(None),
         }
     }
 
@@ -453,6 +726,17 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn set_entry_switch_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         *self.entry_switch_hook.lock().expect("entry switch hook") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_settings_validation_hook_for_test(
+        &self,
+        hook: impl Fn(&Path, &Path) -> Result<(), String> + Send + 'static,
+    ) {
+        *self
+            .settings_validation_hook
+            .lock()
+            .expect("settings validation hook") = Some(Box::new(hook));
     }
 
     #[must_use]
@@ -566,9 +850,39 @@ impl AppState {
 
     pub fn preview_settings(
         &self,
+        request: &SettingsPreviewRequest,
+    ) -> Result<SettingsPreview, String> {
+        let fingerprint = settings_request_fingerprint(
+            &request.draft,
+            request.active_outlet_replacement.as_deref(),
+            request.fail_closed_on_removed_active,
+            &request.credential_intents,
+        )?;
+        if fingerprint != request.request_fingerprint {
+            return Err("设置预览指纹与请求内容不匹配".into());
+        }
+        let preview = self.evaluate_settings(
+            &request.draft,
+            &request.credential_intents,
+            request.active_outlet_replacement.as_deref(),
+            request.fail_closed_on_removed_active,
+            &fingerprint,
+        )?;
+        *self
+            .settings_preview_ticket
+            .lock()
+            .map_err(|_| "设置预览状态锁已损坏".to_string())? =
+            preview.can_apply.then_some(fingerprint);
+        Ok(preview)
+    }
+
+    fn evaluate_settings(
+        &self,
         draft: &SettingsDraft,
+        credential_intents: &[CredentialMutationIntent],
         active_outlet_replacement: Option<&str>,
         fail_closed_on_removed_active: bool,
+        request_fingerprint: &str,
     ) -> Result<SettingsPreview, String> {
         let current = self.private_config()?;
         let guardian = GuardianConfig::load(&self.guardian_config_path)
@@ -604,39 +918,15 @@ impl AppState {
                 .map_err(|_| "路由策略状态锁已损坏".to_string())?
                 .current_outlet()
                 .map(str::to_owned);
-            if let Some(current_active) = current_active
-                && !candidate
-                    .enabled_outlets()
-                    .any(|outlet| outlet.id == current_active)
-                && !fail_closed_on_removed_active
-            {
-                let replacement_valid = active_outlet_replacement.is_some_and(|replacement| {
-                    candidate
-                        .enabled_outlets()
-                        .any(|outlet| outlet.id == replacement)
-                });
-                if !replacement_valid {
-                    issues.push(ValidationIssue::new(
-                        "active_outlet_replacement",
-                        "active_outlet_replacement_required",
-                        "删除或停用当前出口前，必须选择启用的替代出口或明确进入 Fail Closed",
-                    ));
-                }
-            }
-            let resolved = if let Ok(resolved) = self.resolved_subscription_urls(candidate) {
-                Some(resolved)
-            } else {
-                issues.push(ValidationIssue::new(
-                    "credentials",
-                    "protected_store_unavailable",
-                    "Windows 受保护凭据存储不可用，无法验证订阅设置",
-                ));
-                None
-            };
-            if let Some(resolved) = resolved
-                && generate_mihomo_config(candidate, &resolved, &generate_controller_secret())
-                    .is_err()
-            {
+            let _ = settings_routing_action(
+                candidate,
+                current_active.as_deref(),
+                active_outlet_replacement,
+                fail_closed_on_removed_active,
+                &mut issues,
+            );
+            validate_credential_intents(candidate, credential_intents, &mut issues);
+            if generate_secret_free_validation_config(candidate).is_err() {
                 issues.push(ValidationIssue::new(
                     "routing",
                     "mihomo_candidate_invalid",
@@ -657,9 +947,11 @@ impl AppState {
             ));
         }
         Ok(SettingsPreview {
-            can_apply: issues.is_empty() && !diff.changes.is_empty(),
+            can_apply: issues.is_empty()
+                && (!diff.changes.is_empty() || !credential_intents.is_empty()),
             diff,
             issues,
+            request_fingerprint: request_fingerprint.into(),
         })
     }
 
@@ -668,7 +960,14 @@ impl AppState {
         &self,
         request: SettingsApplyRequest,
     ) -> Result<SettingsApplyResult, String> {
-        if !request.credential_mutations.is_empty()
+        let SettingsApplyRequest {
+            draft,
+            credential_mutations,
+            active_outlet_replacement,
+            fail_closed_on_removed_active,
+            preview_fingerprint,
+        } = request;
+        if !credential_mutations.is_empty()
             && self
                 .managed_core
                 .lock()
@@ -679,12 +978,38 @@ impl AppState {
                 "覆盖或删除凭据前请先停止本应用自管核心；当前核心与最后有效配置保持不变".into(),
             );
         }
-        let mut preview = self.preview_settings(
-            &request.draft,
-            request.active_outlet_replacement.as_deref(),
-            request.fail_closed_on_removed_active,
+        let credential_intents = credential_mutations
+            .iter()
+            .map(|mutation| CredentialMutationIntent {
+                subscription_id: mutation.subscription_id.clone(),
+                action: mutation.action,
+            })
+            .collect::<Vec<_>>();
+        let fingerprint = settings_request_fingerprint(
+            &draft,
+            active_outlet_replacement.as_deref(),
+            fail_closed_on_removed_active,
+            &credential_intents,
         )?;
-        if !request.credential_mutations.is_empty() {
+        if fingerprint != preview_fingerprint {
+            return Err("应用内容与最后一次预览不匹配".into());
+        }
+        let ticket = self
+            .settings_preview_ticket
+            .lock()
+            .map_err(|_| "设置预览状态锁已损坏".to_string())?
+            .take();
+        if ticket.as_deref() != Some(fingerprint.as_str()) {
+            return Err("设置预览已失效或已被使用，请重新预览".into());
+        }
+        let mut preview = self.evaluate_settings(
+            &draft,
+            &credential_intents,
+            active_outlet_replacement.as_deref(),
+            fail_closed_on_removed_active,
+            &fingerprint,
+        )?;
+        if !credential_intents.is_empty() {
             preview.diff.changes.push(vpn_hub_core::SettingsChange {
                 code: "credentials_changed".into(),
                 summary: "订阅凭据配置状态将更新；预览不包含凭据内容".into(),
@@ -705,43 +1030,58 @@ impl AppState {
             return Err("设置没有可应用的变更".into());
         }
         let current = self.private_config()?;
-        let candidate = request
-            .draft
+        let candidate = draft
             .private_candidate(&current)
             .map_err(|_| "设置候选在提交前校验失败".to_string())?;
+        let current_active = self
+            .routing_engine
+            .lock()
+            .map_err(|_| "路由策略状态锁已损坏".to_string())?
+            .current_outlet()
+            .map(str::to_owned);
+        let mut routing_issues = Vec::new();
+        let routing_action = settings_routing_action(
+            &candidate,
+            current_active.as_deref(),
+            active_outlet_replacement.as_deref(),
+            fail_closed_on_removed_active,
+            &mut routing_issues,
+        );
+        if !routing_issues.is_empty() {
+            return Err("设置路由动作在提交前失效，请重新预览".into());
+        }
         let current_guardian = GuardianConfig::load(&self.guardian_config_path)
             .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
-        let candidate_guardian = request.draft.guardian_candidate(&current_guardian);
+        let candidate_guardian = draft.guardian_candidate(&current_guardian);
         candidate_guardian
             .validate()
             .map_err(|error| format!("Guardian 候选校验失败：{error}"))?;
-        let pending =
-            self.prepare_secret_operations(&current, &candidate, request.credential_mutations)?;
-        let journal =
-            match self.prepare_settings_transaction(&pending, request.draft.retention_days) {
-                Ok(journal) => journal,
-                Err(error) => {
-                    let store = self
-                        .secret_store
-                        .as_ref()
-                        .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?;
-                    recover_settings_transaction(
-                        &self.runtime_directory,
-                        &self.private_config_path,
-                        &self.guardian_config_path,
-                        store,
-                    )?;
-                    return Err(error);
-                }
-            };
+        let pending = self.prepare_secret_operations(&current, &candidate, credential_mutations)?;
+        let journal = match self.prepare_settings_transaction(
+            &pending,
+            draft.retention_days,
+            routing_action.clone(),
+        ) {
+            Ok(journal) => journal,
+            Err(error) => {
+                let store = self
+                    .secret_store
+                    .as_ref()
+                    .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?;
+                let _ = recover_settings_transaction(
+                    &self.runtime_directory,
+                    &self.private_config_path,
+                    &self.guardian_config_path,
+                    store,
+                )?;
+                return Err(error);
+            }
+        };
         let transaction_result =
             self.execute_settings_transaction(journal, &pending, &candidate, &candidate_guardian);
         match transaction_result {
             Ok(removed_history_rows) => {
-                self.routing_engine
-                    .lock()
-                    .map_err(|_| "路由策略状态锁已损坏".to_string())?
-                    .set_mode(candidate.route_mode, candidate.manual_outlet.clone());
+                self.apply_committed_routing_state(&candidate, &routing_action)?;
                 Ok(SettingsApplyResult {
                     settings: self.settings_view()?,
                     diff: preview.diff,
@@ -758,7 +1098,7 @@ impl AppState {
                                 | SettingsTransactionPhase::Finalized
                         )
                     });
-                recover_settings_transaction(
+                let recovered = recover_settings_transaction(
                     &self.runtime_directory,
                     &self.private_config_path,
                     &self.guardian_config_path,
@@ -771,10 +1111,12 @@ impl AppState {
                 })?;
                 if committed {
                     let applied = self.private_config()?;
-                    self.routing_engine
-                        .lock()
-                        .map_err(|_| "路由策略状态锁已损坏".to_string())?
-                        .set_mode(applied.route_mode, applied.manual_outlet.clone());
+                    self.apply_committed_routing_state(
+                        &applied,
+                        recovered
+                            .as_ref()
+                            .unwrap_or(&JournalRoutingAction::FailClosed),
+                    )?;
                     return Ok(SettingsApplyResult {
                         settings: self.settings_view()?,
                         diff: preview.diff,
@@ -784,6 +1126,36 @@ impl AppState {
                 Err(error)
             }
         }
+    }
+
+    fn apply_committed_routing_state(
+        &self,
+        candidate: &PrivateRoutingConfig,
+        action: &JournalRoutingAction,
+    ) -> Result<(), String> {
+        let mut engine = self
+            .routing_engine
+            .lock()
+            .map_err(|_| "路由策略状态锁已损坏".to_string())?;
+        engine.set_mode(candidate.route_mode, candidate.manual_outlet.clone());
+        match action {
+            JournalRoutingAction::Keep => {}
+            JournalRoutingAction::Replace { outlet_id } => {
+                let valid = candidate
+                    .enabled_outlets()
+                    .any(|outlet| outlet.id == *outlet_id);
+                engine.restore_current(valid.then(|| outlet_id.clone()), None);
+            }
+            JournalRoutingAction::FailClosed => engine.restore_current(None, None),
+        }
+        if engine.current_outlet().is_some_and(|outlet_id| {
+            !candidate
+                .enabled_outlets()
+                .any(|outlet| outlet.id == outlet_id)
+        }) {
+            engine.restore_current(None, None);
+        }
+        Ok(())
     }
 
     fn prepare_secret_operations(
@@ -869,9 +1241,27 @@ impl AppState {
         &self,
         pending: &[PendingSecretOperation],
         target_retention_days: u32,
+        routing_action: JournalRoutingAction,
     ) -> Result<SettingsTransactionJournal, String> {
-        fs::create_dir_all(&self.runtime_directory)
-            .map_err(|_| "无法创建设置事务目录".to_string())?;
+        self.prepare_settings_transaction_with_operations(
+            pending,
+            target_retention_days,
+            routing_action,
+            &SystemDurableFileOps,
+        )
+    }
+
+    fn prepare_settings_transaction_with_operations<O: DurableFileOps + ?Sized>(
+        &self,
+        pending: &[PendingSecretOperation],
+        target_retention_days: u32,
+        routing_action: JournalRoutingAction,
+        operations: &O,
+    ) -> Result<SettingsTransactionJournal, String> {
+        operations
+            .create_dir_all(&self.runtime_directory)
+            .and_then(|()| operations.sync_directory(&self.runtime_directory))
+            .map_err(|_| "无法持久化设置事务目录".to_string())?;
         harden_private_path(&self.runtime_directory)?;
         if settings_journal_path(&self.runtime_directory).exists() {
             return Err("存在尚未恢复的设置事务，拒绝开始新事务".into());
@@ -880,7 +1270,7 @@ impl AppState {
         let files =
             settings_transaction_files(&self.private_config_path, &self.guardian_config_path);
         let mut journal = SettingsTransactionJournal {
-            version: 1,
+            version: 2,
             transaction_id,
             phase: SettingsTransactionPhase::Prepared,
             file_existed: std::array::from_fn(|index| files[index].exists()),
@@ -889,9 +1279,15 @@ impl AppState {
                 .iter()
                 .map(|operation| operation.journal.clone())
                 .collect(),
+            routing_action,
         };
-        write_settings_journal(&self.runtime_directory, &journal)?;
-        backup_settings_files(&self.runtime_directory, &journal, &files)?;
+        write_settings_journal_with_operations(&self.runtime_directory, &journal, operations)?;
+        backup_settings_files_with_operations(
+            &self.runtime_directory,
+            &journal,
+            &files,
+            operations,
+        )?;
         let store = self
             .secret_store
             .as_ref()
@@ -903,19 +1299,36 @@ impl AppState {
                     .map_err(|_| "无法写入受保护的凭据回滚点".to_string())?;
             }
             journal.secret_operations[index].backup_ready = true;
-            write_settings_journal(&self.runtime_directory, &journal)?;
+            write_settings_journal_with_operations(&self.runtime_directory, &journal, operations)?;
         }
         journal.phase = SettingsTransactionPhase::BackupsReady;
-        write_settings_journal(&self.runtime_directory, &journal)?;
+        write_settings_journal_with_operations(&self.runtime_directory, &journal, operations)?;
         Ok(journal)
     }
 
     fn execute_settings_transaction(
         &self,
+        journal: SettingsTransactionJournal,
+        pending: &[PendingSecretOperation],
+        candidate: &PrivateRoutingConfig,
+        candidate_guardian: &GuardianConfig,
+    ) -> Result<u64, String> {
+        self.execute_settings_transaction_with_operations(
+            journal,
+            pending,
+            candidate,
+            candidate_guardian,
+            &SystemDurableFileOps,
+        )
+    }
+
+    fn execute_settings_transaction_with_operations<O: DurableFileOps + ?Sized>(
+        &self,
         mut journal: SettingsTransactionJournal,
         pending: &[PendingSecretOperation],
         candidate: &PrivateRoutingConfig,
         candidate_guardian: &GuardianConfig,
+        operations: &O,
     ) -> Result<u64, String> {
         let store = self
             .secret_store
@@ -935,63 +1348,37 @@ impl AppState {
             }
         }
         journal.phase = SettingsTransactionPhase::CredentialsStaged;
-        write_settings_journal(&self.runtime_directory, &journal)?;
+        write_settings_journal_with_operations(&self.runtime_directory, &journal, operations)?;
 
-        let mut resolved = SubscriptionSecrets::new(store)
-            .resolve(candidate)
-            .map_err(|_| "无法解析候选订阅凭据".to_string())?;
-        for operation in pending {
-            if operation.journal.action == JournalSecretAction::Delete {
-                resolved.remove(&operation.journal.current_ref);
-            }
-        }
-        let (yaml, summary) =
-            generate_mihomo_config(candidate, &resolved, &generate_controller_secret())
-                .map_err(|_| "无法生成候选 Fail Closed Mihomo 配置".to_string())?;
+        let (yaml, summary) = generate_secret_free_validation_config(candidate)?;
         if summary.has_direct_fallback || yaml.lines().any(|line| line.trim() == "DIRECT") {
             return Err("候选 Mihomo 配置违反 Fail Closed 边界".into());
         }
-        let validation_directory = tempfile::Builder::new()
-            .prefix("settings-validation-")
-            .tempdir_in(&self.runtime_directory)
-            .map_err(|_| "无法创建隔离设置验证目录".to_string())?;
-        harden_private_path(validation_directory.path())?;
-        let candidate_path = validation_directory.path().join("mihomo.yaml");
-        write_synced_file(&candidate_path, yaml.as_bytes())?;
+        let validation_directory =
+            settings_validation_directory(&self.runtime_directory, &journal.transaction_id);
+        operations
+            .create_dir_all(&validation_directory)
+            .and_then(|()| operations.sync_directory(&self.runtime_directory))
+            .map_err(|_| "无法持久化隔离设置验证目录".to_string())?;
+        harden_private_path(&validation_directory)?;
+        let candidate_path = validation_directory.join("mihomo.yaml");
+        durable_write_new(&candidate_path, yaml.as_bytes(), operations)
+            .map_err(|_| "无法持久化隔离候选配置".to_string())?;
         harden_private_path(&candidate_path)?;
-        let executable = self.find_mihomo_executable()?;
-        let validation = hidden_command(&executable)
-            .arg("-t")
-            .arg("-d")
-            .arg(validation_directory.path())
-            .arg("-f")
-            .arg(&candidate_path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|_| "无法启动固定 Mihomo 候选检查".to_string())?;
-        if !validation.success() {
-            return Err("固定 Mihomo 拒绝候选配置".into());
-        }
+        let validation_result =
+            self.run_settings_candidate_validation(&validation_directory, &candidate_path);
+        remove_validation_directory(&validation_directory, operations)?;
+        validation_result?;
 
-        candidate
-            .save(&self.private_config_path)
-            .map_err(|_| "无法原子提交私密路由配置".to_string())?;
-        harden_private_config_files(&self.private_config_path)?;
-        journal.phase = SettingsTransactionPhase::PrivateCommitted;
-        write_settings_journal(&self.runtime_directory, &journal)?;
-        candidate_guardian
-            .save(&self.guardian_config_path)
-            .map_err(|_| "无法原子提交 Guardian 配置".to_string())?;
-        harden_private_config_files(&self.guardian_config_path)?;
-        journal.phase = SettingsTransactionPhase::GuardianCommitted;
-        write_settings_journal(&self.runtime_directory, &journal)?;
-
-        // This durable decision is the cross-resource commit point. A crash
-        // before it rolls back files and staged credentials; a crash after it
-        // deterministically finishes deletions and retention on next startup.
-        journal.phase = SettingsTransactionPhase::CommitDecided;
-        write_settings_journal(&self.runtime_directory, &journal)?;
+        journal = persist_candidate_settings_and_commit_decision(
+            &self.runtime_directory,
+            &self.private_config_path,
+            &self.guardian_config_path,
+            journal,
+            candidate,
+            candidate_guardian,
+            operations,
+        )?;
         for operation in pending {
             if operation.journal.action == JournalSecretAction::Delete {
                 store
@@ -999,18 +1386,48 @@ impl AppState {
                     .map_err(|_| "无法完成已提交的凭据删除".to_string())?;
             }
         }
-        let mut history = GuardianStore::open(&candidate_guardian.database_path)
-            .map_err(|_| "无法打开历史数据库以完成设置提交".to_string())?;
-        let removed = history
-            .set_retention_days(
-                journal.target_retention_days,
-                &chrono::Utc::now().to_rfc3339(),
-            )
-            .map_err(|_| "无法完成已提交的历史保留策略".to_string())?;
+        let removed =
+            finish_settings_database(candidate, candidate_guardian, journal.target_retention_days)?;
         journal.phase = SettingsTransactionPhase::Finalized;
-        write_settings_journal(&self.runtime_directory, &journal)?;
-        cleanup_settings_transaction(&self.runtime_directory, &journal, store)?;
+        write_settings_journal_with_operations(&self.runtime_directory, &journal, operations)?;
+        cleanup_settings_transaction_with_operations(
+            &self.runtime_directory,
+            &journal,
+            store,
+            operations,
+        )?;
         Ok(removed)
+    }
+
+    fn run_settings_candidate_validation(
+        &self,
+        validation_directory: &Path,
+        candidate_path: &Path,
+    ) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .settings_validation_hook
+            .lock()
+            .map_err(|_| "设置验证测试钩子锁已损坏".to_string())?
+            .as_ref()
+        {
+            return hook(validation_directory, candidate_path);
+        }
+        let executable = self.find_mihomo_executable()?;
+        let validation = hidden_command(&executable)
+            .arg("-t")
+            .arg("-d")
+            .arg(validation_directory)
+            .arg("-f")
+            .arg(candidate_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|_| "无法启动固定 Mihomo 候选检查".to_string())?;
+        validation
+            .success()
+            .then_some(())
+            .ok_or_else(|| "固定 Mihomo 拒绝候选配置".to_string())
     }
 
     #[must_use]
@@ -1068,6 +1485,12 @@ impl AppState {
             .map(|evidence| {
                 evidence
                     .into_iter()
+                    .filter(|item| {
+                        private_config
+                            .outlets
+                            .iter()
+                            .any(|outlet| outlet.id == item.outlet_id)
+                    })
                     .map(|item| (item.outlet_id.clone(), item))
                     .collect()
             })
@@ -1739,6 +2162,44 @@ fn settings_transaction_directory(runtime_directory: &Path, transaction_id: &str
     runtime_directory.join(format!("settings-transaction-{transaction_id}"))
 }
 
+fn settings_validation_directory(runtime_directory: &Path, transaction_id: &str) -> PathBuf {
+    runtime_directory.join(format!("settings-validation-{transaction_id}"))
+}
+
+fn remove_validation_directory<O: DurableFileOps + ?Sized>(
+    directory: &Path,
+    operations: &O,
+) -> Result<(), String> {
+    let parent = directory.parent().unwrap_or_else(|| Path::new("."));
+    match fs::remove_dir_all(directory) {
+        Ok(()) => operations
+            .sync_directory(parent)
+            .map_err(|_| "无法持久化隔离验证目录清理".to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("无法清理隔离设置验证目录".into()),
+    }
+}
+
+fn cleanup_stale_settings_validation_directories(runtime_directory: &Path) -> Result<(), String> {
+    let Ok(entries) = fs::read_dir(runtime_directory) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(suffix) = name.strip_prefix("settings-validation-") else {
+            continue;
+        };
+        if suffix.len() == 16
+            && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && entry.path().is_dir()
+        {
+            remove_validation_directory(&entry.path(), &SystemDurableFileOps)?;
+        }
+    }
+    Ok(())
+}
+
 fn settings_transaction_files(private_path: &Path, guardian_path: &Path) -> [PathBuf; 4] {
     [
         private_path.to_owned(),
@@ -1748,42 +2209,55 @@ fn settings_transaction_files(private_path: &Path, guardian_path: &Path) -> [Pat
     ]
 }
 
-fn write_synced_file(path: &Path, content: &[u8]) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|_| "无法创建私密事务目录".to_string())?;
-    }
-    let mut file = fs::File::create(path).map_err(|_| "无法写入私密事务文件".to_string())?;
-    file.write_all(content)
-        .and_then(|()| file.sync_all())
-        .map_err(|_| "无法持久化私密事务文件".to_string())
+fn persist_candidate_settings_and_commit_decision<O: DurableFileOps + ?Sized>(
+    runtime_directory: &Path,
+    private_path: &Path,
+    guardian_path: &Path,
+    mut journal: SettingsTransactionJournal,
+    candidate: &PrivateRoutingConfig,
+    candidate_guardian: &GuardianConfig,
+    operations: &O,
+) -> Result<SettingsTransactionJournal, String> {
+    candidate
+        .save_with_operations(private_path, operations)
+        .map_err(|_| "无法持久化提交私密路由配置".to_string())?;
+    harden_private_config_files(private_path)?;
+    journal.phase = SettingsTransactionPhase::PrivateCommitted;
+    write_settings_journal_with_operations(runtime_directory, &journal, operations)?;
+
+    candidate_guardian
+        .save_with_operations(guardian_path, operations)
+        .map_err(|_| "无法持久化提交 Guardian 配置".to_string())?;
+    harden_private_config_files(guardian_path)?;
+    journal.phase = SettingsTransactionPhase::GuardianCommitted;
+    write_settings_journal_with_operations(runtime_directory, &journal, operations)?;
+
+    // The commit point is written only after both config main files, both
+    // adjacent backups, and their parent-directory metadata are durable.
+    journal.phase = SettingsTransactionPhase::CommitDecided;
+    write_settings_journal_with_operations(runtime_directory, &journal, operations)?;
+    Ok(journal)
 }
 
+#[cfg(test)]
 fn write_settings_journal(
     runtime_directory: &Path,
     journal: &SettingsTransactionJournal,
 ) -> Result<(), String> {
+    write_settings_journal_with_operations(runtime_directory, journal, &SystemDurableFileOps)
+}
+
+fn write_settings_journal_with_operations<O: DurableFileOps + ?Sized>(
+    runtime_directory: &Path,
+    journal: &SettingsTransactionJournal,
+    operations: &O,
+) -> Result<(), String> {
     let path = settings_journal_path(runtime_directory);
-    let backup = settings_journal_backup_path(runtime_directory);
-    let temporary = runtime_directory.join("settings-transaction.json.tmp");
     let content = serde_json::to_vec(journal).map_err(|_| "无法序列化设置事务日志".to_string())?;
-    write_synced_file(&temporary, &content)?;
-    harden_private_path(&temporary)?;
-    if path.exists() {
-        if backup.exists() {
-            fs::remove_file(&backup).map_err(|_| "无法轮换设置事务日志".to_string())?;
-        }
-        fs::rename(&path, &backup).map_err(|_| "无法备份设置事务日志".to_string())?;
-    }
-    if fs::rename(&temporary, &path).is_err() {
-        if backup.exists() {
-            let _ = fs::rename(&backup, &path);
-        }
-        let _ = fs::remove_file(&temporary);
-        return Err("无法提交设置事务日志".into());
-    }
+    durable_atomic_save_with_backup(&path, &content, operations)
+        .map_err(|_| "无法持久化设置事务日志".to_string())?;
     harden_private_path(&path)?;
-    fs::copy(&path, &backup).map_err(|_| "无法复制设置事务日志备份".to_string())?;
-    harden_private_path(&backup)
+    harden_private_path(&settings_journal_backup_path(runtime_directory))
 }
 
 fn read_settings_journal(runtime_directory: &Path) -> Result<SettingsTransactionJournal, String> {
@@ -1802,46 +2276,63 @@ fn read_settings_journal(runtime_directory: &Path) -> Result<SettingsTransaction
                 .transaction_id
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit());
-        if journal.version == 1 && valid_id {
+        if matches!(journal.version, 1 | 2) && valid_id {
             return Ok(journal);
         }
     }
     Err("设置事务日志不存在或已损坏".into())
 }
 
+#[cfg(test)]
 fn backup_settings_files(
     runtime_directory: &Path,
     journal: &SettingsTransactionJournal,
     files: &[PathBuf; 4],
 ) -> Result<(), String> {
+    backup_settings_files_with_operations(runtime_directory, journal, files, &SystemDurableFileOps)
+}
+
+fn backup_settings_files_with_operations<O: DurableFileOps + ?Sized>(
+    runtime_directory: &Path,
+    journal: &SettingsTransactionJournal,
+    files: &[PathBuf; 4],
+    operations: &O,
+) -> Result<(), String> {
     let directory = settings_transaction_directory(runtime_directory, &journal.transaction_id);
-    fs::create_dir_all(&directory).map_err(|_| "无法创建设置事务备份目录".to_string())?;
+    operations
+        .create_dir_all(&directory)
+        .and_then(|()| operations.sync_directory(runtime_directory))
+        .map_err(|_| "无法持久化设置事务备份目录".to_string())?;
     harden_private_path(&directory)?;
     for (index, file) in files.iter().enumerate() {
         if journal.file_existed[index] {
             let content = fs::read(file).map_err(|_| "无法读取设置事务文件快照".to_string())?;
             let snapshot = directory.join(format!("file-{index}.snapshot"));
-            write_synced_file(&snapshot, &content)?;
+            durable_write_new(&snapshot, &content, operations)
+                .map_err(|_| "无法持久化设置事务文件快照".to_string())?;
             harden_private_path(&snapshot)?;
         }
     }
     Ok(())
 }
 
-fn restore_settings_files(
+fn restore_settings_files_with_operations<O: DurableFileOps + ?Sized>(
     runtime_directory: &Path,
     journal: &SettingsTransactionJournal,
     files: &[PathBuf; 4],
+    operations: &O,
 ) -> Result<(), String> {
     let directory = settings_transaction_directory(runtime_directory, &journal.transaction_id);
     for (index, file) in files.iter().enumerate() {
         if journal.file_existed[index] {
             let snapshot = directory.join(format!("file-{index}.snapshot"));
             let content = fs::read(snapshot).map_err(|_| "设置事务文件快照不可用".to_string())?;
-            write_synced_file(file, &content)?;
+            durable_replace(file, &content, operations)
+                .map_err(|_| "无法持久化恢复设置事务文件".to_string())?;
             harden_private_path(file)?;
         } else if file.exists() {
-            fs::remove_file(file).map_err(|_| "无法移除未提交的设置文件".to_string())?;
+            durable_remove_if_exists(file, operations)
+                .map_err(|_| "无法持久化移除未提交的设置文件".to_string())?;
         }
     }
     Ok(())
@@ -1872,11 +2363,16 @@ fn restore_settings_credentials<S: SecretStore + ?Sized>(
     Ok(())
 }
 
-fn finish_committed_settings<S: SecretStore + ?Sized>(
+fn finish_committed_settings_with_operations<
+    S: SecretStore + ?Sized,
+    O: DurableFileOps + ?Sized,
+>(
     runtime_directory: &Path,
+    private_path: &Path,
     guardian_path: &Path,
     journal: &mut SettingsTransactionJournal,
     store: &S,
+    operations: &O,
 ) -> Result<(), String> {
     for operation in &journal.secret_operations {
         if operation.action == JournalSecretAction::Delete {
@@ -1887,22 +2383,21 @@ fn finish_committed_settings<S: SecretStore + ?Sized>(
     }
     let guardian = GuardianConfig::load(guardian_path)
         .map_err(|_| "无法读取已提交的 Guardian 配置".to_string())?;
-    let mut history = GuardianStore::open(&guardian.database_path)
-        .map_err(|_| "无法打开历史数据库以恢复设置事务".to_string())?;
-    history
-        .set_retention_days(
-            journal.target_retention_days,
-            &chrono::Utc::now().to_rfc3339(),
-        )
-        .map_err(|_| "无法完成已提交的历史保留策略".to_string())?;
+    let private = PrivateRoutingConfig::load(private_path)
+        .map_err(|_| "无法读取已提交的私密路由配置".to_string())?;
+    finish_settings_database(&private, &guardian, journal.target_retention_days)?;
     journal.phase = SettingsTransactionPhase::Finalized;
-    write_settings_journal(runtime_directory, journal)
+    write_settings_journal_with_operations(runtime_directory, journal, operations)
 }
 
-fn cleanup_settings_transaction<S: SecretStore + ?Sized>(
+fn cleanup_settings_transaction_with_operations<
+    S: SecretStore + ?Sized,
+    O: DurableFileOps + ?Sized,
+>(
     runtime_directory: &Path,
     journal: &SettingsTransactionJournal,
     store: &S,
+    operations: &O,
 ) -> Result<(), String> {
     for operation in &journal.secret_operations {
         store
@@ -1912,17 +2407,18 @@ fn cleanup_settings_transaction<S: SecretStore + ?Sized>(
     let directory = settings_transaction_directory(runtime_directory, &journal.transaction_id);
     if directory.exists() {
         fs::remove_dir_all(directory).map_err(|_| "无法清理设置事务备份目录".to_string())?;
+        operations
+            .sync_directory(runtime_directory)
+            .map_err(|_| "无法持久化设置事务目录清理".to_string())?;
     }
     for path in [
         settings_journal_path(runtime_directory),
         settings_journal_backup_path(runtime_directory),
-        runtime_directory.join("settings-transaction.json.tmp"),
+        runtime_directory.join("settings-transaction.json.new"),
+        runtime_directory.join("settings-transaction.json.bak.new"),
     ] {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err("无法清理设置事务日志".into()),
-        }
+        durable_remove_if_exists(&path, operations)
+            .map_err(|_| "无法持久化清理设置事务日志".to_string())?;
     }
     Ok(())
 }
@@ -1932,34 +2428,71 @@ fn recover_settings_transaction<S: SecretStore + ?Sized>(
     private_path: &Path,
     guardian_path: &Path,
     store: &S,
-) -> Result<(), String> {
+) -> Result<Option<JournalRoutingAction>, String> {
+    recover_settings_transaction_with_operations(
+        runtime_directory,
+        private_path,
+        guardian_path,
+        store,
+        &SystemDurableFileOps,
+    )
+}
+
+fn recover_settings_transaction_with_operations<
+    S: SecretStore + ?Sized,
+    O: DurableFileOps + ?Sized,
+>(
+    runtime_directory: &Path,
+    private_path: &Path,
+    guardian_path: &Path,
+    store: &S,
+    operations: &O,
+) -> Result<Option<JournalRoutingAction>, String> {
     let primary = settings_journal_path(runtime_directory);
     let backup = settings_journal_backup_path(runtime_directory);
     if !primary.exists() && !backup.exists() {
-        return Ok(());
+        return Ok(None);
     }
     let mut journal = read_settings_journal(runtime_directory)?;
+    let mut committed_action = None;
     match journal.phase {
         SettingsTransactionPhase::CommitDecided => {
-            finish_committed_settings(runtime_directory, guardian_path, &mut journal, store)?;
+            committed_action = Some(journal.routing_action.clone());
+            finish_committed_settings_with_operations(
+                runtime_directory,
+                private_path,
+                guardian_path,
+                &mut journal,
+                store,
+                operations,
+            )?;
         }
-        SettingsTransactionPhase::Finalized | SettingsTransactionPhase::RolledBack => {}
+        SettingsTransactionPhase::Finalized => {
+            committed_action = Some(journal.routing_action.clone());
+        }
+        SettingsTransactionPhase::RolledBack => {}
         SettingsTransactionPhase::Prepared => {
             journal.phase = SettingsTransactionPhase::RolledBack;
-            write_settings_journal(runtime_directory, &journal)?;
+            write_settings_journal_with_operations(runtime_directory, &journal, operations)?;
         }
         SettingsTransactionPhase::BackupsReady
         | SettingsTransactionPhase::CredentialsStaged
         | SettingsTransactionPhase::PrivateCommitted
         | SettingsTransactionPhase::GuardianCommitted => {
             let files = settings_transaction_files(private_path, guardian_path);
-            restore_settings_files(runtime_directory, &journal, &files)?;
+            restore_settings_files_with_operations(
+                runtime_directory,
+                &journal,
+                &files,
+                operations,
+            )?;
             restore_settings_credentials(&journal, store)?;
             journal.phase = SettingsTransactionPhase::RolledBack;
-            write_settings_journal(runtime_directory, &journal)?;
+            write_settings_journal_with_operations(runtime_directory, &journal, operations)?;
         }
     }
-    cleanup_settings_transaction(runtime_directory, &journal, store)
+    cleanup_settings_transaction_with_operations(runtime_directory, &journal, store, operations)?;
+    Ok(committed_action)
 }
 
 fn harden_private_config_files(path: &Path) -> Result<(), String> {
@@ -2136,7 +2669,14 @@ fn remove_proxy_environment(command: &mut Command) {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{
+        collections::BTreeMap,
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
     use vpn_hub_core::{
         HealthStatus, LocalProxyProtocol, MASTER_SELECTOR, MonitorConfig, OutletConfig,
         OutletHealth, OutletKind, RoutingPolicy, SecretStoreError, SettingsOutletDraft,
@@ -2146,6 +2686,68 @@ mod tests {
     #[derive(Default)]
     struct TestSecretStore {
         values: Mutex<BTreeMap<String, String>>,
+    }
+
+    struct FailingDurableOps {
+        inner: SystemDurableFileOps,
+        fail_at: usize,
+        operation: AtomicUsize,
+    }
+
+    impl FailingDurableOps {
+        fn gate(&self) -> io::Result<()> {
+            let operation = self.operation.fetch_add(1, Ordering::SeqCst) + 1;
+            if operation == self.fail_at {
+                Err(io::Error::other("injected persistence boundary"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl DurableFileOps for FailingDurableOps {
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.gate()?;
+            self.inner.create_dir_all(path)
+        }
+        fn write(&self, path: &Path, content: &[u8]) -> io::Result<()> {
+            self.gate()?;
+            self.inner.write(path, content)
+        }
+        fn sync_file(&self, path: &Path) -> io::Result<()> {
+            self.gate()?;
+            self.inner.sync_file(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.gate()?;
+            self.inner.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.gate()?;
+            self.inner.remove_file(path)
+        }
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            self.gate()?;
+            self.inner.sync_directory(path)
+        }
+    }
+
+    fn preview_request(
+        draft: &SettingsDraft,
+        replacement: Option<&str>,
+        fail_closed: bool,
+        credential_intents: Vec<CredentialMutationIntent>,
+    ) -> SettingsPreviewRequest {
+        let request_fingerprint =
+            settings_request_fingerprint(draft, replacement, fail_closed, &credential_intents)
+                .expect("fingerprint");
+        SettingsPreviewRequest {
+            draft: draft.clone(),
+            credential_intents,
+            active_outlet_replacement: replacement.map(str::to_owned),
+            fail_closed_on_removed_active: fail_closed,
+            request_fingerprint,
+        }
     }
 
     impl SecretStore for TestSecretStore {
@@ -2316,12 +2918,13 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         operation: JournalSecretOperation,
     ) -> SettingsTransactionJournal {
         SettingsTransactionJournal {
-            version: 1,
+            version: 2,
             transaction_id: transaction_id.into(),
             phase,
             file_existed: std::array::from_fn(|index| files[index].exists()),
             target_retention_days: 45,
             secret_operations: vec![operation],
+            routing_action: JournalRoutingAction::Keep,
         }
     }
 
@@ -2361,6 +2964,9 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 &files,
                 operation.clone(),
             );
+            journal.routing_action = JournalRoutingAction::Replace {
+                outlet_id: "replacement-must-not-apply".into(),
+            };
             write_settings_journal(&runtime, &journal).expect("journal");
             if phase != SettingsTransactionPhase::Prepared {
                 backup_settings_files(&runtime, &journal, &files).expect("file snapshots");
@@ -2378,8 +2984,9 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 fs::write(&guardian, b"candidate-guardian").expect("candidate guardian");
             }
 
-            recover_settings_transaction(&runtime, &private, &guardian, &store)
+            let recovered = recover_settings_transaction(&runtime, &private, &guardian, &store)
                 .expect("restart recovery");
+            assert!(recovered.is_none(), "pre-commit action must not apply");
 
             assert_eq!(
                 fs::read(&private).expect("private restored"),
@@ -2396,6 +3003,171 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             assert_eq!(store.get(&rollback_ref).expect("rollback cleanup"), None);
             assert!(!settings_journal_path(&runtime).exists());
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn every_config_and_commit_flush_boundary_recovers_to_all_old_or_all_new() {
+        let mut failed_boundaries = 0;
+        for fail_at in 1..=160 {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let runtime = directory.path().join("runtime");
+            fs::create_dir_all(&runtime).expect("runtime");
+            let private_path = directory.path().join("private-routing.toml");
+            let guardian_path = directory.path().join("guardian.toml");
+            let database_path = directory.path().join("guardian.db");
+
+            let mut original_private = PrivateRoutingConfig::default();
+            original_private.cooldown_seconds = 60;
+            original_private.outlets = vec![OutletConfig {
+                id: "old-local".into(),
+                label: "Old Local".into(),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: "socks5h://127.0.0.1:45120".into(),
+                },
+            }];
+            original_private.save(&private_path).expect("old private");
+            let original_guardian = GuardianConfig {
+                database_path: database_path.clone(),
+                monitor: MonitorConfig {
+                    interval_seconds: 180,
+                    connect_timeout_ms: 1_500,
+                    request_timeout_ms: 8_000,
+                    failure_threshold: 2,
+                    recovery_threshold: 3,
+                },
+                outlets: Vec::new(),
+            };
+            original_guardian
+                .save(&guardian_path)
+                .expect("old guardian");
+            GuardianStore::open(&database_path).expect("history");
+
+            let files = settings_transaction_files(&private_path, &guardian_path);
+            let mut journal = SettingsTransactionJournal {
+                version: 2,
+                transaction_id: "abcdef1234567890".into(),
+                phase: SettingsTransactionPhase::Prepared,
+                file_existed: [true; 4],
+                target_retention_days: 45,
+                secret_operations: Vec::new(),
+                routing_action: JournalRoutingAction::Replace {
+                    outlet_id: "replacement-local".into(),
+                },
+            };
+            write_settings_journal(&runtime, &journal).expect("prepared journal");
+            backup_settings_files(&runtime, &journal, &files).expect("snapshots");
+            journal.phase = SettingsTransactionPhase::BackupsReady;
+            write_settings_journal(&runtime, &journal).expect("backup-ready journal");
+
+            let mut candidate_private = original_private.clone();
+            candidate_private.cooldown_seconds = 123;
+            candidate_private.outlets[0].id = "replacement-local".into();
+            candidate_private.outlets[0].label = "Replacement Local".into();
+            let mut candidate_guardian = original_guardian.clone();
+            candidate_guardian.monitor.interval_seconds = 181;
+            let operations = FailingDurableOps {
+                inner: SystemDurableFileOps,
+                fail_at,
+                operation: AtomicUsize::new(0),
+            };
+            let result = persist_candidate_settings_and_commit_decision(
+                &runtime,
+                &private_path,
+                &guardian_path,
+                journal,
+                &candidate_private,
+                &candidate_guardian,
+                &operations,
+            );
+            if result.is_ok() {
+                break;
+            }
+            failed_boundaries += 1;
+
+            let store = TestSecretStore::default();
+            let recovered =
+                recover_settings_transaction(&runtime, &private_path, &guardian_path, &store)
+                    .expect("restart recovery");
+            let private_main = PrivateRoutingConfig::load(&private_path).expect("private main");
+            let private_backup =
+                PrivateRoutingConfig::load(private_path.with_extension("toml.bak"))
+                    .expect("private backup");
+            let guardian_main = GuardianConfig::load(&guardian_path).expect("guardian main");
+            let guardian_backup = GuardianConfig::load(guardian_path.with_extension("toml.bak"))
+                .expect("guardian backup");
+            let all_old = [
+                private_main.cooldown_seconds,
+                private_backup.cooldown_seconds,
+            ] == [60, 60]
+                && [
+                    guardian_main.monitor.interval_seconds,
+                    guardian_backup.monitor.interval_seconds,
+                ] == [180, 180];
+            let all_new = [
+                private_main.cooldown_seconds,
+                private_backup.cooldown_seconds,
+            ] == [123, 123]
+                && [
+                    guardian_main.monitor.interval_seconds,
+                    guardian_backup.monitor.interval_seconds,
+                ] == [181, 181];
+            assert!(all_old || all_new, "boundary {fail_at} mixed documents");
+            assert_eq!(recovered.is_some(), all_new, "boundary {fail_at}");
+        }
+        assert!(failed_boundaries >= 24);
+    }
+
+    #[test]
+    fn validation_artifacts_use_only_ordinal_placeholders_and_startup_cleanup_removes_crash_leftovers()
+     {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runtime = directory.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("runtime");
+        let mut candidate = PrivateRoutingConfig::default();
+        candidate.outlets = vec![OutletConfig {
+            id: "customer-sensitive-outlet-id".into(),
+            label: "Customer Sensitive Label".into(),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: "customer.secret.reference".into(),
+                provider_update_seconds: 180,
+            },
+        }];
+        let raw_credential = "https://user:private-token@customer.example/private";
+        let raw_controller = "customer-controller-secret";
+        let (yaml, summary) =
+            generate_secret_free_validation_config(&candidate).expect("placeholder config");
+        assert!(!summary.has_direct_fallback);
+        for forbidden in [
+            "customer-sensitive-outlet-id",
+            "Customer Sensitive Label",
+            "customer.secret.reference",
+            raw_credential,
+            raw_controller,
+        ] {
+            assert!(!yaml.contains(forbidden));
+        }
+        assert!(yaml.contains("settings-validation.invalid/subscription/0"));
+
+        let crash_directory = settings_validation_directory(&runtime, "deadbeefdeadbeef");
+        fs::create_dir_all(&crash_directory).expect("crash directory");
+        let artifact = crash_directory.join("mihomo.yaml");
+        durable_write_new(&artifact, yaml.as_bytes(), &SystemDurableFileOps)
+            .expect("placeholder artifact");
+        let persisted = fs::read_to_string(&artifact).expect("artifact scan");
+        for forbidden in [
+            "customer-sensitive-outlet-id",
+            "Customer Sensitive Label",
+            "customer.secret.reference",
+            raw_credential,
+            raw_controller,
+        ] {
+            assert!(!persisted.contains(forbidden));
+        }
+        cleanup_stale_settings_validation_directories(&runtime).expect("startup cleanup");
+        assert!(!crash_directory.exists());
     }
 
     #[test]
@@ -2422,6 +3194,9 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             &files,
             operation,
         );
+        journal.routing_action = JournalRoutingAction::Replace {
+            outlet_id: "replacement-local".into(),
+        };
         write_settings_journal(&runtime, &journal).expect("journal");
         backup_settings_files(&runtime, &journal, &files).expect("snapshots");
         journal.phase = SettingsTransactionPhase::CredentialsStaged;
@@ -2485,25 +3260,34 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             &files,
             operation,
         );
+        journal.routing_action = JournalRoutingAction::Replace {
+            outlet_id: "replacement-local".into(),
+        };
         write_settings_journal(&runtime, &journal).expect("journal");
         backup_settings_files(&runtime, &journal, &files).expect("snapshots");
         let mut candidate = original.clone();
+        candidate.outlets[0].id = "replacement-local".into();
         candidate.outlets[0].label = "Committed label".into();
         candidate.save(&private).expect("candidate");
         journal.phase = SettingsTransactionPhase::CommitDecided;
         write_settings_journal(&runtime, &journal).expect("commit decision");
 
-        recover_settings_transaction(&runtime, &private, &guardian_path, &store)
+        let recovered = recover_settings_transaction(&runtime, &private, &guardian_path, &store)
             .expect("finish committed transaction");
+        assert_eq!(
+            recovered,
+            Some(JournalRoutingAction::Replace {
+                outlet_id: "replacement-local".into()
+            })
+        );
+        let committed = PrivateRoutingConfig::load(&private).expect("committed private");
+        let mut restarted_engine = RoutingEngine::new(committed.route_mode, None);
+        apply_recovered_routing_action(&mut restarted_engine, &committed, recovered.as_ref());
+        assert_eq!(restarted_engine.current_outlet(), Some("replacement-local"));
+        assert_ne!(restarted_engine.current_outlet(), Some("local-old"));
 
         assert_eq!(store.get("settings.removed").expect("secret"), None);
-        assert_eq!(
-            PrivateRoutingConfig::load(&private)
-                .expect("candidate kept")
-                .outlets[0]
-                .label,
-            "Committed label"
-        );
+        assert_eq!(committed.outlets[0].label, "Committed label");
         assert_eq!(
             GuardianStore::open(&database_path)
                 .expect("database")
@@ -2511,6 +3295,68 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 .expect("retention"),
             45
         );
+        assert!(!settings_journal_path(&runtime).exists());
+    }
+
+    #[test]
+    fn finalized_restart_replays_fail_closed_without_returning_removed_current() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runtime = directory.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("runtime");
+        let private = directory.path().join("private-routing.toml");
+        let guardian_path = directory.path().join("guardian.toml");
+        let database_path = directory.path().join("history.db");
+        let mut config = PrivateRoutingConfig::default();
+        config.outlets.push(OutletConfig {
+            id: "remaining-local".into(),
+            label: "Remaining Local".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "socks5h://127.0.0.1:45133".into(),
+            },
+        });
+        config.save(&private).expect("private");
+        let guardian = GuardianConfig {
+            database_path: database_path.clone(),
+            monitor: MonitorConfig {
+                interval_seconds: 180,
+                connect_timeout_ms: 1_500,
+                request_timeout_ms: 8_000,
+                failure_threshold: 2,
+                recovery_threshold: 3,
+            },
+            outlets: Vec::new(),
+        };
+        guardian.save(&guardian_path).expect("guardian");
+        GuardianStore::open(&database_path).expect("database");
+        let files = settings_transaction_files(&private, &guardian_path);
+        let mut journal = test_journal(
+            "abcdef1234567890",
+            SettingsTransactionPhase::Finalized,
+            &files,
+            JournalSecretOperation {
+                current_ref: "settings.none".into(),
+                rollback_ref: "rollback.settings.abcdef1234567890.0".into(),
+                previous_present: false,
+                backup_ready: false,
+                action: JournalSecretAction::Delete,
+            },
+        );
+        journal.secret_operations.clear();
+        journal.routing_action = JournalRoutingAction::FailClosed;
+        write_settings_journal(&runtime, &journal).expect("finalized journal");
+        let recovered = recover_settings_transaction(
+            &runtime,
+            &private,
+            &guardian_path,
+            &TestSecretStore::default(),
+        )
+        .expect("finalized cleanup");
+        assert_eq!(recovered, Some(JournalRoutingAction::FailClosed));
+        let mut engine = RoutingEngine::new(config.route_mode, None);
+        engine.restore_current(Some("removed-local".into()), Some(1));
+        apply_recovered_routing_action(&mut engine, &config, recovered.as_ref());
+        assert!(engine.current_outlet().is_none());
         assert!(!settings_journal_path(&runtime).exists());
     }
 
@@ -2567,7 +3413,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             port: 45_112,
         }];
         let preview = state
-            .preview_settings(&draft, None, false)
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
             .expect("preview");
         assert!(
             preview
@@ -2622,7 +3468,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         draft.outlets.remove(0);
 
         let blocked = state
-            .preview_settings(&draft, None, false)
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
             .expect("blocked preview");
         assert!(
             blocked
@@ -2631,7 +3477,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 .any(|issue| issue.code == "active_outlet_replacement_required")
         );
         let replaced = state
-            .preview_settings(&draft, Some("local-b"), false)
+            .preview_settings(&preview_request(&draft, Some("local-b"), false, Vec::new()))
             .expect("replacement preview");
         assert!(
             replaced
@@ -2640,7 +3486,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 .all(|issue| issue.code != "active_outlet_replacement_required")
         );
         let fail_closed = state
-            .preview_settings(&draft, None, true)
+            .preview_settings(&preview_request(&draft, None, true, Vec::new()))
             .expect("fail closed preview");
         assert!(
             fail_closed
@@ -2648,6 +3494,122 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 .iter()
                 .all(|issue| issue.code != "active_outlet_replacement_required")
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn apply_settings_commits_replacement_or_fail_closed_and_consumes_preview_once() {
+        for fail_closed in [false, true] {
+            let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+            let directory = tempfile::tempdir().expect("tempdir");
+            let state = AppState::new_for_test(workspace_root, directory.path());
+            state.set_settings_validation_hook_for_test(|_, candidate_path| {
+                let yaml = fs::read_to_string(candidate_path)
+                    .map_err(|_| "无法读取占位验证配置".to_string())?;
+                if yaml.contains("DIRECT") {
+                    return Err("占位验证配置违反 Fail Closed".into());
+                }
+                Ok(())
+            });
+            let mut config = state.private_config().expect("private");
+            config.outlets = vec![
+                OutletConfig {
+                    id: "removed-local".into(),
+                    label: "Removed Local".into(),
+                    enabled: true,
+                    kind: OutletKind::LocalProxy {
+                        endpoint: "socks5h://127.0.0.1:45131".into(),
+                    },
+                },
+                OutletConfig {
+                    id: "replacement-local".into(),
+                    label: "Replacement Local".into(),
+                    enabled: true,
+                    kind: OutletKind::LocalProxy {
+                        endpoint: "socks5h://127.0.0.1:45132".into(),
+                    },
+                },
+            ];
+            config.save(&state.private_config_path).expect("config");
+            state.routing_engine.lock().expect("engine").apply(
+                &RouteDecision {
+                    from_outlet: None,
+                    to_outlet: "removed-local".into(),
+                    reason: "test-only-current-state".into(),
+                },
+                1,
+            );
+            let guardian = GuardianConfig::load(&state.guardian_config_path).expect("guardian");
+            let mut history = GuardianStore::open(&guardian.database_path).expect("history");
+            history
+                .ensure_udp_capability(
+                    "removed-local",
+                    "Removed Local",
+                    &unknown_udp_evidence(&config.outlets[0], "test"),
+                )
+                .expect("old UDP current");
+
+            let mut draft = state.settings_view().expect("settings").draft;
+            draft.outlets.remove(0);
+            let replacement = (!fail_closed).then_some("replacement-local");
+            let preview = state
+                .preview_settings(&preview_request(
+                    &draft,
+                    replacement,
+                    fail_closed,
+                    Vec::new(),
+                ))
+                .expect("preview");
+            assert!(preview.can_apply);
+            let fingerprint = preview.request_fingerprint.clone();
+            let result = state
+                .apply_settings(SettingsApplyRequest {
+                    draft: draft.clone(),
+                    credential_mutations: Vec::new(),
+                    active_outlet_replacement: replacement.map(str::to_owned),
+                    fail_closed_on_removed_active: fail_closed,
+                    preview_fingerprint: fingerprint.clone(),
+                })
+                .expect("atomic settings apply");
+            assert!(
+                result
+                    .settings
+                    .draft
+                    .outlets
+                    .iter()
+                    .all(|outlet| outlet.outlet_id() != "removed-local")
+            );
+            assert_eq!(
+                state.routing_status().expect("routing").current_outlet,
+                replacement.map(str::to_owned)
+            );
+            let udp = GuardianStore::open(&guardian.database_path)
+                .expect("history restart")
+                .udp_capabilities()
+                .expect("UDP current");
+            assert!(udp.iter().all(|item| item.outlet_id != "removed-local"));
+            let switches = GuardianStore::open(&guardian.database_path)
+                .expect("history restart")
+                .recent_route_switches(10)
+                .expect("route switches");
+            assert!(
+                switches.is_empty(),
+                "settings must not forge Controller history"
+            );
+
+            let duplicate = state.apply_settings(SettingsApplyRequest {
+                draft,
+                credential_mutations: Vec::new(),
+                active_outlet_replacement: replacement.map(str::to_owned),
+                fail_closed_on_removed_active: fail_closed,
+                preview_fingerprint: fingerprint,
+            });
+            assert!(
+                duplicate
+                    .expect_err("preview is one-shot")
+                    .contains("预览已失效或已被使用")
+            );
+        }
     }
 
     #[test]
@@ -2706,12 +3668,16 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 port: second_local_port,
             },
         ];
+        let preview = state
+            .preview_settings(&preview_request(&draft, None, true, Vec::new()))
+            .expect("fixed Mihomo preview");
         let result = state
             .apply_settings(SettingsApplyRequest {
                 draft,
                 credential_mutations: Vec::new(),
                 active_outlet_replacement: None,
                 fail_closed_on_removed_active: true,
+                preview_fingerprint: preview.request_fingerprint,
             })
             .expect("fixed Mihomo atomic apply");
         assert_eq!(result.settings.draft.outlets.len(), 5);

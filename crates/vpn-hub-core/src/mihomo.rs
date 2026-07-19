@@ -248,13 +248,28 @@ impl PrivateRoutingConfig {
     ///
     /// Returns a sanitized validation, serialization, or write failure.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), PrivateConfigError> {
+        self.save_with_operations(path, &crate::SystemDurableFileOps)
+    }
+
+    /// Saves through an injectable durable I/O boundary used by the desktop
+    /// cross-resource transaction and its crash-boundary tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized validation, serialization, or durable write error.
+    pub fn save_with_operations<O: crate::DurableFileOps + ?Sized>(
+        &self,
+        path: impl AsRef<Path>,
+        operations: &O,
+    ) -> Result<(), PrivateConfigError> {
         self.validate()?;
         let content = if self.source_format == SourceFormat::Legacy {
             toml::to_string_pretty(&self.as_legacy()).map_err(|_| PrivateConfigError::Write)?
         } else {
             toml::to_string_pretty(self).map_err(|_| PrivateConfigError::Write)?
         };
-        atomic_save(path.as_ref(), content.as_bytes())
+        crate::durable_atomic_save_with_backup(path.as_ref(), content.as_bytes(), operations)
+            .map_err(|_| PrivateConfigError::Write)
     }
 
     #[must_use]
@@ -933,27 +948,6 @@ fn parse_local_proxy_endpoint(
         )));
     }
     Ok(std::net::SocketAddr::new(ip, port))
-}
-
-fn atomic_save(path: &Path, content: &[u8]) -> Result<(), PrivateConfigError> {
-    let temporary = path.with_extension("toml.tmp");
-    let backup = backup_path(path);
-    fs::write(&temporary, content).map_err(|_| PrivateConfigError::Write)?;
-    if path.exists() {
-        if backup.exists() {
-            fs::remove_file(&backup).map_err(|_| PrivateConfigError::Write)?;
-        }
-        fs::rename(path, &backup).map_err(|_| PrivateConfigError::Write)?;
-    }
-    if fs::rename(&temporary, path).is_err() {
-        if backup.exists() {
-            let _ = fs::rename(&backup, path);
-        }
-        let _ = fs::remove_file(&temporary);
-        return Err(PrivateConfigError::Write);
-    }
-    fs::copy(path, &backup).map_err(|_| PrivateConfigError::Write)?;
-    Ok(())
 }
 
 fn backup_path(path: &Path) -> std::path::PathBuf {

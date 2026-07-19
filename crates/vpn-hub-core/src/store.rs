@@ -295,6 +295,38 @@ impl GuardianStore {
         Ok(())
     }
 
+    /// Keeps the current UDP projection limited to outlets that still exist
+    /// in the active configuration while preserving the append-only evidence
+    /// history for audit and later explanation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the projection transaction cannot be committed.
+    pub fn sync_udp_current_outlets(&mut self, outlet_ids: &[&str]) -> Result<(), StoreError> {
+        let configured = outlet_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let transaction = self.connection.transaction()?;
+        {
+            let mut statement =
+                transaction.prepare("SELECT outlet_id FROM udp_capability_current")?;
+            let existing = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for outlet_id in existing {
+                if !configured.contains(outlet_id.as_str()) {
+                    transaction.execute(
+                        "DELETE FROM udp_capability_current WHERE outlet_id=?1",
+                        [outlet_id],
+                    )?;
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     fn outlet_display(
         &self,
         outlet_id: &str,
@@ -1939,6 +1971,28 @@ mod tests {
             store.summaries().expect("TCP summary")[0].last_status,
             HealthStatus::Healthy,
             "UDP evidence must not alter Guardian TCP health"
+        );
+        store
+            .sync_udp_current_outlets(&[])
+            .expect("remove deleted outlet from current projection");
+        assert!(
+            store
+                .udp_capabilities()
+                .expect("current after removal")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .udp_capability_history("a", 10)
+                .expect("audit history after removal")
+                .len(),
+            3,
+            "removing a current projection must preserve UDP audit history"
+        );
+        assert_eq!(
+            store.summaries().expect("TCP summary after removal")[0].last_status,
+            HealthStatus::Healthy,
+            "removing a UDP projection must preserve TCP history"
         );
     }
 

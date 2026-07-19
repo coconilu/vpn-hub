@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import test from "node:test";
-import { buildCredentialMutations, createOutletId, moveItem } from "./settingsModel.js";
+import {
+  buildSettingsPreviewRequest,
+  consumeSettingsPreviewTicket,
+  createOutletId,
+  dispatchOneShotSettingsApply,
+  isCurrentPreviewResponse,
+  moveItem,
+  settingsRequestFingerprint,
+} from "./settingsModel.js";
 
 test("reordering and renaming do not regenerate stable outlet ids", () => {
   const outlets = [
@@ -17,13 +26,79 @@ test("generated ids stay within the core stable-id alphabet", () => {
   assert.equal(createOutletId("subscription", "A1B2-C3D4_E5F6"), "subscription-a1b2c3d4e5f6");
 });
 
-test("credential mutations keep raw values only in the apply request", () => {
-  const result = buildCredentialMutations(
-    { "sub-a": "https://example.invalid/private-value", "sub-b": "" },
-    new Set(["sub-b"]),
-  );
-  assert.deepEqual(result, [
-    { subscription_id: "sub-a", action: "set", credential: "https://example.invalid/private-value" },
-    { subscription_id: "sub-b", action: "delete", credential: null },
+const draft = { entry: { host: "127.0.0.1", port: 3666 }, outlets: [{ outlet_id: "sub-a" }] };
+
+test("preview fingerprint is deterministic and contains only sanitized credential intent", () => {
+  const first = buildSettingsPreviewRequest(draft, null, false, { "sub-b": "delete", "sub-a": "set" });
+  const second = buildSettingsPreviewRequest(draft, null, false, { "sub-a": "set", "sub-b": "delete" });
+  assert.equal(first.request_fingerprint, second.request_fingerprint);
+  assert.equal(JSON.stringify(first).includes("private-value"), false);
+  assert.deepEqual(first.credential_intents, [
+    { subscription_id: "sub-a", action: "set" },
+    { subscription_id: "sub-b", action: "delete" },
   ]);
+});
+
+test("overlapping and edited previews discard stale responses", () => {
+  const first = buildSettingsPreviewRequest(draft, null, false, {});
+  const editedDraft = { ...draft, entry: { ...draft.entry, port: 3667 } };
+  const second = buildSettingsPreviewRequest(editedDraft, null, false, {});
+  assert.equal(isCurrentPreviewResponse(1, 2, second.request_fingerprint, first.request_fingerprint), false);
+  assert.equal(isCurrentPreviewResponse(2, 2, second.request_fingerprint, second.request_fingerprint), true);
+  assert.notEqual(first.request_fingerprint, second.request_fingerprint);
+});
+
+test("credential intent invalidates a matching draft preview", () => {
+  const clean = settingsRequestFingerprint(draft, null, false, []);
+  const intent = buildSettingsPreviewRequest(draft, null, false, { "sub-a": "delete" });
+  assert.notEqual(clean, intent.request_fingerprint);
+});
+
+test("one-shot dispatch clears uncontrolled password input before rejected await", async () => {
+  const secret = "https://example.invalid/private-value";
+  const input = { value: secret };
+  const inputs = new Map([["sub-a", input]]);
+  let dispatched;
+  const pending = dispatchOneShotSettingsApply(
+    { draft, preview_fingerprint: "fingerprint" },
+    inputs,
+    { "sub-a": "set" },
+    async (request) => {
+      dispatched = request;
+      throw new Error("synthetic failure");
+    },
+  );
+  assert.equal(input.value, "");
+  assert.equal(inputs.size, 0);
+  await assert.rejects(pending, /synthetic failure/);
+  assert.equal(dispatched.credential_mutations[0].credential, secret);
+});
+
+test("one-shot credential read clears every password input before validation failure", () => {
+  const missing = { value: "" };
+  const unrelated = { value: "must-also-be-cleared" };
+  const inputs = new Map([["sub-a", missing], ["sub-b", unrelated]]);
+  assert.throws(() => dispatchOneShotSettingsApply(
+    { draft, preview_fingerprint: "fingerprint" },
+    inputs,
+    { "sub-a": "set" },
+    async () => undefined,
+  ), /必须输入新值/);
+  assert.equal(missing.value, "");
+  assert.equal(unrelated.value, "");
+  assert.equal(inputs.size, 0);
+});
+
+test("browser preview ticket is consumed exactly once", () => {
+  let ticket = "fingerprint";
+  ticket = consumeSettingsPreviewTicket(ticket, "fingerprint");
+  assert.equal(ticket, null);
+  assert.throws(() => consumeSettingsPreviewTicket(ticket, "fingerprint"), /已失效或已被使用/);
+});
+
+test("settings component has no controlled or React-state credential plaintext", () => {
+  const source = fs.readFileSync(new URL("../SettingsPage.tsx", import.meta.url), "utf8");
+  assert.equal(source.includes("credentialValues"), false);
+  assert.equal(/type="password"[^>]*\bvalue=/.test(source), false);
+  assert.equal(source.includes("dispatchOneShotSettingsApply"), true);
 });

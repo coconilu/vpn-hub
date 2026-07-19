@@ -231,6 +231,20 @@ export interface SettingsPreview {
   diff: SettingsDiff;
   issues: ValidationIssue[];
   can_apply: boolean;
+  request_fingerprint: string;
+}
+
+export interface CredentialMutationIntent {
+  subscription_id: string;
+  action: "set" | "delete";
+}
+
+export interface SettingsPreviewRequest {
+  draft: SettingsDraft;
+  credential_intents: CredentialMutationIntent[];
+  active_outlet_replacement: string | null;
+  fail_closed_on_removed_active: boolean;
+  request_fingerprint: string;
 }
 
 export interface CredentialMutation {
@@ -244,6 +258,7 @@ export interface SettingsApplyRequest {
   credential_mutations: CredentialMutation[];
   active_outlet_replacement: string | null;
   fail_closed_on_removed_active: boolean;
+  preview_fingerprint: string;
 }
 
 export interface SettingsApplyResult {

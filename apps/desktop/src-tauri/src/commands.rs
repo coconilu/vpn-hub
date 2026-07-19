@@ -21,7 +21,7 @@ use vpn_hub_core::{
 
 use crate::runtime::{
     AppState, CoreStatus, PortSnapshot, RoutingStatus, SettingsApplyRequest, SettingsApplyResult,
-    SettingsPreview,
+    SettingsPreview, SettingsPreviewRequest,
 };
 
 #[derive(Debug, Serialize)]
@@ -58,6 +58,12 @@ fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
     let mut udp_capabilities = store
         .udp_capabilities()
         .map_err(|error| format!("无法读取 UDP 能力状态：{error}"))?;
+    udp_capabilities.retain(|evidence| {
+        private
+            .outlets
+            .iter()
+            .any(|outlet| outlet.id == evidence.outlet_id)
+    });
     for evidence in &mut udp_capabilities {
         let current = private
             .outlets
@@ -195,16 +201,10 @@ pub async fn get_settings(
 #[allow(clippy::needless_pass_by_value)]
 pub async fn preview_settings(
     state: State<'_, AppState>,
-    draft: vpn_hub_core::SettingsDraft,
-    active_outlet_replacement: Option<String>,
-    fail_closed_on_removed_active: bool,
+    request: SettingsPreviewRequest,
 ) -> Result<SettingsPreview, String> {
     let _transaction = state.lock_routing_transaction().await;
-    state.preview_settings(
-        &draft,
-        active_outlet_replacement.as_deref(),
-        fail_closed_on_removed_active,
-    )
+    state.preview_settings(&request)
 }
 
 #[tauri::command]

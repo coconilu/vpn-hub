@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { mockSnapshot } from "../data/mock";
+import { consumeSettingsPreviewTicket, settingsRequestFingerprint } from "./settingsModel";
 import type {
   CoreStatus,
   DashboardSnapshot,
@@ -10,8 +11,8 @@ import type {
   SafeSettingsView,
   SettingsApplyRequest,
   SettingsApplyResult,
-  SettingsDraft,
   SettingsPreview,
+  SettingsPreviewRequest,
 } from "../types";
 
 declare global {
@@ -41,6 +42,7 @@ let browserSettings: SafeSettingsView = {
   },
   credentials: [],
 };
+let browserSettingsPreviewTicket: string | null = null;
 
 export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
   if (!isTauriRuntime()) return structuredClone(browserSnapshot);
@@ -148,16 +150,22 @@ export async function getSettings(): Promise<SafeSettingsView> {
   return invoke<SafeSettingsView>("get_settings");
 }
 
-export async function previewSettings(
-  draft: SettingsDraft,
-  activeOutletReplacement: string | null,
-  failClosedOnRemovedActive: boolean,
-): Promise<SettingsPreview> {
+export async function previewSettings(request: SettingsPreviewRequest): Promise<SettingsPreview> {
   if (!isTauriRuntime()) {
+    const fingerprint = settingsRequestFingerprint(
+      request.draft,
+      request.active_outlet_replacement,
+      request.fail_closed_on_removed_active,
+      request.credential_intents,
+    );
+    if (fingerprint !== request.request_fingerprint) {
+      throw new Error("设置预览指纹与请求内容不匹配");
+    }
+    const draft = request.draft;
     const issues = draft.outlets.some((outlet) => outlet.enabled)
       ? []
       : [{ field: "outlets", code: "enabled_outlet_required", message: "至少需要一个启用出口。" }];
-    return {
+    const result = {
       diff: {
         changes: JSON.stringify(draft) === JSON.stringify(browserSettings.draft)
           ? []
@@ -167,27 +175,50 @@ export async function previewSettings(
         retention_changed: draft.retention_days !== browserSettings.draft.retention_days,
       },
       issues,
-      can_apply: issues.length === 0 && JSON.stringify(draft) !== JSON.stringify(browserSettings.draft),
+      can_apply: issues.length === 0
+        && (JSON.stringify(draft) !== JSON.stringify(browserSettings.draft)
+          || request.credential_intents.length > 0),
+      request_fingerprint: fingerprint,
     };
+    browserSettingsPreviewTicket = result.can_apply ? fingerprint : null;
+    return result;
   }
-  return invoke<SettingsPreview>("preview_settings", {
-    draft,
-    activeOutletReplacement,
-    failClosedOnRemovedActive,
-  });
+  return invoke<SettingsPreview>("preview_settings", { request });
 }
 
 export async function applySettings(request: SettingsApplyRequest): Promise<SettingsApplyResult> {
   if (!isTauriRuntime()) {
+    const intents = request.credential_mutations.map(({ subscription_id, action }) => ({
+      subscription_id,
+      action,
+    }));
+    const fingerprint = settingsRequestFingerprint(
+      request.draft,
+      request.active_outlet_replacement,
+      request.fail_closed_on_removed_active,
+      intents,
+    );
+    if (fingerprint !== request.preview_fingerprint) {
+      throw new Error("设置预览已失效或已被使用，请重新预览");
+    }
+    browserSettingsPreviewTicket = consumeSettingsPreviewTicket(
+      browserSettingsPreviewTicket,
+      request.preview_fingerprint,
+    );
+    const previousStates = new Map(browserSettings.credentials.map((item) => [item.subscription_id, item.state]));
     browserSettings = {
       draft: structuredClone(request.draft),
       credentials: request.draft.outlets
         .filter((outlet) => outlet.kind === "subscription")
         .map((outlet) => ({
           subscription_id: outlet.outlet_id,
-          state: request.credential_mutations.some(
-            (mutation) => mutation.subscription_id === outlet.outlet_id && mutation.action === "set",
-          ) ? "configured" : "missing",
+          state: request.credential_mutations.find(
+            (mutation) => mutation.subscription_id === outlet.outlet_id,
+          )?.action === "set" ? "configured"
+            : request.credential_mutations.find(
+              (mutation) => mutation.subscription_id === outlet.outlet_id,
+            )?.action === "delete" ? "missing"
+              : previousStates.get(outlet.outlet_id) ?? "missing",
         })),
     };
     return {

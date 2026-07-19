@@ -6,6 +6,7 @@
 
 mod config;
 mod controller;
+mod durable;
 mod guardian_cycle;
 mod history;
 mod mihomo;
@@ -19,6 +20,10 @@ mod udp_capability;
 
 pub use config::{ConfigError, GuardianConfig, MonitorConfig, ProbeOutletConfig};
 pub use controller::{ControllerClient, ControllerError};
+pub use durable::{
+    DurableFileOps, SystemDurableFileOps, durable_atomic_save_with_backup,
+    durable_remove_if_exists, durable_replace, durable_write_new,
+};
 pub use guardian_cycle::{
     GuardianCycleError, GuardianCycleOutcome, RoutingSession, RoutingStateError,
     run_controller_guardian_cycle,
