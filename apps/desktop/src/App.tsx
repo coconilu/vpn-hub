@@ -6,7 +6,6 @@ import { StatusBar } from "./components/StatusBar";
 import {
   getDashboardSnapshot,
   refreshGuardian,
-  saveSubscriptionUrl,
   setRouteMode,
   startDevelopmentCore,
   stopDevelopmentCore,
@@ -73,12 +72,6 @@ export default function App() {
     setNotice("已通过 Mihomo Controller 更新真实选择器策略。");
   });
 
-  const handleSubscriptionSave = (value: string) => runBusy(async () => {
-    await saveSubscriptionUrl(value);
-    await load();
-    setNotice("订阅地址已保存到仅限当前用户访问的本机私密配置；启动开发核心后生效。");
-  });
-
   if (!snapshot) {
     return <div className="loading-screen"><span className="brand-mark">V</span><p>正在读取本机状态…</p></div>;
   }
@@ -93,7 +86,6 @@ export default function App() {
             busy={busy}
             notice={notice}
             onModeChange={handleModeChange}
-            onSubscriptionSave={handleSubscriptionSave}
             onRefresh={handleRefresh}
             onCoreToggle={handleCoreToggle}
           />

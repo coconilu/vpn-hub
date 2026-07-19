@@ -4,7 +4,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 use crate::{
-    HealthStatus, LatencySample, OutletConfig, OutletSummary, ProbeResult, RouteSwitchEvent,
+    HealthStatus, LatencySample, OutletSummary, ProbeOutletConfig, ProbeResult, RouteSwitchEvent,
     StateEvent,
 };
 
@@ -123,7 +123,7 @@ impl GuardianStore {
     /// Returns an error when the transaction cannot be read or committed.
     pub fn record_probe(
         &mut self,
-        outlet: &OutletConfig,
+        outlet: &ProbeOutletConfig,
         result: &ProbeResult,
         failure_threshold: u32,
         recovery_threshold: u32,
@@ -473,8 +473,8 @@ fn next_state(
 mod tests {
     use super::*;
 
-    fn outlet() -> OutletConfig {
-        OutletConfig {
+    fn outlet() -> ProbeOutletConfig {
+        ProbeOutletConfig {
             id: "a".into(),
             label: "A".into(),
             proxy_url: "socks5h://127.0.0.1:16666".into(),

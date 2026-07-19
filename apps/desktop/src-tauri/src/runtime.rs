@@ -10,12 +10,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use vpn_hub_core::{
-    ControllerClient, PrivateConfigSummary, PrivateRoutingConfig, RouteDecision, RouteMode,
+    ControllerClient, OutletConfigSummary, PrivateRoutingConfig, RouteDecision, RouteMode,
     RoutingEngine, generate_controller_secret, generate_mihomo_config,
 };
 
-const PROTECTED_PORT: u16 = 6_666;
-const DEVELOPMENT_PORT: u16 = 36_666;
 const DEFAULT_GUARDIAN_CONFIG: &str = r#"database_path = "guardian-desktop.db"
 
 [monitor]
@@ -24,18 +22,11 @@ connect_timeout_ms = 1500
 request_timeout_ms = 8000
 failure_threshold = 2
 recovery_threshold = 3
-
-[[outlets]]
-id = "chaoshihui"
-label = "超实惠"
-proxy_url = "socks5h://127.0.0.1:16666"
-probe_url = "https://www.gstatic.com/generate_204"
-degraded_latency_ms = 2500
-enabled = true
 "#;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PortSnapshot {
+    pub host: String,
     pub port: u16,
     pub reachable: bool,
     pub owner_pid: Option<u32>,
@@ -56,8 +47,7 @@ pub struct RoutingStatus {
     pub current_outlet: Option<String>,
     pub manual_outlet: Option<String>,
     pub controller_ready: bool,
-    pub subscription_configured: bool,
-    pub provider_update_seconds: u64,
+    pub outlets: Vec<OutletConfigSummary>,
     pub message: String,
 }
 
@@ -85,8 +75,9 @@ impl RoutingTransaction {
 
 struct ManagedCore {
     child: Child,
-    protected_owner_pid: u32,
     started_at: String,
+    entry_host: String,
+    entry_port: u16,
     controller_port: u16,
     controller_secret: String,
 }
@@ -120,7 +111,7 @@ impl AppState {
             .unwrap_or_else(|| prepare_local_guardian_config(data_directory, &workspace_root));
         let private_config_path = data_directory.join("private-routing.toml");
         let _ = PrivateRoutingConfig::create_default(&private_config_path);
-        let _ = harden_private_path(&private_config_path);
+        let _ = harden_private_config_files(&private_config_path);
         let private_config = PrivateRoutingConfig::load(&private_config_path).unwrap_or_default();
         let routing_engine = RoutingEngine::new(
             private_config.route_mode,
@@ -154,16 +145,18 @@ impl AppState {
     }
 
     #[must_use]
-    pub fn port_snapshot(port: u16) -> PortSnapshot {
+    pub fn port_snapshot(host: &str, port: u16) -> PortSnapshot {
         PortSnapshot {
+            host: host.into(),
             port,
-            reachable: is_port_reachable(port),
+            reachable: is_endpoint_reachable(host, port),
             owner_pid: listening_owner_pid(port),
         }
     }
 
     pub fn routing_status(&self) -> Result<RoutingStatus, String> {
         let config = self.private_config()?;
+        let resolved = config.resolved_subscription_urls();
         let controller_ready = self.controller_client()?.is_some();
         let engine = self
             .routing_engine
@@ -174,8 +167,7 @@ impl AppState {
             current_outlet: engine.current_outlet().map(str::to_owned),
             manual_outlet: engine.manual_outlet().map(str::to_owned),
             controller_ready,
-            subscription_configured: config.subscription_configured(),
-            provider_update_seconds: config.provider_update_seconds,
+            outlets: config.summary(&resolved).outlets,
             message: if controller_ready {
                 "Mihomo Controller 已连接，模式会改变真实选择器".into()
             } else {
@@ -202,27 +194,12 @@ impl AppState {
         config
             .save(&self.private_config_path)
             .map_err(|error| format!("无法保存私密路由配置：{error}"))?;
-        harden_private_path(&self.private_config_path)?;
+        harden_private_config_files(&self.private_config_path)?;
         self.routing_engine
             .lock()
             .map_err(|_| "路由策略状态锁已损坏".to_string())?
             .set_mode(mode, manual_outlet);
         Ok(())
-    }
-
-    pub fn save_subscription_url(&self, value: &str) -> Result<PrivateConfigSummary, String> {
-        if self.controller_client()?.is_some() {
-            return Err("请先停止开发核心，再更新订阅配置".into());
-        }
-        let mut config = self.private_config()?;
-        config
-            .set_subscription_url(value)
-            .map_err(|error| format!("订阅配置无效：{error}"))?;
-        config
-            .save(&self.private_config_path)
-            .map_err(|error| format!("无法保存订阅配置：{error}"))?;
-        harden_private_path(&self.private_config_path)?;
-        Ok(config.summary())
     }
 
     pub fn evaluate_route(
@@ -288,16 +265,20 @@ impl AppState {
                 managed: true,
                 pid: Some(core.child.id()),
                 started_at: Some(core.started_at.clone()),
-                message: "开发核心正在 36666 运行".into(),
+                message: format!("开发核心正在 {}:{} 运行", core.entry_host, core.entry_port),
             });
         }
-        if is_port_reachable(DEVELOPMENT_PORT) {
+        let config = self.private_config()?;
+        if is_endpoint_reachable(&config.entry.host, config.entry.port) {
             return Ok(CoreStatus {
                 state: "external".into(),
                 managed: false,
-                pid: listening_owner_pid(DEVELOPMENT_PORT),
+                pid: listening_owner_pid(config.entry.port),
                 started_at: None,
-                message: "36666 已被其他进程占用，本应用不会停止它".into(),
+                message: format!(
+                    "{}:{} 已被其他进程占用，本应用不会停止它",
+                    config.entry.host, config.entry.port
+                ),
             });
         }
         Ok(CoreStatus {
@@ -311,10 +292,12 @@ impl AppState {
 
     pub fn start_development_core(&self) -> Result<CoreStatus, String> {
         self.ensure_runtime_ready()?;
-        let protected_owner_pid = listening_owner_pid(PROTECTED_PORT)
-            .ok_or_else(|| "受保护端口 6666 当前没有监听者，拒绝启动开发核心".to_string())?;
-        if is_port_reachable(DEVELOPMENT_PORT) {
-            return Err("开发端口 36666 已被占用；本应用不会接管未知进程".into());
+        let private_config = self.private_config()?;
+        if is_endpoint_reachable(&private_config.entry.host, private_config.entry.port) {
+            return Err(format!(
+                "配置入口 {}:{} 已被占用；本应用不会接管未知进程",
+                private_config.entry.host, private_config.entry.port
+            ));
         }
         let mut guard = self
             .managed_core
@@ -324,15 +307,15 @@ impl AppState {
             return Err("本应用已经持有一个 Mihomo 开发进程".into());
         }
 
-        let private_config = self.private_config()?;
-        if is_port_reachable(private_config.controller_port) {
+        if is_endpoint_reachable("127.0.0.1", private_config.controller_port) {
             return Err("本机 Controller 端口已被占用，拒绝接管未知进程".into());
         }
         fs::create_dir_all(&self.runtime_directory)
             .map_err(|error| format!("无法创建 Mihomo 运行目录：{error}"))?;
         harden_private_path(&self.runtime_directory)?;
         let controller_secret = generate_controller_secret();
-        let (yaml, _) = generate_mihomo_config(&private_config, &controller_secret)
+        let resolved = private_config.resolved_subscription_urls();
+        let (yaml, _) = generate_mihomo_config(&private_config, &resolved, &controller_secret)
             .map_err(|error| format!("无法生成 Mihomo 配置：{error}"))?;
         let config_path = self.runtime_directory.join("mihomo.yaml");
         fs::write(&config_path, yaml).map_err(|_| "无法写入本机 Mihomo 运行配置".to_string())?;
@@ -365,8 +348,8 @@ impl AppState {
             .map_err(|error| format!("无法启动 Mihomo：{error}"))?;
 
         for _ in 0..50 {
-            if is_port_reachable(DEVELOPMENT_PORT)
-                && is_port_reachable(private_config.controller_port)
+            if is_endpoint_reachable(&private_config.entry.host, private_config.entry.port)
+                && is_endpoint_reachable("127.0.0.1", private_config.controller_port)
             {
                 break;
             }
@@ -379,15 +362,14 @@ impl AppState {
             }
             thread::sleep(Duration::from_millis(100));
         }
-        if !is_port_reachable(DEVELOPMENT_PORT)
-            || !is_port_reachable(private_config.controller_port)
+        if !is_endpoint_reachable(&private_config.entry.host, private_config.entry.port)
+            || !is_endpoint_reachable("127.0.0.1", private_config.controller_port)
         {
             terminate_child(&mut child);
-            return Err("Mihomo 启动超时，36666 或本机 Controller 未就绪".into());
-        }
-        if listening_owner_pid(PROTECTED_PORT) != Some(protected_owner_pid) {
-            terminate_child(&mut child);
-            return Err("启动期间 6666 所有者发生变化；开发核心已停止".into());
+            return Err(format!(
+                "Mihomo 启动超时，{}:{} 或本机 Controller 未就绪",
+                private_config.entry.host, private_config.entry.port
+            ));
         }
 
         let pid = child.id();
@@ -398,8 +380,9 @@ impl AppState {
         }
         *guard = Some(ManagedCore {
             child,
-            protected_owner_pid,
             started_at: started_at.clone(),
+            entry_host: private_config.entry.host.clone(),
+            entry_port: private_config.entry.port,
             controller_port: private_config.controller_port,
             controller_secret,
         });
@@ -408,7 +391,10 @@ impl AppState {
             managed: true,
             pid: Some(pid),
             started_at: Some(started_at),
-            message: "开发核心已启动；36666 初始为 Fail Closed，等待健康决策".into(),
+            message: format!(
+                "开发核心已启动；{}:{} 初始为 Fail Closed，等待健康决策",
+                private_config.entry.host, private_config.entry.port
+            ),
         })
     }
 
@@ -421,16 +407,13 @@ impl AppState {
             return Err("没有由本应用启动的 Mihomo 进程；不会停止未知进程".into());
         };
         terminate_child(&mut core.child);
-        if listening_owner_pid(PROTECTED_PORT) != Some(core.protected_owner_pid) {
-            return Err("开发核心停止后检测到 6666 所有者发生变化".into());
-        }
         self.reset_routing_session()?;
         Ok(CoreStatus {
             state: "stopped".into(),
             managed: false,
             pid: None,
             started_at: None,
-            message: "开发核心已停止；6666 所有者保持不变".into(),
+            message: "开发核心已停止；未修改系统代理或第三方客户端".into(),
         })
     }
 
@@ -516,6 +499,15 @@ fn clear_legacy_raw_logs(runtime_directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn harden_private_config_files(path: &Path) -> Result<(), String> {
+    harden_private_path(path)?;
+    let backup = path.with_extension("toml.bak");
+    if backup.exists() {
+        harden_private_path(&backup)?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum CoreDiagnostic {
     ValidationFailed,
@@ -556,8 +548,15 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn is_port_reachable(port: u16) -> bool {
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+fn is_endpoint_reachable(host: &str, port: u16) -> bool {
+    let ip = if host.eq_ignore_ascii_case("localhost") {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else if let Ok(ip) = host.parse() {
+        ip
+    } else {
+        return false;
+    };
+    let address = SocketAddr::new(ip, port);
     TcpStream::connect_timeout(&address, Duration::from_millis(180)).is_ok()
 }
 
@@ -632,7 +631,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use vpn_hub_core::{
-        HealthStatus, LOCAL_OUTLET, LOCAL_PROXY, MASTER_SELECTOR, OutletHealth, RoutingPolicy,
+        HealthStatus, MASTER_SELECTOR, OutletConfig, OutletHealth, OutletKind, RoutingPolicy,
+        outlet_proxy_name,
     };
 
     #[test]
@@ -640,15 +640,26 @@ mod tests {
         let sensitive_url =
             "https://example.invalid/provider/credential-token-value/node-detail-value";
         let mut config = PrivateRoutingConfig::default();
-        config
-            .set_subscription_url(sensitive_url)
-            .expect("synthetic URL");
+        config.outlets.push(OutletConfig {
+            id: "subscription-a".into(),
+            label: "Subscription A".into(),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: "secret.a".into(),
+                provider_update_seconds: 180,
+            },
+        });
+        let resolved = [("secret.a".into(), sensitive_url.into())]
+            .into_iter()
+            .collect();
         let rejected_url = "https://user:credential-token-value@example.invalid/node-detail-value";
-        let rejected_error = config
-            .set_subscription_url(rejected_url)
+        let rejected = [("secret.a".into(), rejected_url.into())]
+            .into_iter()
+            .collect();
+        let rejected_error = generate_mihomo_config(&config, &rejected, "controller-secret")
             .expect_err("userinfo must be rejected")
             .to_string();
-        let ui_summary = serde_json::to_string(&config.summary()).expect("summary");
+        let ui_summary = serde_json::to_string(&config.summary(&resolved)).expect("summary");
         let diagnostics = [
             core_diagnostic(CoreDiagnostic::ValidationFailed),
             core_diagnostic(CoreDiagnostic::ExitedBeforeReady),
@@ -689,9 +700,10 @@ mod tests {
 
     #[test]
     fn core_exit_and_restart_reset_current_route_session() {
+        const OUTLET: &str = "local-a";
         let engine = Mutex::new(RoutingEngine::new(RouteMode::Priority, None));
         let health = [(
-            LOCAL_OUTLET.to_owned(),
+            OUTLET.to_owned(),
             OutletHealth {
                 status: HealthStatus::Healthy,
                 latency_ms: Some(100),
@@ -700,7 +712,7 @@ mod tests {
         .into_iter()
         .collect();
         let policy = RoutingPolicy {
-            priority: vec![LOCAL_OUTLET.into()],
+            priority: vec![OUTLET.into()],
             cooldown_ms: 60_000,
             minimum_improvement_ms: 100,
         };
@@ -769,35 +781,39 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the pinned Mihomo binary and live local outlet on 16666"]
+    #[ignore = "requires the pinned Mihomo binary and a configured live local outlet"]
     fn starts_and_stops_only_the_isolated_development_core() {
-        let protected_owner_before = listening_owner_pid(PROTECTED_PORT)
-            .expect("protected port 6666 must already have an owner");
-        assert!(!is_port_reachable(DEVELOPMENT_PORT));
         let state = AppState::new();
+        let config = state.private_config().expect("config");
+        assert!(!is_endpoint_reachable(
+            &config.entry.host,
+            config.entry.port
+        ));
         let running = state.start_development_core().expect("start core");
         assert_eq!(running.state, "running");
-        assert!(is_port_reachable(DEVELOPMENT_PORT));
-        assert_eq!(
-            listening_owner_pid(PROTECTED_PORT),
-            Some(protected_owner_before)
-        );
+        assert!(is_endpoint_reachable(&config.entry.host, config.entry.port));
         let stopped = state.stop_development_core().expect("stop core");
         assert_eq!(stopped.state, "stopped");
-        assert!(!is_port_reachable(DEVELOPMENT_PORT));
-        assert_eq!(
-            listening_owner_pid(PROTECTED_PORT),
-            Some(protected_owner_before)
-        );
+        assert!(!is_endpoint_reachable(
+            &config.entry.host,
+            config.entry.port
+        ));
     }
 
     #[test]
-    #[ignore = "requires the pinned Mihomo binary, live local outlet on 16666, and external HTTPS"]
+    #[ignore = "requires the pinned Mihomo binary, a configured live local outlet, and external HTTPS"]
     fn controller_selects_local_outlet_for_real_https() {
-        let protected_owner_before = listening_owner_pid(PROTECTED_PORT)
-            .expect("protected port 6666 must already have an owner");
-        assert!(!is_port_reachable(DEVELOPMENT_PORT));
         let state = AppState::new();
+        let config = state.private_config().expect("config");
+        let local_id = config
+            .enabled_outlets()
+            .find(|outlet| matches!(outlet.kind, OutletKind::LocalProxy { .. }))
+            .map(|outlet| outlet.id.clone())
+            .expect("configured local outlet");
+        assert!(!is_endpoint_reachable(
+            &config.entry.host,
+            config.entry.port
+        ));
         state.start_development_core().expect("start core");
         let controller = state
             .controller_client()
@@ -805,7 +821,7 @@ mod tests {
             .expect("controller");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         runtime
-            .block_on(controller.select(MASTER_SELECTOR, LOCAL_PROXY))
+            .block_on(controller.select(MASTER_SELECTOR, &outlet_proxy_name(&local_id)))
             .expect("select local outlet");
         let response = hidden_command("curl.exe")
             .args([
@@ -815,26 +831,24 @@ mod tests {
                 "--max-time",
                 "20",
                 "--proxy",
-                "socks5h://127.0.0.1:36666",
+                &format!("socks5h://{}:{}", config.entry.host, config.entry.port),
                 "https://www.gstatic.com/generate_204",
             ])
             .status()
             .expect("curl");
         assert!(response.success());
         state.stop_development_core().expect("stop core");
-        assert_eq!(
-            listening_owner_pid(PROTECTED_PORT),
-            Some(protected_owner_before)
-        );
     }
 
     #[test]
     #[ignore = "requires the pinned Mihomo binary and external HTTPS"]
     fn initial_selector_is_fail_closed() {
-        let protected_owner_before = listening_owner_pid(PROTECTED_PORT)
-            .expect("protected port 6666 must already have an owner");
-        assert!(!is_port_reachable(DEVELOPMENT_PORT));
         let state = AppState::new();
+        let config = state.private_config().expect("config");
+        assert!(!is_endpoint_reachable(
+            &config.entry.host,
+            config.entry.port
+        ));
         state.start_development_core().expect("start core");
         let response = hidden_command("curl.exe")
             .args([
@@ -843,16 +857,12 @@ mod tests {
                 "--max-time",
                 "5",
                 "--proxy",
-                "socks5h://127.0.0.1:36666",
+                &format!("socks5h://{}:{}", config.entry.host, config.entry.port),
                 "https://www.gstatic.com/generate_204",
             ])
             .status()
             .expect("curl");
         assert!(!response.success());
         state.stop_development_core().expect("stop core");
-        assert_eq!(
-            listening_owner_pid(PROTECTED_PORT),
-            Some(protected_owner_before)
-        );
     }
 }

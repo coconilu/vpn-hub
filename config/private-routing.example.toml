@@ -1,11 +1,8 @@
-# Copy this shape only to the app-managed local private configuration.
-# Never commit a real subscription URL.
-subscription_url = ""
-provider_update_seconds = 180
+# Versioned product configuration. Never place a subscription URL here.
+version = 1
 controller_port = 39090
 route_mode = "priority"
-manual_outlet = "chaoshihui"
-priority = ["subscription-a", "chaoshihui"]
+manual_outlet = "local-a"
 cooldown_seconds = 60
 minimum_improvement_ms = 150
 probe_targets = [
@@ -13,3 +10,45 @@ probe_targets = [
   "https://www.baidu.com/",
   "https://github.com/",
 ]
+
+[entry]
+host = "127.0.0.1"
+port = 3666
+
+[[outlets]]
+id = "subscription-a"
+label = "Subscription A"
+enabled = true
+kind = "subscription"
+secret_ref = "subscription.a"
+provider_update_seconds = 180
+
+[[outlets]]
+id = "subscription-b"
+label = "Subscription B"
+enabled = true
+kind = "subscription"
+secret_ref = "subscription.b"
+provider_update_seconds = 180
+
+[[outlets]]
+id = "subscription-c"
+label = "Subscription C"
+enabled = false
+kind = "subscription"
+secret_ref = "subscription.c"
+provider_update_seconds = 300
+
+[[outlets]]
+id = "local-a"
+label = "Local client A"
+enabled = true
+kind = "local_proxy"
+endpoint = "socks5h://127.0.0.1:2666"
+
+[[outlets]]
+id = "local-b"
+label = "Local client B"
+enabled = true
+kind = "local_proxy"
+endpoint = "http://127.0.0.1:4666"

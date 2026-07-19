@@ -8,7 +8,8 @@ use thiserror::Error;
 pub struct GuardianConfig {
     pub database_path: std::path::PathBuf,
     pub monitor: MonitorConfig,
-    pub outlets: Vec<OutletConfig>,
+    #[serde(default)]
+    pub outlets: Vec<ProbeOutletConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +27,7 @@ pub struct MonitorConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutletConfig {
+pub struct ProbeOutletConfig {
     pub id: String,
     pub label: String,
     pub proxy_url: String,
@@ -109,7 +110,7 @@ impl GuardianConfig {
     }
 }
 
-impl OutletConfig {
+impl ProbeOutletConfig {
     /// Returns the local socket address encoded in the proxy URL.
     ///
     /// # Errors
@@ -141,7 +142,7 @@ impl OutletConfig {
     }
 }
 
-fn validate_proxy_url(outlet: &OutletConfig) -> Result<(), ConfigError> {
+fn validate_proxy_url(outlet: &ProbeOutletConfig) -> Result<(), ConfigError> {
     let url = Url::parse(&outlet.proxy_url)
         .map_err(|_| ConfigError::Invalid(format!("invalid proxy URL for {}", outlet.id)))?;
     if !matches!(url.scheme(), "http" | "socks5" | "socks5h") {
@@ -153,7 +154,7 @@ fn validate_proxy_url(outlet: &OutletConfig) -> Result<(), ConfigError> {
     outlet.socket_addr().map(|_| ())
 }
 
-fn validate_probe_url(outlet: &OutletConfig) -> Result<(), ConfigError> {
+fn validate_probe_url(outlet: &ProbeOutletConfig) -> Result<(), ConfigError> {
     let url = Url::parse(&outlet.probe_url)
         .map_err(|_| ConfigError::Invalid(format!("invalid probe URL for {}", outlet.id)))?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -201,7 +202,7 @@ mod tests {
                 failure_threshold: 2,
                 recovery_threshold: 3,
             },
-            outlets: vec![OutletConfig {
+            outlets: vec![ProbeOutletConfig {
                 id: "local-a".into(),
                 label: "Local A".into(),
                 proxy_url: "socks5h://127.0.0.1:16666".into(),

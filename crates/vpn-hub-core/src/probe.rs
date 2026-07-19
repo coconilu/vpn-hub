@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 use chrono::{SecondsFormat, Utc};
 use tokio::{net::TcpStream, time::timeout};
 
-use crate::{HealthStatus, MonitorConfig, OutletConfig, ProbeResult};
+use crate::{HealthStatus, MonitorConfig, ProbeOutletConfig, ProbeResult};
 
-pub async fn probe_outlet(outlet: &OutletConfig, monitor: &MonitorConfig) -> ProbeResult {
+pub async fn probe_outlet(outlet: &ProbeOutletConfig, monitor: &MonitorConfig) -> ProbeResult {
     let observed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let mut base = ProbeResult {
         outlet_id: outlet.id.clone(),
@@ -84,7 +84,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_local_port_is_down() {
-        let outlet = OutletConfig {
+        let outlet = ProbeOutletConfig {
             id: "closed".into(),
             label: "Closed".into(),
             proxy_url: "socks5h://127.0.0.1:9".into(),

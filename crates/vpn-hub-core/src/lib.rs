@@ -12,19 +12,19 @@ mod probe;
 mod routing;
 mod store;
 
-pub use config::{ConfigError, GuardianConfig, MonitorConfig, OutletConfig};
+pub use config::{ConfigError, GuardianConfig, MonitorConfig, ProbeOutletConfig};
 pub use controller::{ControllerClient, ControllerError};
 pub use mihomo::{
-    FAIL_CLOSED_PROXY, LOCAL_PROXY, MASTER_SELECTOR, PrivateConfigError, PrivateConfigSummary,
-    PrivateRoutingConfig, RuntimeConfigSummary, SUBSCRIPTION_PROXY, generate_controller_secret,
-    generate_mihomo_config, outlet_proxy_name,
+    CURRENT_CONFIG_VERSION, EntryConfig, FAIL_CLOSED_PROXY, MASTER_SELECTOR, OutletConfig,
+    OutletConfigSummary, OutletKind, PrivateConfigError, PrivateConfigSummary,
+    PrivateRoutingConfig, ResolvedSubscriptionUrls, RuntimeConfigSummary,
+    generate_controller_secret, generate_mihomo_config, outlet_proxy_name,
 };
 pub use model::{
     HealthStatus, LatencySample, OutletSummary, ProbeResult, RouteSwitchEvent, StateEvent,
 };
 pub use probe::probe_outlet;
 pub use routing::{
-    FAIL_CLOSED_OUTLET, LOCAL_OUTLET, OutletHealth, RouteDecision, RouteMode, RoutingEngine,
-    RoutingPolicy, SUBSCRIPTION_OUTLET,
+    FAIL_CLOSED_OUTLET, OutletHealth, RouteDecision, RouteMode, RoutingEngine, RoutingPolicy,
 };
 pub use store::{GuardianStore, StoreError};

@@ -1,48 +1,151 @@
 use std::fmt::Write as _;
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{collections::BTreeMap, fs, net::IpAddr, path::Path};
 
 use rand::RngCore;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{LOCAL_OUTLET, RouteMode, SUBSCRIPTION_OUTLET};
+use crate::RouteMode;
 
+pub const CURRENT_CONFIG_VERSION: u32 = 1;
 pub const MASTER_SELECTOR: &str = "VPN-HUB-MASTER";
-pub const SUBSCRIPTION_PROXY: &str = "VPN-HUB-SUBSCRIPTION-A";
-pub const LOCAL_PROXY: &str = "VPN-HUB-CHAOSHIHUI";
 pub const FAIL_CLOSED_PROXY: &str = "REJECT";
+const DEFAULT_ENTRY_PORT: u16 = 3_666;
+const LEGACY_SUBSCRIPTION_ID: &str = "subscription-a";
+const LEGACY_LOCAL_ID: &str = "chaoshihui";
+const LEGACY_SECRET_REF: &str = "legacy.subscription-a";
+
+pub type ResolvedSubscriptionUrls = BTreeMap<String, String>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EntryConfig {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for EntryConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".into(),
+            port: DEFAULT_ENTRY_PORT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutletConfig {
+    pub id: String,
+    pub label: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub kind: OutletKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutletKind {
+    Subscription {
+        secret_ref: String,
+        #[serde(default = "default_provider_update_seconds")]
+        provider_update_seconds: u64,
+    },
+    LocalProxy {
+        endpoint: String,
+    },
+}
+
+impl OutletConfig {
+    #[must_use]
+    pub const fn kind_name(&self) -> &'static str {
+        match self.kind {
+            OutletKind::Subscription { .. } => "subscription",
+            OutletKind::LocalProxy { .. } => "local_proxy",
+        }
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> Option<&str> {
+        match &self.kind {
+            OutletKind::Subscription { .. } => None,
+            OutletKind::LocalProxy { endpoint } => Some(endpoint),
+        }
+    }
+
+    #[must_use]
+    pub fn secret_ref(&self) -> Option<&str> {
+        match &self.kind {
+            OutletKind::Subscription { secret_ref, .. } => Some(secret_ref),
+            OutletKind::LocalProxy { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn provider_update_seconds(&self) -> Option<u64> {
+        match self.kind {
+            OutletKind::Subscription {
+                provider_update_seconds,
+                ..
+            } => Some(provider_update_seconds),
+            OutletKind::LocalProxy { .. } => None,
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PrivateRoutingConfig {
-    subscription_url: String,
-    pub provider_update_seconds: u64,
+    pub version: u32,
+    pub entry: EntryConfig,
     pub controller_port: u16,
     pub route_mode: RouteMode,
     pub manual_outlet: Option<String>,
-    pub priority: Vec<String>,
     pub cooldown_seconds: u64,
     pub minimum_improvement_ms: u64,
     pub probe_targets: Vec<String>,
+    pub outlets: Vec<OutletConfig>,
+    #[serde(skip)]
+    legacy_subscription_urls: ResolvedSubscriptionUrls,
+    #[serde(skip)]
+    source_format: SourceFormat,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SourceFormat {
+    #[default]
+    Versioned,
+    Legacy,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PrivateConfigSummary {
-    pub subscription_configured: bool,
-    pub provider_update_seconds: u64,
+    pub version: u32,
+    pub entry: EntryConfig,
     pub route_mode: RouteMode,
     pub manual_outlet: Option<String>,
     pub cooldown_seconds: u64,
     pub probe_target_count: usize,
+    pub outlets: Vec<OutletConfigSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OutletConfigSummary {
+    pub outlet_id: String,
+    pub label: String,
+    pub kind: String,
+    pub enabled: bool,
+    pub endpoint: Option<String>,
+    pub configured: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeConfigSummary {
-    pub entry_port: u16,
+    pub entry: EntryConfig,
     pub controller_port: u16,
-    pub subscription_enabled: bool,
-    pub provider_update_seconds: u64,
+    pub enabled_outlet_count: usize,
+    pub configured_subscription_count: usize,
     pub has_direct_fallback: bool,
 }
 
@@ -63,12 +166,11 @@ pub enum PrivateConfigError {
 impl Default for PrivateRoutingConfig {
     fn default() -> Self {
         Self {
-            subscription_url: String::new(),
-            provider_update_seconds: 180,
+            version: CURRENT_CONFIG_VERSION,
+            entry: EntryConfig::default(),
             controller_port: 39_090,
             route_mode: RouteMode::Priority,
             manual_outlet: None,
-            priority: vec![SUBSCRIPTION_OUTLET.into(), LOCAL_OUTLET.into()],
             cooldown_seconds: 60,
             minimum_improvement_ms: 150,
             probe_targets: vec![
@@ -76,24 +178,50 @@ impl Default for PrivateRoutingConfig {
                 "https://www.baidu.com/".into(),
                 "https://github.com/".into(),
             ],
+            outlets: Vec::new(),
+            legacy_subscription_urls: BTreeMap::new(),
+            source_format: SourceFormat::Versioned,
         }
     }
 }
 
 impl PrivateRoutingConfig {
-    /// Loads a local-only TOML file without including its content in errors.
+    /// Loads either the current versioned format or the legacy fixed dual-outlet format.
+    /// A damaged primary file falls back to the last atomically saved backup.
     ///
     /// # Errors
     ///
     /// Returns sanitized read, parse, or validation failures.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, PrivateConfigError> {
+        let path = path.as_ref();
+        match Self::load_exact(path) {
+            Ok(config) => Ok(config),
+            Err(primary_error) => {
+                let backup = backup_path(path);
+                Self::load_exact(&backup).map_err(|_| primary_error)
+            }
+        }
+    }
+
+    fn load_exact(path: &Path) -> Result<Self, PrivateConfigError> {
         let content = fs::read_to_string(path).map_err(|_| PrivateConfigError::Read)?;
-        let config = toml::from_str::<Self>(&content).map_err(|_| PrivateConfigError::Parse)?;
+        let document =
+            toml::from_str::<toml::Value>(&content).map_err(|_| PrivateConfigError::Parse)?;
+        let config = if document.get("version").is_some() {
+            let mut config =
+                toml::from_str::<Self>(&content).map_err(|_| PrivateConfigError::Parse)?;
+            config.source_format = SourceFormat::Versioned;
+            config
+        } else {
+            let legacy = toml::from_str::<LegacyPrivateRoutingConfig>(&content)
+                .map_err(|_| PrivateConfigError::Parse)?;
+            Self::from_legacy(legacy)?
+        };
         config.validate()?;
         Ok(config)
     }
 
-    /// Creates the default private config if absent.
+    /// Creates the default versioned config if absent.
     ///
     /// # Errors
     ///
@@ -109,81 +237,95 @@ impl PrivateRoutingConfig {
         Self::default().save(path)
     }
 
-    /// Saves the private config. Callers must apply OS-level ACL hardening.
+    /// Saves an already validated config through a temporary file and retains
+    /// the previous valid document as a rollback candidate.
     ///
     /// # Errors
     ///
-    /// Returns a sanitized serialization or write failure.
+    /// Returns a sanitized validation, serialization, or write failure.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), PrivateConfigError> {
         self.validate()?;
-        let content = toml::to_string_pretty(self).map_err(|_| PrivateConfigError::Write)?;
-        fs::write(path, content).map_err(|_| PrivateConfigError::Write)
-    }
-
-    /// Replaces only the subscription URL after validating HTTPS.
-    ///
-    /// # Errors
-    ///
-    /// Returns a validation error without echoing the URL.
-    pub fn set_subscription_url(&mut self, value: &str) -> Result<(), PrivateConfigError> {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            self.subscription_url.clear();
-            return Ok(());
-        }
-        validate_subscription_url(trimmed)?;
-        trimmed.clone_into(&mut self.subscription_url);
-        Ok(())
+        let content = if self.source_format == SourceFormat::Legacy {
+            toml::to_string_pretty(&self.as_legacy()).map_err(|_| PrivateConfigError::Write)?
+        } else {
+            toml::to_string_pretty(self).map_err(|_| PrivateConfigError::Write)?
+        };
+        atomic_save(path.as_ref(), content.as_bytes())
     }
 
     #[must_use]
-    pub fn subscription_configured(&self) -> bool {
-        !self.subscription_url.is_empty()
+    pub fn priority(&self) -> Vec<String> {
+        self.outlets
+            .iter()
+            .filter(|outlet| outlet.enabled)
+            .map(|outlet| outlet.id.clone())
+            .collect()
+    }
+
+    pub fn enabled_outlets(&self) -> impl Iterator<Item = &OutletConfig> {
+        self.outlets.iter().filter(|outlet| outlet.enabled)
     }
 
     #[must_use]
-    pub fn summary(&self) -> PrivateConfigSummary {
+    pub fn resolved_subscription_urls(&self) -> ResolvedSubscriptionUrls {
+        self.legacy_subscription_urls.clone()
+    }
+
+    #[must_use]
+    pub fn summary(&self, resolved: &ResolvedSubscriptionUrls) -> PrivateConfigSummary {
         PrivateConfigSummary {
-            subscription_configured: self.subscription_configured(),
-            provider_update_seconds: self.provider_update_seconds,
+            version: self.version,
+            entry: self.entry.clone(),
             route_mode: self.route_mode,
             manual_outlet: self.manual_outlet.clone(),
             cooldown_seconds: self.cooldown_seconds,
             probe_target_count: self.probe_targets.len(),
+            outlets: self
+                .outlets
+                .iter()
+                .map(|outlet| OutletConfigSummary {
+                    outlet_id: outlet.id.clone(),
+                    label: outlet.label.clone(),
+                    kind: outlet.kind_name().into(),
+                    enabled: outlet.enabled,
+                    endpoint: outlet.endpoint().map(str::to_owned),
+                    configured: match &outlet.kind {
+                        OutletKind::Subscription { secret_ref, .. } => {
+                            resolved.contains_key(secret_ref)
+                        }
+                        OutletKind::LocalProxy { .. } => true,
+                    },
+                })
+                .collect(),
         }
     }
 
-    fn validate(&self) -> Result<(), PrivateConfigError> {
-        if self.subscription_configured() {
-            validate_subscription_url(&self.subscription_url)?;
+    /// Validates version, loopback boundaries, stable IDs and route references.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized validation error before any runtime config is applied.
+    pub fn validate(&self) -> Result<(), PrivateConfigError> {
+        if self.version != CURRENT_CONFIG_VERSION {
+            return Err(PrivateConfigError::Invalid(format!(
+                "unsupported config version: {}",
+                self.version
+            )));
         }
-        if self.provider_update_seconds < 60 {
+        let entry_ip = parse_loopback(&self.entry.host, "entry.host")?;
+        if self.entry.port == 0 {
             return Err(PrivateConfigError::Invalid(
-                "provider_update_seconds must be at least 60".into(),
+                "entry.port must be a valid port".into(),
             ));
         }
-        if matches!(self.controller_port, 6_666 | 16_666 | 36_666) {
+        if self.entry.port == self.controller_port {
             return Err(PrivateConfigError::Invalid(
-                "controller_port conflicts with a protected routing port".into(),
+                "entry.port conflicts with controller_port".into(),
             ));
         }
-        if self.priority.is_empty()
-            || self
-                .priority
-                .iter()
-                .any(|id| !matches!(id.as_str(), SUBSCRIPTION_OUTLET | LOCAL_OUTLET))
-        {
+        if self.controller_port == 0 {
             return Err(PrivateConfigError::Invalid(
-                "priority contains an unknown outlet".into(),
-            ));
-        }
-        if self
-            .manual_outlet
-            .as_deref()
-            .is_some_and(|id| !matches!(id, SUBSCRIPTION_OUTLET | LOCAL_OUTLET))
-        {
-            return Err(PrivateConfigError::Invalid(
-                "manual_outlet is unknown".into(),
+                "controller_port must be a valid port".into(),
             ));
         }
         if self.cooldown_seconds == 0 {
@@ -205,6 +347,226 @@ impl PrivateRoutingConfig {
                 ));
             }
         }
+
+        let ids = validate_outlets(self, entry_ip)?;
+        if let Some(manual) = self.manual_outlet.as_deref()
+            && !ids.contains(manual)
+        {
+            return Err(PrivateConfigError::Invalid(
+                "manual_outlet is unknown".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn from_legacy(legacy: LegacyPrivateRoutingConfig) -> Result<Self, PrivateConfigError> {
+        legacy.validate()?;
+        let mut outlets = Vec::new();
+        let mut legacy_subscription_urls = BTreeMap::new();
+        if !legacy.subscription_url.is_empty() {
+            outlets.push(OutletConfig {
+                id: LEGACY_SUBSCRIPTION_ID.into(),
+                label: "Subscription A".into(),
+                enabled: true,
+                kind: OutletKind::Subscription {
+                    secret_ref: LEGACY_SECRET_REF.into(),
+                    provider_update_seconds: legacy.provider_update_seconds,
+                },
+            });
+            legacy_subscription_urls
+                .insert(LEGACY_SECRET_REF.into(), legacy.subscription_url.clone());
+        }
+        outlets.push(OutletConfig {
+            id: LEGACY_LOCAL_ID.into(),
+            label: "Local client A".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "socks5h://127.0.0.1:16666".into(),
+            },
+        });
+        let order = legacy
+            .priority
+            .iter()
+            .filter_map(|id| outlets.iter().find(|outlet| outlet.id == *id).cloned())
+            .chain(
+                outlets
+                    .iter()
+                    .filter(|outlet| !legacy.priority.contains(&outlet.id))
+                    .cloned(),
+            )
+            .collect();
+        Ok(Self {
+            version: CURRENT_CONFIG_VERSION,
+            entry: EntryConfig {
+                host: "127.0.0.1".into(),
+                port: 36_666,
+            },
+            controller_port: legacy.controller_port,
+            route_mode: legacy.route_mode,
+            manual_outlet: legacy.manual_outlet,
+            cooldown_seconds: legacy.cooldown_seconds,
+            minimum_improvement_ms: legacy.minimum_improvement_ms,
+            probe_targets: legacy.probe_targets,
+            outlets: order,
+            legacy_subscription_urls,
+            source_format: SourceFormat::Legacy,
+        })
+    }
+
+    fn as_legacy(&self) -> LegacyPrivateRoutingConfig {
+        let subscription_url = self
+            .legacy_subscription_urls
+            .get(LEGACY_SECRET_REF)
+            .cloned()
+            .unwrap_or_default();
+        let provider_update_seconds = self
+            .outlets
+            .iter()
+            .find(|outlet| outlet.id == LEGACY_SUBSCRIPTION_ID)
+            .and_then(OutletConfig::provider_update_seconds)
+            .unwrap_or_else(default_provider_update_seconds);
+        LegacyPrivateRoutingConfig {
+            subscription_url,
+            provider_update_seconds,
+            controller_port: self.controller_port,
+            route_mode: self.route_mode,
+            manual_outlet: self.manual_outlet.clone(),
+            priority: self.priority(),
+            cooldown_seconds: self.cooldown_seconds,
+            minimum_improvement_ms: self.minimum_improvement_ms,
+            probe_targets: self.probe_targets.clone(),
+        }
+    }
+}
+
+fn validate_outlets(
+    config: &PrivateRoutingConfig,
+    entry_ip: IpAddr,
+) -> Result<std::collections::HashSet<&str>, PrivateConfigError> {
+    let mut ids = std::collections::HashSet::new();
+    let mut local_endpoints = std::collections::HashSet::new();
+    for outlet in &config.outlets {
+        validate_outlet_id(&outlet.id)?;
+        if outlet.label.trim().is_empty() {
+            return Err(PrivateConfigError::Invalid(
+                "outlet label must not be empty".into(),
+            ));
+        }
+        if !ids.insert(outlet.id.as_str()) {
+            return Err(PrivateConfigError::Invalid(format!(
+                "duplicate outlet id: {}",
+                outlet.id
+            )));
+        }
+        match &outlet.kind {
+            OutletKind::Subscription {
+                secret_ref,
+                provider_update_seconds,
+            } => validate_subscription_outlet(outlet, secret_ref, *provider_update_seconds)?,
+            OutletKind::LocalProxy { endpoint } => {
+                let endpoint = parse_local_proxy_endpoint(endpoint, &outlet.id)?;
+                if endpoint.ip() == entry_ip && endpoint.port() == config.entry.port {
+                    return Err(PrivateConfigError::Invalid(format!(
+                        "local proxy {} conflicts with the entry listener",
+                        outlet.id
+                    )));
+                }
+                if endpoint.port() == config.controller_port {
+                    return Err(PrivateConfigError::Invalid(format!(
+                        "local proxy {} conflicts with the controller listener",
+                        outlet.id
+                    )));
+                }
+                if !local_endpoints.insert(endpoint) {
+                    return Err(PrivateConfigError::Invalid(format!(
+                        "duplicate local proxy endpoint for {}",
+                        outlet.id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn validate_subscription_outlet(
+    outlet: &OutletConfig,
+    secret_ref: &str,
+    provider_update_seconds: u64,
+) -> Result<(), PrivateConfigError> {
+    if secret_ref.trim().is_empty() {
+        return Err(PrivateConfigError::Invalid(format!(
+            "secret_ref for {} must not be empty",
+            outlet.id
+        )));
+    }
+    if provider_update_seconds < 60 {
+        return Err(PrivateConfigError::Invalid(format!(
+            "provider_update_seconds for {} must be at least 60",
+            outlet.id
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct LegacyPrivateRoutingConfig {
+    subscription_url: String,
+    provider_update_seconds: u64,
+    controller_port: u16,
+    route_mode: RouteMode,
+    manual_outlet: Option<String>,
+    priority: Vec<String>,
+    cooldown_seconds: u64,
+    minimum_improvement_ms: u64,
+    probe_targets: Vec<String>,
+}
+
+impl Default for LegacyPrivateRoutingConfig {
+    fn default() -> Self {
+        Self {
+            subscription_url: String::new(),
+            provider_update_seconds: default_provider_update_seconds(),
+            controller_port: 39_090,
+            route_mode: RouteMode::Priority,
+            manual_outlet: None,
+            priority: vec![LEGACY_SUBSCRIPTION_ID.into(), LEGACY_LOCAL_ID.into()],
+            cooldown_seconds: 60,
+            minimum_improvement_ms: 150,
+            probe_targets: PrivateRoutingConfig::default().probe_targets,
+        }
+    }
+}
+
+impl LegacyPrivateRoutingConfig {
+    fn validate(&self) -> Result<(), PrivateConfigError> {
+        if !self.subscription_url.is_empty() {
+            validate_subscription_url(&self.subscription_url)?;
+        }
+        if self.provider_update_seconds < 60 || self.cooldown_seconds == 0 {
+            return Err(PrivateConfigError::Invalid(
+                "legacy routing thresholds are invalid".into(),
+            ));
+        }
+        if self
+            .priority
+            .iter()
+            .any(|id| !matches!(id.as_str(), LEGACY_SUBSCRIPTION_ID | LEGACY_LOCAL_ID))
+        {
+            return Err(PrivateConfigError::Invalid(
+                "legacy priority contains an unknown outlet".into(),
+            ));
+        }
+        if self
+            .manual_outlet
+            .as_deref()
+            .is_some_and(|id| !matches!(id, LEGACY_SUBSCRIPTION_ID | LEGACY_LOCAL_ID))
+        {
+            return Err(PrivateConfigError::Invalid(
+                "legacy manual_outlet is unknown".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -221,57 +583,84 @@ pub fn generate_controller_secret() -> String {
         })
 }
 
-/// Generates a dual-outlet Mihomo config in memory.
+/// Generates a dynamic, loopback-only and fail-closed Mihomo config in memory.
 ///
 /// # Errors
 ///
-/// Returns a sanitized generation failure.
+/// Returns a sanitized validation or generation failure.
+#[allow(clippy::too_many_lines)]
 pub fn generate_mihomo_config(
     config: &PrivateRoutingConfig,
+    resolved_subscriptions: &ResolvedSubscriptionUrls,
     controller_secret: &str,
 ) -> Result<(String, RuntimeConfigSummary), PrivateConfigError> {
     config.validate()?;
-    let subscription_enabled = config.subscription_configured();
     let mut providers = BTreeMap::new();
-    if subscription_enabled {
-        providers.insert(
-            "subscription-a".to_owned(),
-            ProviderConfig {
-                provider_type: "http",
-                url: &config.subscription_url,
-                path: "./providers/subscription-a.yaml",
-                interval: config.provider_update_seconds,
-                health_check: ProviderHealthCheck {
-                    enable: true,
-                    url: &config.probe_targets[0],
-                    interval: config.provider_update_seconds,
-                    lazy: false,
-                },
-            },
-        );
-    }
-
+    let mut proxies = Vec::new();
     let mut groups = Vec::new();
-    if subscription_enabled {
-        groups.push(ProxyGroup {
-            name: SUBSCRIPTION_PROXY,
-            group_type: "url-test",
-            proxies: Vec::new(),
-            use_providers: vec!["subscription-a"],
-            url: Some(&config.probe_targets[0]),
-            interval: Some(config.provider_update_seconds),
-            tolerance: Some(100),
-            lazy: Some(false),
-        });
+    let mut master_proxies = vec![FAIL_CLOSED_PROXY.to_owned()];
+    let mut configured_subscription_count = 0;
+
+    for outlet in config.enabled_outlets() {
+        let proxy_name = outlet_proxy_name(&outlet.id);
+        match &outlet.kind {
+            OutletKind::Subscription {
+                secret_ref,
+                provider_update_seconds,
+            } => {
+                let Some(url) = resolved_subscriptions.get(secret_ref) else {
+                    continue;
+                };
+                validate_subscription_url(url)?;
+                let provider_name = provider_name(&outlet.id);
+                providers.insert(
+                    provider_name.clone(),
+                    ProviderConfig {
+                        provider_type: "http".into(),
+                        url: url.clone(),
+                        path: format!("./providers/{}.yaml", outlet.id),
+                        interval: *provider_update_seconds,
+                        health_check: ProviderHealthCheck {
+                            enable: true,
+                            url: config.probe_targets[0].clone(),
+                            interval: *provider_update_seconds,
+                            lazy: false,
+                        },
+                    },
+                );
+                groups.push(ProxyGroup {
+                    name: proxy_name.clone(),
+                    group_type: "url-test".into(),
+                    proxies: Vec::new(),
+                    use_providers: vec![provider_name],
+                    url: Some(config.probe_targets[0].clone()),
+                    interval: Some(*provider_update_seconds),
+                    tolerance: Some(100),
+                    lazy: Some(false),
+                });
+                configured_subscription_count += 1;
+            }
+            OutletKind::LocalProxy { endpoint } => {
+                let parsed = Url::parse(endpoint).map_err(|_| PrivateConfigError::Generate)?;
+                let address = parse_local_proxy_endpoint(endpoint, &outlet.id)?;
+                proxies.push(LocalProxyConfig {
+                    name: proxy_name.clone(),
+                    proxy_type: if parsed.scheme() == "http" {
+                        "http".into()
+                    } else {
+                        "socks5".into()
+                    },
+                    server: address.ip().to_string(),
+                    port: address.port(),
+                    udp: false,
+                });
+            }
+        }
+        master_proxies.push(proxy_name);
     }
-    let mut master_proxies = vec![FAIL_CLOSED_PROXY];
-    if subscription_enabled {
-        master_proxies.push(SUBSCRIPTION_PROXY);
-    }
-    master_proxies.push(LOCAL_PROXY);
     groups.push(ProxyGroup {
-        name: MASTER_SELECTOR,
-        group_type: "select",
+        name: MASTER_SELECTOR.into(),
+        group_type: "select".into(),
         proxies: master_proxies,
         use_providers: Vec::new(),
         url: None,
@@ -281,28 +670,22 @@ pub fn generate_mihomo_config(
     });
 
     let document = MihomoConfig {
-        mixed_port: 36_666,
-        bind_address: "127.0.0.1",
+        mixed_port: config.entry.port,
+        bind_address: parse_loopback(&config.entry.host, "entry.host")?.to_string(),
         allow_lan: false,
-        mode: "rule",
-        log_level: "warning",
+        mode: "rule".into(),
+        log_level: "warning".into(),
         ipv6: false,
-        find_process_mode: "off",
+        find_process_mode: "off".into(),
         unified_delay: true,
         tcp_concurrent: true,
         external_controller: format!("127.0.0.1:{}", config.controller_port),
-        secret: controller_secret,
+        secret: controller_secret.into(),
         profile: ProfileConfig {
             store_selected: false,
             store_fake_ip: false,
         },
-        proxies: vec![LocalProxyConfig {
-            name: LOCAL_PROXY,
-            proxy_type: "socks5",
-            server: "127.0.0.1",
-            port: 16_666,
-            udp: false,
-        }],
+        proxies,
         proxy_providers: providers,
         proxy_groups: groups,
         rules: vec![format!("MATCH,{MASTER_SELECTOR}")],
@@ -311,23 +694,26 @@ pub fn generate_mihomo_config(
     Ok((
         yaml,
         RuntimeConfigSummary {
-            entry_port: 36_666,
+            entry: config.entry.clone(),
             controller_port: config.controller_port,
-            subscription_enabled,
-            provider_update_seconds: config.provider_update_seconds,
+            enabled_outlet_count: config.enabled_outlets().count(),
+            configured_subscription_count,
             has_direct_fallback: false,
         },
     ))
 }
 
 #[must_use]
-pub fn outlet_proxy_name(outlet_id: &str) -> Option<&'static str> {
-    match outlet_id {
-        SUBSCRIPTION_OUTLET => Some(SUBSCRIPTION_PROXY),
-        LOCAL_OUTLET => Some(LOCAL_PROXY),
-        "fail-closed" => Some(FAIL_CLOSED_PROXY),
-        _ => None,
+pub fn outlet_proxy_name(outlet_id: &str) -> String {
+    if outlet_id == "fail-closed" {
+        FAIL_CLOSED_PROXY.into()
+    } else {
+        format!("VPN-HUB-OUTLET-{outlet_id}")
     }
+}
+
+fn provider_name(outlet_id: &str) -> String {
+    format!("vpn-hub-provider-{outlet_id}")
 }
 
 fn validate_subscription_url(value: &str) -> Result<(), PrivateConfigError> {
@@ -341,26 +727,130 @@ fn validate_subscription_url(value: &str) -> Result<(), PrivateConfigError> {
     Ok(())
 }
 
+fn validate_outlet_id(id: &str) -> Result<(), PrivateConfigError> {
+    let mut chars = id.chars();
+    let valid_first = chars
+        .next()
+        .is_some_and(|character| character.is_ascii_lowercase() || character.is_ascii_digit());
+    let valid_rest = chars.all(|character| {
+        character.is_ascii_lowercase()
+            || character.is_ascii_digit()
+            || matches!(character, '-' | '_')
+    });
+    if !valid_first || !valid_rest || id.len() > 64 {
+        return Err(PrivateConfigError::Invalid(
+            "outlet id must be 1-64 lowercase ASCII letters, digits, '-' or '_'".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_loopback(value: &str, field: &str) -> Result<IpAddr, PrivateConfigError> {
+    let ip = if value.eq_ignore_ascii_case("localhost") {
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else {
+        value
+            .parse::<IpAddr>()
+            .map_err(|_| PrivateConfigError::Invalid(format!("{field} must be loopback")))?
+    };
+    if !ip.is_loopback() {
+        return Err(PrivateConfigError::Invalid(format!(
+            "{field} must be loopback"
+        )));
+    }
+    Ok(ip)
+}
+
+fn parse_local_proxy_endpoint(
+    value: &str,
+    outlet_id: &str,
+) -> Result<std::net::SocketAddr, PrivateConfigError> {
+    let url = Url::parse(value).map_err(|_| {
+        PrivateConfigError::Invalid(format!("invalid local proxy endpoint for {outlet_id}"))
+    })?;
+    if !matches!(url.scheme(), "http" | "socks5" | "socks5h") {
+        return Err(PrivateConfigError::Invalid(format!(
+            "unsupported local proxy protocol for {outlet_id}"
+        )));
+    }
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "" | "/")
+    {
+        return Err(PrivateConfigError::Invalid(format!(
+            "local proxy endpoint for {outlet_id} must not contain credentials, path or query"
+        )));
+    }
+    let host = url.host_str().ok_or_else(|| {
+        PrivateConfigError::Invalid(format!("missing local proxy host for {outlet_id}"))
+    })?;
+    let ip = parse_loopback(host, &format!("local proxy host for {outlet_id}"))?;
+    let port = url.port().ok_or_else(|| {
+        PrivateConfigError::Invalid(format!("missing local proxy port for {outlet_id}"))
+    })?;
+    if port == 0 {
+        return Err(PrivateConfigError::Invalid(format!(
+            "local proxy port for {outlet_id} must be valid"
+        )));
+    }
+    Ok(std::net::SocketAddr::new(ip, port))
+}
+
+fn atomic_save(path: &Path, content: &[u8]) -> Result<(), PrivateConfigError> {
+    let temporary = path.with_extension("toml.tmp");
+    let backup = backup_path(path);
+    fs::write(&temporary, content).map_err(|_| PrivateConfigError::Write)?;
+    if path.exists() {
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|_| PrivateConfigError::Write)?;
+        }
+        fs::rename(path, &backup).map_err(|_| PrivateConfigError::Write)?;
+    }
+    if fs::rename(&temporary, path).is_err() {
+        if backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(PrivateConfigError::Write);
+    }
+    fs::copy(path, &backup).map_err(|_| PrivateConfigError::Write)?;
+    Ok(())
+}
+
+fn backup_path(path: &Path) -> std::path::PathBuf {
+    path.with_extension("toml.bak")
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+const fn default_provider_update_seconds() -> u64 {
+    180
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[allow(clippy::struct_excessive_bools)]
-struct MihomoConfig<'a> {
+struct MihomoConfig {
     mixed_port: u16,
-    bind_address: &'a str,
+    bind_address: String,
     allow_lan: bool,
-    mode: &'a str,
-    log_level: &'a str,
+    mode: String,
+    log_level: String,
     ipv6: bool,
-    find_process_mode: &'a str,
+    find_process_mode: String,
     unified_delay: bool,
     tcp_concurrent: bool,
     external_controller: String,
-    secret: &'a str,
+    secret: String,
     profile: ProfileConfig,
-    proxies: Vec<LocalProxyConfig<'a>>,
+    proxies: Vec<LocalProxyConfig>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    proxy_providers: BTreeMap<String, ProviderConfig<'a>>,
-    proxy_groups: Vec<ProxyGroup<'a>>,
+    proxy_providers: BTreeMap<String, ProviderConfig>,
+    proxy_groups: Vec<ProxyGroup>,
     rules: Vec<String>,
 }
 
@@ -372,45 +862,45 @@ struct ProfileConfig {
 }
 
 #[derive(Serialize)]
-struct LocalProxyConfig<'a> {
-    name: &'a str,
+struct LocalProxyConfig {
+    name: String,
     #[serde(rename = "type")]
-    proxy_type: &'a str,
-    server: &'a str,
+    proxy_type: String,
+    server: String,
     port: u16,
     udp: bool,
 }
 
 #[derive(Serialize)]
-struct ProviderConfig<'a> {
+struct ProviderConfig {
     #[serde(rename = "type")]
-    provider_type: &'a str,
-    url: &'a str,
-    path: &'a str,
+    provider_type: String,
+    url: String,
+    path: String,
     interval: u64,
     #[serde(rename = "health-check")]
-    health_check: ProviderHealthCheck<'a>,
+    health_check: ProviderHealthCheck,
 }
 
 #[derive(Serialize)]
-struct ProviderHealthCheck<'a> {
+struct ProviderHealthCheck {
     enable: bool,
-    url: &'a str,
+    url: String,
     interval: u64,
     lazy: bool,
 }
 
 #[derive(Serialize)]
-struct ProxyGroup<'a> {
-    name: &'a str,
+struct ProxyGroup {
+    name: String,
     #[serde(rename = "type")]
-    group_type: &'a str,
+    group_type: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    proxies: Vec<&'a str>,
+    proxies: Vec<String>,
     #[serde(rename = "use", skip_serializing_if = "Vec::is_empty")]
-    use_providers: Vec<&'a str>,
+    use_providers: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<&'a str>,
+    url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     interval: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -423,46 +913,173 @@ struct ProxyGroup<'a> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn generated_dual_config_is_loopback_and_has_no_direct() {
-        let mut config = PrivateRoutingConfig::default();
-        config
-            .set_subscription_url("https://example.invalid/provider")
-            .expect("URL");
-        let (yaml, summary) = generate_mihomo_config(&config, "test-secret").expect("config");
-        assert!(yaml.contains("mixed-port: 36666"));
-        assert!(yaml.contains("external-controller: 127.0.0.1:39090"));
-        assert!(yaml.contains("VPN-HUB-SUBSCRIPTION-A"));
-        assert!(yaml.contains("VPN-HUB-CHAOSHIHUI"));
-        assert!(yaml.contains("REJECT"));
-        assert!(!yaml.contains("DIRECT"));
-        let document = serde_yaml::from_str::<serde_yaml::Value>(&yaml).expect("yaml");
-        let groups = document["proxy-groups"].as_sequence().expect("groups");
-        let master = groups
-            .iter()
-            .find(|group| group["name"] == MASTER_SELECTOR)
-            .expect("master");
-        assert_eq!(master["proxies"][0], FAIL_CLOSED_PROXY);
-        assert!(!summary.has_direct_fallback);
+    fn subscription(id: &str, secret_ref: &str) -> OutletConfig {
+        OutletConfig {
+            id: id.into(),
+            label: id.into(),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: secret_ref.into(),
+                provider_update_seconds: 180,
+            },
+        }
+    }
+
+    fn local(id: &str, endpoint: &str, enabled: bool) -> OutletConfig {
+        OutletConfig {
+            id: id.into(),
+            label: id.into(),
+            enabled,
+            kind: OutletKind::LocalProxy {
+                endpoint: endpoint.into(),
+            },
+        }
     }
 
     #[test]
-    fn local_only_config_still_fails_closed() {
+    fn versioned_config_persists_three_subscriptions_and_two_local_outlets() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("routing.toml");
+        let mut config = PrivateRoutingConfig::default();
+        config.entry.port = 4_321;
+        config.outlets = vec![
+            subscription("sub-a", "secret.a"),
+            subscription("sub-b", "secret.b"),
+            subscription("sub-c", "secret.c"),
+            local("local-a", "http://127.0.0.1:2666", true),
+            local("local-b", "socks5h://127.0.0.1:4666", false),
+        ];
+        config.save(&path).expect("save");
+        let mut loaded = PrivateRoutingConfig::load(&path).expect("load");
+        assert_eq!(loaded.entry.port, 4_321);
+        assert_eq!(loaded.outlets, config.outlets);
+        assert_eq!(loaded.priority(), ["sub-a", "sub-b", "sub-c", "local-a"]);
+        loaded.outlets.remove(1);
+        loaded.outlets.swap(0, 2);
+        loaded.save(&path).expect("save reordered config");
+        let reordered = PrivateRoutingConfig::load(&path).expect("reload reordered config");
+        assert_eq!(
+            reordered
+                .outlets
+                .iter()
+                .map(|outlet| outlet.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local-a", "sub-c", "sub-a", "local-b"]
+        );
+        assert!(!reordered.outlets[3].enabled);
+        let serialized = fs::read_to_string(path).expect("document");
+        assert!(!serialized.contains("https://provider"));
+        assert!(serialized.contains("secret_ref"));
+    }
+
+    #[test]
+    fn repository_example_is_a_valid_five_outlet_config() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/private-routing.example.toml");
+        let config = PrivateRoutingConfig::load(path).expect("repository example");
+        assert_eq!(config.entry, EntryConfig::default());
+        assert_eq!(config.outlets.len(), 5);
+        assert_eq!(config.enabled_outlets().count(), 4);
+    }
+
+    #[test]
+    fn rejects_remote_duplicate_and_recursive_local_endpoints() {
+        let mut config = PrivateRoutingConfig {
+            outlets: vec![local("local-a", "socks5://192.0.2.1:2666", true)],
+            ..PrivateRoutingConfig::default()
+        };
+        assert!(config.validate().is_err());
+
+        config.outlets = vec![
+            local("local-a", "http://127.0.0.1:2666", true),
+            local("local-b", "socks5h://127.0.0.1:2666", true),
+        ];
+        assert!(config.validate().is_err());
+
+        config.outlets = vec![local("local-a", "http://127.0.0.1:3666", true)];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn migrates_legacy_dual_outlet_without_exposing_url_in_summary() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("routing.toml");
+        let legacy = r#"
+subscription_url = "https://example.invalid/provider/credential-token"
+provider_update_seconds = 180
+controller_port = 39090
+route_mode = "priority"
+priority = ["subscription-a", "chaoshihui"]
+cooldown_seconds = 60
+minimum_improvement_ms = 150
+probe_targets = ["https://a.invalid/", "https://b.invalid/"]
+"#;
+        fs::write(&path, legacy).expect("legacy file");
+        let config = PrivateRoutingConfig::load(&path).expect("migrate");
+        assert_eq!(config.entry.port, 36_666);
+        assert_eq!(config.outlets.len(), 2);
+        assert_eq!(config.priority(), ["subscription-a", "chaoshihui"]);
+        let summary = serde_json::to_string(&config.summary(&config.resolved_subscription_urls()))
+            .expect("summary");
+        assert!(!summary.contains("credential-token"));
+        assert!(!summary.contains("example.invalid"));
+    }
+
+    #[test]
+    fn invalid_primary_rolls_back_to_last_valid_config() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("routing.toml");
+        let mut config = PrivateRoutingConfig::default();
+        config.entry.port = 4_001;
+        config.save(&path).expect("first save");
+        config.entry.port = 4_002;
+        config.save(&path).expect("second save");
+        fs::write(&path, "version = 999").expect("damage primary");
+        let recovered = PrivateRoutingConfig::load(&path).expect("backup");
+        assert_eq!(recovered.entry.port, 4_002);
+    }
+
+    #[test]
+    fn generated_dynamic_config_uses_resolved_subscriptions_and_fails_closed() {
+        let config = PrivateRoutingConfig {
+            outlets: vec![
+                subscription("sub-a", "secret.a"),
+                subscription("sub-b", "secret.b"),
+                subscription("sub-c", "secret.c"),
+                local("local-a", "http://127.0.0.1:2666", true),
+                local("local-b", "socks5h://127.0.0.1:4666", true),
+            ],
+            ..PrivateRoutingConfig::default()
+        };
+        let resolved = [
+            ("secret.a".into(), "https://a.invalid/provider".into()),
+            ("secret.b".into(), "https://b.invalid/provider".into()),
+            ("secret.c".into(), "https://c.invalid/provider".into()),
+        ]
+        .into_iter()
+        .collect();
         let (yaml, summary) =
-            generate_mihomo_config(&PrivateRoutingConfig::default(), "test-secret")
-                .expect("config");
-        assert!(!summary.subscription_enabled);
+            generate_mihomo_config(&config, &resolved, "test-secret").expect("config");
+        assert!(yaml.contains("mixed-port: 3666"));
+        for id in ["sub-a", "sub-b", "sub-c", "local-a", "local-b"] {
+            assert!(yaml.contains(&outlet_proxy_name(id)));
+        }
         assert!(yaml.contains("REJECT"));
         assert!(!yaml.contains("DIRECT"));
+        assert_eq!(summary.enabled_outlet_count, 5);
+        assert_eq!(summary.configured_subscription_count, 3);
     }
 
     #[test]
-    fn invalid_private_config_error_does_not_echo_secret() {
-        let mut config = PrivateRoutingConfig::default();
-        let secret_value = "not-a-url-sensitive-value";
-        let error = config
-            .set_subscription_url(secret_value)
-            .expect_err("invalid");
-        assert!(!error.to_string().contains(secret_value));
+    fn missing_subscription_secret_is_not_added_to_master_selector() {
+        let config = PrivateRoutingConfig {
+            outlets: vec![subscription("sub-a", "secret.a")],
+            ..PrivateRoutingConfig::default()
+        };
+        let (yaml, summary) =
+            generate_mihomo_config(&config, &BTreeMap::new(), "test-secret").expect("config");
+        assert!(!yaml.contains("VPN-HUB-OUTLET-sub-a"));
+        assert!(yaml.contains("REJECT"));
+        assert_eq!(summary.configured_subscription_count, 0);
     }
 }

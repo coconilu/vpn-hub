@@ -1,5 +1,4 @@
-import { LoaderCircle, Play, RefreshCw, Save, Square } from "lucide-react";
-import { useState } from "react";
+import { LoaderCircle, Play, RefreshCw, Square } from "lucide-react";
 import { EventTimeline } from "./components/EventTimeline";
 import { LatencyChart } from "./components/LatencyChart";
 import { OutletTable } from "./components/OutletTable";
@@ -12,7 +11,6 @@ interface DashboardProps {
   busy: boolean;
   notice: string | null;
   onModeChange: (mode: RouteMode, manualOutlet: string | null) => void;
-  onSubscriptionSave: (value: string) => void;
   onRefresh: () => void;
   onCoreToggle: () => void;
 }
@@ -24,11 +22,11 @@ const formatUpdatedAt = (value: string) => new Intl.DateTimeFormat("zh-CN", {
   hour12: false,
 }).format(new Date(value));
 
-export function Dashboard({ snapshot, busy, notice, onModeChange, onSubscriptionSave, onRefresh, onCoreToggle }: DashboardProps) {
-  const [subscriptionUrl, setSubscriptionUrl] = useState("");
+export function Dashboard({ snapshot, busy, notice, onModeChange, onRefresh, onCoreToggle }: DashboardProps) {
   const coreRunning = snapshot.mihomo.state === "running";
   const mode = snapshot.routing.mode;
-  const manualOutlet = snapshot.routing.manual_outlet ?? "chaoshihui";
+  const selectableOutlets = snapshot.routing.outlets.filter((outlet) => outlet.enabled && outlet.configured);
+  const manualOutlet = snapshot.routing.manual_outlet ?? selectableOutlets[0]?.outlet_id ?? "";
 
   return (
     <main className={`main-content ${busy ? "is-busy" : ""}`}>
@@ -45,26 +43,7 @@ export function Dashboard({ snapshot, busy, notice, onModeChange, onSubscription
         </div>
       </header>
       {notice && <div className="notice" role="status">{notice}</div>}
-      <ProtectedBanner protectedEntry={snapshot.protected_entry} developmentEntry={snapshot.development_entry} />
-
-      {!snapshot.routing.subscription_configured && (
-        <form className="subscription-setup" onSubmit={(event) => {
-          event.preventDefault();
-          onSubscriptionSave(subscriptionUrl);
-          setSubscriptionUrl("");
-        }}>
-          <div><strong>订阅 A 尚未配置</strong><small>地址只写入本机私密文件，不进入日志、数据库或界面快照。</small></div>
-          <input
-            type="password"
-            value={subscriptionUrl}
-            onChange={(event) => setSubscriptionUrl(event.target.value)}
-            placeholder="粘贴 HTTPS 订阅地址"
-            autoComplete="off"
-            disabled={busy || coreRunning}
-          />
-          <button className="secondary-button" type="submit" disabled={busy || coreRunning || !subscriptionUrl}><Save />保存</button>
-        </form>
-      )}
+      <ProtectedBanner entry={snapshot.entry} />
 
       <div className="mode-row">
         <h2>路由模式</h2>
@@ -75,16 +54,15 @@ export function Dashboard({ snapshot, busy, notice, onModeChange, onSubscription
               name="mode"
               value={value}
               checked={mode === value}
-              disabled={busy || !snapshot.routing.controller_ready}
-              onChange={() => onModeChange(value, value === "manual" ? manualOutlet : null)}
+              disabled={busy || !snapshot.routing.controller_ready || (value === "manual" && selectableOutlets.length === 0)}
+              onChange={() => onModeChange(value, value === "manual" ? manualOutlet || null : null)}
             />
             <span>{label}</span>
           </label>
         ))}
         {mode === "manual" && (
-          <select value={manualOutlet} disabled={busy} onChange={(event) => onModeChange("manual", event.target.value)}>
-            {snapshot.routing.subscription_configured && <option value="subscription-a">订阅 A</option>}
-            <option value="chaoshihui">超实惠</option>
+          <select value={manualOutlet} disabled={busy || selectableOutlets.length === 0} onChange={(event) => onModeChange("manual", event.target.value)}>
+            {selectableOutlets.map((outlet) => <option key={outlet.outlet_id} value={outlet.outlet_id}>{outlet.label}</option>)}
           </select>
         )}
         <small>{snapshot.routing.message}</small>
