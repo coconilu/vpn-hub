@@ -361,6 +361,12 @@ impl AppState {
         self.guardian_config_path.clone()
     }
 
+    #[must_use]
+    pub fn history_export_path(&self, timestamp_ms: i64) -> PathBuf {
+        self.runtime_directory
+            .join(format!("history-export-{timestamp_ms}.csv"))
+    }
+
     pub fn private_config(&self) -> Result<PrivateRoutingConfig, String> {
         PrivateRoutingConfig::load(&self.private_config_path)
             .map_err(|error| format!("无法加载本机私密路由配置：{error}"))

@@ -1,5 +1,65 @@
 export type HealthStatus = "unknown" | "healthy" | "degraded" | "down";
 export type UdpCapabilityStatus = "supported" | "tcp_only" | "unknown";
+export type HistoryWindow = "1h" | "24h" | "7d" | "30d";
+export type HistoryOutletKind = "subscription" | "local_proxy" | "unknown";
+export type HistoryEventType = "probe" | "state" | "route_switch";
+
+export interface HistoryFilter {
+  window: HistoryWindow;
+  outlet_id: string | null;
+  kind: HistoryOutletKind | null;
+  status: HealthStatus | null;
+  event_type: HistoryEventType | null;
+  page: number;
+  page_size: number;
+}
+
+export interface HistoryMetric {
+  outlet_id: string;
+  label: string;
+  kind: HistoryOutletKind;
+  deleted: boolean;
+  sample_count: number;
+  online_samples: number;
+  availability_percent: number;
+  p50_latency_ms: number | null;
+  p95_latency_ms: number | null;
+  failure_count: number;
+  failure_duration_seconds: number;
+  ongoing_failure: boolean;
+}
+
+export interface HistoryRecord {
+  event_type: HistoryEventType;
+  occurred_at: string;
+  outlet_id: string;
+  outlet_label: string;
+  outlet_kind: HistoryOutletKind;
+  deleted: boolean;
+  status: HealthStatus | null;
+  from_status: HealthStatus | null;
+  to_status: HealthStatus | null;
+  latency_ms: number | null;
+  from_outlet_id: string | null;
+  to_outlet_id: string | null;
+  mode: string | null;
+  reason: string | null;
+  duration_ms: number | null;
+}
+
+export interface HistoryResponse {
+  window_start: string;
+  window_end: string;
+  metrics: HistoryMetric[];
+  records: HistoryRecord[];
+  next_page: number | null;
+  retention_days: number;
+}
+
+export interface HistoryExport {
+  path: string;
+  rows: number;
+}
 
 export interface UdpCapabilityEvidence {
   outlet_id: string;

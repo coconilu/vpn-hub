@@ -7,6 +7,7 @@
 mod config;
 mod controller;
 mod guardian_cycle;
+mod history;
 mod mihomo;
 mod model;
 mod probe;
@@ -20,6 +21,10 @@ pub use controller::{ControllerClient, ControllerError};
 pub use guardian_cycle::{
     GuardianCycleError, GuardianCycleOutcome, RoutingSession, RoutingStateError,
     run_controller_guardian_cycle,
+};
+pub use history::{
+    HistoryEventType, HistoryExport, HistoryFilter, HistoryMetric, HistoryOutletKind,
+    HistoryOutletSnapshot, HistoryRecord, HistoryResponse, HistoryWindow,
 };
 pub use mihomo::{
     CURRENT_CONFIG_VERSION, EntryConfig, FAIL_CLOSED_PROXY, MASTER_SELECTOR, OutletConfig,

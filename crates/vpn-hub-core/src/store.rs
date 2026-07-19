@@ -1,14 +1,21 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    io::{BufWriter, Write},
+    path::Path,
+};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use chrono::{DateTime, SecondsFormat, Utc};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::Value};
 use thiserror::Error;
 
 use crate::{
-    HealthStatus, LatencySample, OutletSummary, ProbeOutletConfig, ProbeResult, RouteSwitchEvent,
-    StateEvent, UdpCapabilityEvidence, UdpCapabilityStatus,
+    HealthStatus, HistoryEventType, HistoryFilter, HistoryMetric, HistoryOutletKind,
+    HistoryOutletSnapshot, HistoryRecord, HistoryResponse, LatencySample, OutletSummary,
+    ProbeOutletConfig, ProbeResult, RouteSwitchEvent, StateEvent, UdpCapabilityEvidence,
+    UdpCapabilityStatus,
 };
 
-const CURRENT_DATABASE_VERSION: i64 = 3;
+const CURRENT_DATABASE_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -20,6 +27,12 @@ pub enum StoreError {
     InvalidStatus(String),
     #[error("invalid stored UDP capability: {0}")]
     InvalidUdpCapability(String),
+    #[error("invalid stored outlet kind: {0}")]
+    InvalidOutletKind(String),
+    #[error("invalid history timestamp: {0}")]
+    InvalidTimestamp(String),
+    #[error("invalid retention days: {0}; expected 1..=3650")]
+    InvalidRetention(u32),
     #[error("UDP configuration generation is outside the supported SQLite integer range")]
     InvalidUdpGeneration,
     #[error("database version {0} is newer than this application supports")]
@@ -57,6 +70,7 @@ impl GuardianStore {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
         let user_version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if user_version > CURRENT_DATABASE_VERSION {
@@ -70,7 +84,10 @@ impl GuardianStore {
             CREATE TABLE IF NOT EXISTS outlets (
                 id TEXT PRIMARY KEY,
                 label TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'unknown',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                deleted_at TEXT
             );
             CREATE TABLE IF NOT EXISTS probe_samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -82,7 +99,9 @@ impl GuardianStore {
                 latency_ms INTEGER,
                 error_code TEXT,
                 successful_targets INTEGER NOT NULL DEFAULT 0,
-                total_targets INTEGER NOT NULL DEFAULT 1
+                total_targets INTEGER NOT NULL DEFAULT 1,
+                outlet_label TEXT NOT NULL DEFAULT '',
+                outlet_kind TEXT NOT NULL DEFAULT 'unknown'
             );
             CREATE INDEX IF NOT EXISTS idx_probe_samples_outlet_time
                 ON probe_samples(outlet_id, observed_at DESC);
@@ -99,7 +118,9 @@ impl GuardianStore {
                 occurred_at TEXT NOT NULL,
                 from_status TEXT NOT NULL,
                 to_status TEXT NOT NULL,
-                reason TEXT NOT NULL
+                reason TEXT NOT NULL,
+                outlet_label TEXT NOT NULL DEFAULT '',
+                outlet_kind TEXT NOT NULL DEFAULT 'unknown'
             );
             CREATE INDEX IF NOT EXISTS idx_state_events_outlet_time
                 ON state_events(outlet_id, occurred_at DESC);
@@ -110,7 +131,11 @@ impl GuardianStore {
                 to_outlet TEXT NOT NULL,
                 mode TEXT NOT NULL,
                 reason TEXT NOT NULL,
-                duration_ms INTEGER NOT NULL
+                duration_ms INTEGER NOT NULL,
+                from_label TEXT,
+                from_kind TEXT,
+                to_label TEXT NOT NULL DEFAULT '',
+                to_kind TEXT NOT NULL DEFAULT 'unknown'
             );
             CREATE INDEX IF NOT EXISTS idx_route_switches_time
                 ON route_switches(occurred_at DESC);
@@ -132,6 +157,11 @@ impl GuardianStore {
                 outlet_id TEXT PRIMARY KEY REFERENCES outlets(id) ON DELETE CASCADE,
                 history_id INTEGER NOT NULL REFERENCES udp_capability_history(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS history_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                retention_days INTEGER NOT NULL CHECK (retention_days BETWEEN 1 AND 3650)
+            );
+            INSERT OR IGNORE INTO history_settings(id, retention_days) VALUES (1, 30);
             ",
         )?;
         ensure_probe_column(&transaction, "port_reachable", "INTEGER NOT NULL DEFAULT 0")?;
@@ -142,9 +172,144 @@ impl GuardianStore {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_probe_column(&transaction, "total_targets", "INTEGER NOT NULL DEFAULT 1")?;
+        ensure_column(
+            &transaction,
+            "outlets",
+            "kind",
+            "TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+        ensure_column(
+            &transaction,
+            "outlets",
+            "enabled",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        ensure_column(&transaction, "outlets", "deleted_at", "TEXT")?;
+        ensure_column(
+            &transaction,
+            "probe_samples",
+            "outlet_label",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &transaction,
+            "probe_samples",
+            "outlet_kind",
+            "TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+        ensure_column(
+            &transaction,
+            "state_events",
+            "outlet_label",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &transaction,
+            "state_events",
+            "outlet_kind",
+            "TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+        ensure_column(&transaction, "route_switches", "from_label", "TEXT")?;
+        ensure_column(&transaction, "route_switches", "from_kind", "TEXT")?;
+        ensure_column(
+            &transaction,
+            "route_switches",
+            "to_label",
+            "TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &transaction,
+            "route_switches",
+            "to_kind",
+            "TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+        transaction.execute_batch(
+            r"
+            UPDATE probe_samples
+               SET outlet_label = COALESCE(NULLIF(outlet_label, ''), (SELECT label FROM outlets WHERE id=probe_samples.outlet_id)),
+                   outlet_kind = COALESCE(NULLIF(outlet_kind, 'unknown'), (SELECT kind FROM outlets WHERE id=probe_samples.outlet_id), 'unknown')
+             WHERE outlet_label = '' OR outlet_kind = 'unknown';
+            UPDATE state_events
+               SET outlet_label = COALESCE(NULLIF(outlet_label, ''), (SELECT label FROM outlets WHERE id=state_events.outlet_id)),
+                   outlet_kind = COALESCE(NULLIF(outlet_kind, 'unknown'), (SELECT kind FROM outlets WHERE id=state_events.outlet_id), 'unknown')
+             WHERE outlet_label = '' OR outlet_kind = 'unknown';
+            UPDATE route_switches
+               SET from_label = COALESCE(from_label, (SELECT label FROM outlets WHERE id=route_switches.from_outlet)),
+                   from_kind = COALESCE(from_kind, (SELECT kind FROM outlets WHERE id=route_switches.from_outlet)),
+                   to_label = COALESCE(NULLIF(to_label, ''), (SELECT label FROM outlets WHERE id=route_switches.to_outlet), to_outlet),
+                   to_kind = COALESCE(NULLIF(to_kind, 'unknown'), (SELECT kind FROM outlets WHERE id=route_switches.to_outlet), 'unknown')
+             WHERE to_label = '' OR to_kind = 'unknown' OR (from_outlet IS NOT NULL AND from_label IS NULL);
+            CREATE INDEX IF NOT EXISTS idx_probe_samples_time_outlet_status
+                ON probe_samples(observed_at DESC, outlet_id, status);
+            CREATE INDEX IF NOT EXISTS idx_state_events_time_outlet_status
+                ON state_events(occurred_at DESC, outlet_id, to_status);
+            CREATE INDEX IF NOT EXISTS idx_route_switches_time_outlets
+                ON route_switches(occurred_at DESC, from_outlet, to_outlet);
+            ",
+        )?;
         transaction.pragma_update(None, "user_version", CURRENT_DATABASE_VERSION)?;
         transaction.commit()?;
         Ok(Self { connection })
+    }
+
+    /// Synchronizes the current non-sensitive outlet catalogue. Rows missing
+    /// from the supplied configuration are tombstoned rather than deleted so
+    /// historical foreign keys and display snapshots remain explainable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalogue transaction cannot be committed.
+    pub fn sync_history_outlets(
+        &mut self,
+        outlets: &[HistoryOutletSnapshot],
+        observed_at: &str,
+    ) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE outlets SET enabled=0, deleted_at=COALESCE(deleted_at, ?1)",
+            [observed_at],
+        )?;
+        for outlet in outlets {
+            let label = crate::history::sanitized_label(&outlet.label);
+            transaction.execute(
+                r"INSERT INTO outlets(id, label, updated_at, kind, enabled, deleted_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+                   ON CONFLICT(id) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at,
+                       kind=excluded.kind, enabled=excluded.enabled, deleted_at=NULL",
+                params![
+                    outlet.outlet_id,
+                    label,
+                    observed_at,
+                    outlet.kind.as_str(),
+                    outlet.enabled,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn outlet_display(
+        &self,
+        outlet_id: &str,
+    ) -> Result<Option<(String, HistoryOutletKind)>, StoreError> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT label, kind FROM outlets WHERE id=?1",
+                [outlet_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        stored
+            .map(|(label, kind)| {
+                Ok((
+                    crate::history::sanitized_label(&label),
+                    HistoryOutletKind::try_from(kind.as_str())
+                        .map_err(StoreError::InvalidOutletKind)?,
+                ))
+            })
+            .transpose()
     }
 
     /// Persists one sanitized probe and emits a state transition when a
@@ -153,6 +318,7 @@ impl GuardianStore {
     /// # Errors
     ///
     /// Returns an error when the transaction cannot be read or committed.
+    #[allow(clippy::too_many_lines)]
     pub fn record_probe(
         &mut self,
         outlet: &ProbeOutletConfig,
@@ -162,12 +328,22 @@ impl GuardianStore {
     ) -> Result<Option<StateEvent>, StoreError> {
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            r"INSERT INTO outlets(id, label, updated_at) VALUES (?1, ?2, ?3)
-               ON CONFLICT(id) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at",
-            params![outlet.id, outlet.label, result.observed_at],
+            r"INSERT INTO outlets(id, label, updated_at, enabled, deleted_at) VALUES (?1, ?2, ?3, 1, NULL)
+               ON CONFLICT(id) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at,
+                   enabled=1, deleted_at=NULL",
+            params![
+                outlet.id,
+                crate::history::sanitized_label(&outlet.label),
+                result.observed_at
+            ],
+        )?;
+        let outlet_kind = transaction.query_row(
+            "SELECT kind FROM outlets WHERE id=?1",
+            [&outlet.id],
+            |row| row.get::<_, String>(0),
         )?;
         transaction.execute(
-            "INSERT INTO probe_samples(outlet_id, observed_at, port_reachable, status, http_status, latency_ms, error_code, successful_targets, total_targets) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO probe_samples(outlet_id, observed_at, port_reachable, status, http_status, latency_ms, error_code, successful_targets, total_targets, outlet_label, outlet_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 outlet.id,
                 result.observed_at,
@@ -177,7 +353,9 @@ impl GuardianStore {
                 result.latency_ms.map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
                 result.error_code,
                 result.successful_targets,
-                result.total_targets
+                result.total_targets,
+                crate::history::sanitized_label(&outlet.label),
+                outlet_kind,
             ],
         )?;
 
@@ -232,18 +410,20 @@ impl GuardianStore {
             to_status: next_status,
             reason: result
                 .error_code
-                .clone()
-                .unwrap_or_else(|| "probe_result".into()),
+                .as_deref()
+                .map_or_else(|| "probe_result".into(), crate::history::sanitized_code),
         });
         if let Some(event) = &event {
             transaction.execute(
-                "INSERT INTO state_events(outlet_id, occurred_at, from_status, to_status, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO state_events(outlet_id, occurred_at, from_status, to_status, reason, outlet_label, outlet_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     event.outlet_id,
                     event.occurred_at,
                     event.from_status.as_str(),
                     event.to_status.as_str(),
-                    event.reason
+                    crate::history::sanitized_code(&event.reason),
+                    crate::history::sanitized_label(&outlet.label),
+                    outlet_kind,
                 ],
             )?;
         }
@@ -412,15 +592,38 @@ impl GuardianStore {
     ///
     /// Returns an error when the event cannot be inserted.
     pub fn record_route_switch(&self, event: &RouteSwitchEvent) -> Result<(), StoreError> {
+        for outlet_id in event
+            .from_outlet
+            .iter()
+            .chain(std::iter::once(&event.to_outlet))
+        {
+            self.connection.execute(
+                "INSERT OR IGNORE INTO outlets(id, label, updated_at, kind, enabled) VALUES (?1, '已脱敏出口', ?2, 'unknown', 0)",
+                params![outlet_id, event.occurred_at],
+            )?;
+        }
+        let from_snapshot = event
+            .from_outlet
+            .as_ref()
+            .map(|outlet_id| self.outlet_display(outlet_id))
+            .transpose()?
+            .flatten();
+        let to_snapshot = self
+            .outlet_display(&event.to_outlet)?
+            .unwrap_or_else(|| (event.to_outlet.clone(), HistoryOutletKind::Unknown));
         self.connection.execute(
-            "INSERT INTO route_switches(occurred_at, from_outlet, to_outlet, mode, reason, duration_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO route_switches(occurred_at, from_outlet, to_outlet, mode, reason, duration_ms, from_label, from_kind, to_label, to_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 event.occurred_at,
                 event.from_outlet,
                 event.to_outlet,
                 event.mode,
-                event.reason,
-                i64::try_from(event.duration_ms).unwrap_or(i64::MAX)
+                crate::history::sanitized_code(&event.reason),
+                i64::try_from(event.duration_ms).unwrap_or(i64::MAX),
+                from_snapshot.as_ref().map(|snapshot| snapshot.0.as_str()),
+                from_snapshot.as_ref().map(|snapshot| snapshot.1.as_str()),
+                to_snapshot.0,
+                to_snapshot.1.as_str(),
             ],
         )?;
         Ok(())
@@ -558,6 +761,551 @@ impl GuardianStore {
         let rows = statement.query_map(params![outlet_id, limit], read_udp_capability_row)?;
         rows.map(|row| decode_udp_capability(row?)).collect()
     }
+
+    /// Queries a bounded, sanitized history page and its fixed metrics.
+    ///
+    /// Availability is `(healthy + degraded) / all probe samples`. Latency
+    /// percentiles use nearest-rank over non-down samples with a latency. A
+    /// failure is a `down` interval overlapping the window; intervals are
+    /// truncated at the window boundaries and same-time transitions use row ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid timestamps or unreadable stored values.
+    pub fn query_history(
+        &self,
+        filter: &HistoryFilter,
+        now: &str,
+    ) -> Result<HistoryResponse, StoreError> {
+        let end = parse_timestamp(now)?;
+        let start = filter.window.start(end);
+        let start_text = start.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let end_text = end.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let mut metric_filter = filter.clone();
+        metric_filter.status = None;
+        metric_filter.event_type = None;
+        let metrics = self.history_metrics(&metric_filter, &start_text, &end_text)?;
+        let page_size = filter.bounded_page_size();
+        let mut records = self.history_records(
+            filter,
+            &start_text,
+            &end_text,
+            page_size.saturating_add(1),
+            filter.page.saturating_mul(page_size),
+        )?;
+        let has_more = records.len() > usize::try_from(page_size).unwrap_or(usize::MAX);
+        if has_more {
+            records.truncate(usize::try_from(page_size).unwrap_or(usize::MAX));
+        }
+        Ok(HistoryResponse {
+            window_start: start_text,
+            window_end: end_text,
+            metrics,
+            records,
+            next_page: has_more.then(|| filter.page.saturating_add(1)),
+            retention_days: self.retention_days()?,
+        })
+    }
+
+    /// Streams the filtered, sanitized event projection to a CSV file. Memory
+    /// is bounded to one database page and no raw configuration fields are read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the destination cannot be written or queried.
+    pub fn export_history_csv(
+        &self,
+        destination: impl AsRef<Path>,
+        filter: &HistoryFilter,
+        now: &str,
+    ) -> Result<u64, StoreError> {
+        let end = parse_timestamp(now)?;
+        let start = filter.window.start(end);
+        let start_text = start.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let end_text = end.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let file = fs::File::create(destination)?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(b"event_type,occurred_at,outlet_id,outlet_label,outlet_kind,deleted,status,from_status,to_status,latency_ms,from_outlet_id,to_outlet_id,mode,reason,duration_ms\r\n")?;
+        let mut written = 0_u64;
+        let (sql, values) = history_record_query(filter, &start_text, &end_text, u32::MAX, 0);
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values), read_history_record)?;
+        for row in rows {
+            let record = decode_history_record(row?)?;
+            let values = [
+                record.event_type.as_str().to_owned(),
+                record.occurred_at,
+                record.outlet_id,
+                record.outlet_label,
+                record.outlet_kind.as_str().to_owned(),
+                record.deleted.to_string(),
+                record
+                    .status
+                    .map_or_else(String::new, |value| value.as_str().into()),
+                record
+                    .from_status
+                    .map_or_else(String::new, |value| value.as_str().into()),
+                record
+                    .to_status
+                    .map_or_else(String::new, |value| value.as_str().into()),
+                record
+                    .latency_ms
+                    .map_or_else(String::new, |value| value.to_string()),
+                record.from_outlet_id.unwrap_or_default(),
+                record.to_outlet_id.unwrap_or_default(),
+                record.mode.unwrap_or_default(),
+                record.reason.unwrap_or_default(),
+                record
+                    .duration_ms
+                    .map_or_else(String::new, |value| value.to_string()),
+            ];
+            let line = values
+                .iter()
+                .map(|value| crate::history::csv_cell(value))
+                .collect::<Vec<_>>()
+                .join(",");
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(b"\r\n")?;
+            written = written.saturating_add(1);
+        }
+        writer.flush()?;
+        Ok(written)
+    }
+
+    /// Reads the local retention policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the setting cannot be read.
+    pub fn retention_days(&self) -> Result<u32, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT retention_days FROM history_settings WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
+    /// Updates retention and removes expired data without deleting the latest
+    /// state transition for an outlet, ongoing failures, or current UDP evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-range value or failed transaction.
+    pub fn set_retention_days(&mut self, days: u32, now: &str) -> Result<u64, StoreError> {
+        if !(1..=3650).contains(&days) {
+            return Err(StoreError::InvalidRetention(days));
+        }
+        let now = parse_timestamp(now)?;
+        let cutoff = now - chrono::Duration::days(i64::from(days));
+        let cutoff = cutoff.to_rfc3339_opts(SecondsFormat::Millis, true);
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "UPDATE history_settings SET retention_days=?1 WHERE id=1",
+            [days],
+        )?;
+        let mut removed = 0_u64;
+        removed = removed.saturating_add(
+            u64::try_from(transaction.execute(
+                "DELETE FROM probe_samples WHERE observed_at < ?1",
+                [&cutoff],
+            )?)
+            .unwrap_or(u64::MAX),
+        );
+        removed = removed.saturating_add(
+            u64::try_from(transaction.execute(
+                r"DELETE FROM state_events
+               WHERE occurred_at < ?1
+                 AND id NOT IN (SELECT MAX(id) FROM state_events GROUP BY outlet_id)",
+                [&cutoff],
+            )?)
+            .unwrap_or(u64::MAX),
+        );
+        removed = removed.saturating_add(
+            u64::try_from(transaction.execute(
+                "DELETE FROM route_switches WHERE occurred_at < ?1",
+                [&cutoff],
+            )?)
+            .unwrap_or(u64::MAX),
+        );
+        removed = removed.saturating_add(
+            u64::try_from(transaction.execute(
+                r"DELETE FROM udp_capability_history
+               WHERE observed_at < ?1
+                 AND id NOT IN (SELECT history_id FROM udp_capability_current)",
+                [&cutoff],
+            )?)
+            .unwrap_or(u64::MAX),
+        );
+        transaction.commit()?;
+        Ok(removed)
+    }
+
+    fn history_metrics(
+        &self,
+        filter: &HistoryFilter,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<HistoryMetric>, StoreError> {
+        let (predicate, values) = sample_filter(filter, start, end);
+        let sql = format!(
+            r"SELECT p.outlet_id, MAX(p.outlet_label), MAX(p.outlet_kind),
+                      MAX(CASE WHEN o.deleted_at IS NULL THEN 0 ELSE 1 END),
+                      COUNT(*), SUM(CASE WHEN p.status IN ('healthy','degraded') THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN p.status != 'down' AND p.latency_ms IS NOT NULL THEN 1 ELSE 0 END)
+                 FROM probe_samples p JOIN outlets o ON o.id=p.outlet_id
+                WHERE {predicate}
+                GROUP BY p.outlet_id ORDER BY p.outlet_id"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
+                u64::try_from(row.get::<_, i64>(5)?).unwrap_or(0),
+                u64::try_from(row.get::<_, i64>(6)?).unwrap_or(0),
+            ))
+        })?;
+        let base = rows.collect::<Result<Vec<_>, _>>()?;
+        base.into_iter()
+            .map(
+                |(outlet_id, label, kind, deleted, samples, online, latency_count)| {
+                    let kind = HistoryOutletKind::try_from(kind.as_str())
+                        .map_err(StoreError::InvalidOutletKind)?;
+                    let p50 =
+                        self.percentile_latency(filter, start, end, &outlet_id, latency_count, 50)?;
+                    let p95 =
+                        self.percentile_latency(filter, start, end, &outlet_id, latency_count, 95)?;
+                    let (failures, duration, ongoing) =
+                        self.failure_metrics(&outlet_id, start, end)?;
+                    Ok(HistoryMetric {
+                        outlet_id,
+                        label: crate::history::sanitized_label(&label),
+                        kind,
+                        deleted,
+                        sample_count: samples,
+                        online_samples: online,
+                        availability_percent: if samples == 0 {
+                            0.0
+                        } else {
+                            let online = u32::try_from(online).unwrap_or(u32::MAX);
+                            let samples = u32::try_from(samples).unwrap_or(u32::MAX);
+                            100.0 * f64::from(online) / f64::from(samples)
+                        },
+                        p50_latency_ms: p50,
+                        p95_latency_ms: p95,
+                        failure_count: failures,
+                        failure_duration_seconds: duration,
+                        ongoing_failure: ongoing,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    fn percentile_latency(
+        &self,
+        filter: &HistoryFilter,
+        start: &str,
+        end: &str,
+        outlet_id: &str,
+        count: u64,
+        percentile: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        if count == 0 {
+            return Ok(None);
+        }
+        let rank = count.saturating_mul(percentile).div_ceil(100).max(1);
+        let (mut predicate, mut values) = sample_filter(filter, start, end);
+        predicate.push_str(" AND p.outlet_id=?");
+        values.push(Value::Text(outlet_id.into()));
+        values.push(Value::Integer(
+            i64::try_from(rank.saturating_sub(1)).unwrap_or(i64::MAX),
+        ));
+        let sql = format!(
+            "SELECT p.latency_ms FROM probe_samples p WHERE {predicate} AND p.status != 'down' AND p.latency_ms IS NOT NULL ORDER BY p.latency_ms, p.id LIMIT 1 OFFSET ?"
+        );
+        self.connection
+            .query_row(&sql, params_from_iter(values), |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .map(|value| value.and_then(|latency| u64::try_from(latency).ok()))
+            .map_err(StoreError::from)
+    }
+
+    fn failure_metrics(
+        &self,
+        outlet_id: &str,
+        start: &str,
+        end: &str,
+    ) -> Result<(u64, u64, bool), StoreError> {
+        let start_time = parse_timestamp(start)?;
+        let end_time = parse_timestamp(end)?;
+        let prior = self.connection.query_row(
+            "SELECT to_status FROM state_events WHERE outlet_id=?1 AND occurred_at < ?2 ORDER BY occurred_at DESC, id DESC LIMIT 1",
+            params![outlet_id, start],
+            |row| row.get::<_, String>(0),
+        ).optional()?;
+        let mut down_since = prior
+            .as_deref()
+            .is_some_and(|status| status == "down")
+            .then_some(start_time);
+        let mut failures = u64::from(down_since.is_some());
+        let mut duration = 0_u64;
+        let mut statement = self.connection.prepare(
+            "SELECT occurred_at, to_status FROM state_events WHERE outlet_id=?1 AND occurred_at >= ?2 AND occurred_at <= ?3 ORDER BY occurred_at, id",
+        )?;
+        let rows = statement.query_map(params![outlet_id, start, end], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (occurred_at, status) = row?;
+            let occurred_at = parse_timestamp(&occurred_at)?;
+            if status == "down" && down_since.is_none() {
+                down_since = Some(occurred_at);
+                failures = failures.saturating_add(1);
+            } else if status != "down"
+                && let Some(since) = down_since.take()
+            {
+                duration = duration.saturating_add(
+                    u64::try_from((occurred_at - since).num_seconds().max(0)).unwrap_or(u64::MAX),
+                );
+            }
+        }
+        let ongoing = down_since.is_some();
+        if let Some(since) = down_since {
+            duration = duration.saturating_add(
+                u64::try_from((end_time - since).num_seconds().max(0)).unwrap_or(u64::MAX),
+            );
+        }
+        Ok((failures, duration, ongoing))
+    }
+
+    fn history_records(
+        &self,
+        filter: &HistoryFilter,
+        start: &str,
+        end: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<HistoryRecord>, StoreError> {
+        let (sql, values) = history_record_query(filter, start, end, limit, offset);
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params_from_iter(values), read_history_record)?;
+        rows.map(|row| decode_history_record(row?)).collect()
+    }
+}
+
+type StoredHistoryRecord = (
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+);
+
+fn read_history_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredHistoryRecord> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+        row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
+    ))
+}
+
+fn decode_history_record(row: StoredHistoryRecord) -> Result<HistoryRecord, StoreError> {
+    let event_type = match row.2.as_str() {
+        "probe" => HistoryEventType::Probe,
+        "state" => HistoryEventType::State,
+        "route_switch" => HistoryEventType::RouteSwitch,
+        other => return Err(StoreError::InvalidStatus(other.into())),
+    };
+    let decode_status = |status: Option<String>| {
+        status
+            .map(|value| HealthStatus::try_from(value.as_str()).map_err(StoreError::InvalidStatus))
+            .transpose()
+    };
+    Ok(HistoryRecord {
+        event_type,
+        occurred_at: row.3,
+        outlet_id: row.4,
+        outlet_label: crate::history::sanitized_label(&row.5),
+        outlet_kind: HistoryOutletKind::try_from(row.6.as_str())
+            .map_err(StoreError::InvalidOutletKind)?,
+        deleted: row.7,
+        status: decode_status(row.8)?,
+        from_status: decode_status(row.9)?,
+        to_status: decode_status(row.10)?,
+        latency_ms: row.11.and_then(|value| u64::try_from(value).ok()),
+        from_outlet_id: row.12,
+        to_outlet_id: row.13,
+        mode: row.14.map(|value| crate::history::sanitized_code(&value)),
+        reason: row.15.map(|value| crate::history::sanitized_code(&value)),
+        duration_ms: row.16.and_then(|value| u64::try_from(value).ok()),
+    })
+}
+
+fn sample_filter(filter: &HistoryFilter, start: &str, end: &str) -> (String, Vec<Value>) {
+    let mut clauses = vec!["p.observed_at >= ?", "p.observed_at <= ?"];
+    let mut values = vec![Value::Text(start.into()), Value::Text(end.into())];
+    if let Some(outlet_id) = &filter.outlet_id {
+        clauses.push("p.outlet_id = ?");
+        values.push(Value::Text(outlet_id.clone()));
+    }
+    if let Some(kind) = filter.kind {
+        clauses.push("p.outlet_kind = ?");
+        values.push(Value::Text(kind.as_str().into()));
+    }
+    if let Some(status) = filter.status {
+        clauses.push("p.status = ?");
+        values.push(Value::Text(status.as_str().into()));
+    }
+    (clauses.join(" AND "), values)
+}
+
+fn history_record_query(
+    filter: &HistoryFilter,
+    start: &str,
+    end: &str,
+    limit: u32,
+    offset: u32,
+) -> (String, Vec<Value>) {
+    let mut branches = Vec::new();
+    let mut values = Vec::new();
+    if filter.event_type.is_none() || filter.event_type == Some(HistoryEventType::Probe) {
+        let (predicate, branch_values) =
+            record_predicate(filter, "p", "observed_at", "status", start, end, false);
+        branches.push(format!(
+            r"SELECT 1 source_order, p.id source_id, 'probe' event_type, p.observed_at occurred_at,
+                      p.outlet_id, p.outlet_label, p.outlet_kind,
+                      CASE WHEN o.deleted_at IS NULL THEN 0 ELSE 1 END deleted,
+                      p.status status, NULL from_status, NULL to_status, p.latency_ms,
+                      NULL from_outlet_id, NULL to_outlet_id, NULL mode, p.error_code reason, NULL duration_ms
+                 FROM probe_samples p JOIN outlets o ON o.id=p.outlet_id WHERE {predicate}"
+        ));
+        values.extend(branch_values);
+    }
+    if filter.event_type.is_none() || filter.event_type == Some(HistoryEventType::State) {
+        let (predicate, branch_values) =
+            record_predicate(filter, "s", "occurred_at", "to_status", start, end, false);
+        branches.push(format!(
+            r"SELECT 2 source_order, s.id source_id, 'state' event_type, s.occurred_at,
+                      s.outlet_id, s.outlet_label, s.outlet_kind,
+                      CASE WHEN o.deleted_at IS NULL THEN 0 ELSE 1 END deleted,
+                      NULL status, s.from_status, s.to_status, NULL latency_ms,
+                      NULL from_outlet_id, NULL to_outlet_id, NULL mode, s.reason, NULL duration_ms
+                 FROM state_events s JOIN outlets o ON o.id=s.outlet_id WHERE {predicate}"
+        ));
+        values.extend(branch_values);
+    }
+    if (filter.event_type.is_none() || filter.event_type == Some(HistoryEventType::RouteSwitch))
+        && filter.status.is_none()
+    {
+        let (predicate, branch_values) =
+            record_predicate(filter, "r", "occurred_at", "", start, end, true);
+        branches.push(format!(
+            r"SELECT 3 source_order, r.id source_id, 'route_switch' event_type, r.occurred_at,
+                      r.to_outlet outlet_id, r.to_label outlet_label, r.to_kind outlet_kind,
+                      CASE WHEN o.deleted_at IS NULL THEN 0 ELSE 1 END deleted,
+                      NULL status, NULL from_status, NULL to_status, NULL latency_ms,
+                      r.from_outlet from_outlet_id, r.to_outlet to_outlet_id, r.mode, r.reason, r.duration_ms
+                 FROM route_switches r LEFT JOIN outlets o ON o.id=r.to_outlet WHERE {predicate}"
+        ));
+        values.extend(branch_values);
+    }
+    if branches.is_empty() {
+        branches.push(
+            "SELECT 0 source_order, 0 source_id, 'probe' event_type, '' occurred_at, '' outlet_id, '' outlet_label, 'unknown' outlet_kind, 0 deleted, NULL status, NULL from_status, NULL to_status, NULL latency_ms, NULL from_outlet_id, NULL to_outlet_id, NULL mode, NULL reason, NULL duration_ms WHERE 0"
+                .into(),
+        );
+    }
+    values.push(Value::Integer(i64::from(limit)));
+    values.push(Value::Integer(i64::from(offset)));
+    (
+        format!(
+            "SELECT * FROM ({}) ORDER BY occurred_at DESC, source_order DESC, source_id DESC LIMIT ? OFFSET ?",
+            branches.join(" UNION ALL ")
+        ),
+        values,
+    )
+}
+
+fn record_predicate(
+    filter: &HistoryFilter,
+    alias: &str,
+    time_column: &str,
+    status_column: &str,
+    start: &str,
+    end: &str,
+    route_switch: bool,
+) -> (String, Vec<Value>) {
+    let mut clauses = vec![
+        format!("{alias}.{time_column} >= ?"),
+        format!("{alias}.{time_column} <= ?"),
+    ];
+    let mut values = vec![Value::Text(start.into()), Value::Text(end.into())];
+    if let Some(outlet_id) = &filter.outlet_id {
+        clauses.push(if route_switch {
+            format!("({alias}.from_outlet = ? OR {alias}.to_outlet = ?)")
+        } else {
+            format!("{alias}.outlet_id = ?")
+        });
+        values.push(Value::Text(outlet_id.clone()));
+        if route_switch {
+            values.push(Value::Text(outlet_id.clone()));
+        }
+    }
+    if let Some(kind) = filter.kind {
+        clauses.push(if route_switch {
+            format!("({alias}.from_kind = ? OR {alias}.to_kind = ?)")
+        } else {
+            format!("{alias}.outlet_kind = ?")
+        });
+        values.push(Value::Text(kind.as_str().into()));
+        if route_switch {
+            values.push(Value::Text(kind.as_str().into()));
+        }
+    }
+    if !route_switch && let Some(status) = filter.status {
+        clauses.push(format!("{alias}.{status_column} = ?"));
+        values.push(Value::Text(status.as_str().into()));
+    }
+    (clauses.join(" AND "), values)
+}
+
+fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, StoreError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|_| StoreError::InvalidTimestamp(value.into()))
 }
 
 type StoredUdpCapability = (
@@ -606,14 +1354,23 @@ fn ensure_probe_column(
     column_name: &str,
     definition: &str,
 ) -> Result<(), rusqlite::Error> {
+    ensure_column(connection, "probe_samples", column_name, definition)
+}
+
+fn ensure_column(
+    connection: &rusqlite::Transaction<'_>,
+    table_name: &str,
+    column_name: &str,
+    definition: &str,
+) -> Result<(), rusqlite::Error> {
     let exists = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('probe_samples') WHERE name=?1)",
+        &format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table_name}') WHERE name=?1)"),
         [column_name],
         |row| row.get::<_, bool>(0),
     )?;
     if !exists {
         connection.execute(
-            &format!("ALTER TABLE probe_samples ADD COLUMN {column_name} {definition}"),
+            &format!("ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"),
             [],
         )?;
     }
@@ -945,8 +1702,352 @@ mod tests {
         );
     }
 
+    fn history_snapshot(id: &str, label: &str) -> HistoryOutletSnapshot {
+        HistoryOutletSnapshot {
+            outlet_id: id.into(),
+            label: label.into(),
+            kind: HistoryOutletKind::LocalProxy,
+            enabled: true,
+        }
+    }
+
     #[test]
-    fn migrates_v2_to_v3_transactionally_without_losing_existing_probe_data() {
+    fn history_metrics_use_fixed_percentiles_and_window_truncated_failures() {
+        let mut store = GuardianStore::open_in_memory().expect("store");
+        let outlet_id = "test-outlet-7f3a";
+        store
+            .sync_history_outlets(
+                &[history_snapshot(outlet_id, "测试出口")],
+                "2026-02-01T00:00:00Z",
+            )
+            .expect("sync outlet");
+        for (timestamp, status, latency) in [
+            ("2026-01-31T23:01:00Z", "healthy", 10),
+            ("2026-01-31T23:02:00Z", "degraded", 20),
+            ("2026-01-31T23:03:00Z", "down", 30),
+            ("2026-01-31T23:04:00Z", "healthy", 40),
+        ] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO probe_samples(outlet_id, observed_at, status, latency_ms, outlet_label, outlet_kind) VALUES (?1, ?2, ?3, ?4, '测试出口', 'local_proxy')",
+                    params![outlet_id, timestamp, status, latency],
+                )
+                .expect("sample");
+        }
+        for (timestamp, from, to) in [
+            ("2026-01-31T22:50:00Z", "healthy", "down"),
+            ("2026-01-31T23:30:00Z", "down", "healthy"),
+            ("2026-01-31T23:35:00Z", "healthy", "down"),
+            ("2026-01-31T23:35:00Z", "down", "healthy"),
+            ("2026-01-31T23:40:00Z", "healthy", "down"),
+        ] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO state_events(outlet_id, occurred_at, from_status, to_status, reason, outlet_label, outlet_kind) VALUES (?1, ?2, ?3, ?4, 'synthetic', '测试出口', 'local_proxy')",
+                    params![outlet_id, timestamp, from, to],
+                )
+                .expect("state event");
+        }
+        let response = store
+            .query_history(
+                &HistoryFilter {
+                    window: crate::HistoryWindow::OneHour,
+                    ..HistoryFilter::default()
+                },
+                "2026-02-01T00:00:00Z",
+            )
+            .expect("history");
+        let metric = response.metrics.first().expect("metric");
+        assert_eq!(metric.sample_count, 4);
+        assert_eq!(metric.online_samples, 3);
+        assert!((metric.availability_percent - 75.0).abs() < f64::EPSILON);
+        assert_eq!(metric.p50_latency_ms, Some(20));
+        assert_eq!(metric.p95_latency_ms, Some(40));
+        assert_eq!(metric.failure_count, 3);
+        assert_eq!(metric.failure_duration_seconds, 3_000);
+        assert!(metric.ongoing_failure);
+        let status_filtered = store
+            .query_history(
+                &HistoryFilter {
+                    window: crate::HistoryWindow::OneHour,
+                    status: Some(HealthStatus::Down),
+                    ..HistoryFilter::default()
+                },
+                "2026-02-01T00:00:00Z",
+            )
+            .expect("status-filtered events");
+        assert!((status_filtered.metrics[0].availability_percent - 75.0).abs() < f64::EPSILON);
+        assert!(status_filtered.records.iter().all(|record| {
+            record.status == Some(HealthStatus::Down)
+                || record.to_status == Some(HealthStatus::Down)
+        }));
+    }
+
+    #[test]
+    fn history_snapshots_survive_rename_reorder_disable_and_delete() {
+        let mut store = GuardianStore::open_in_memory().expect("store");
+        let outlet_id = "stable-outlet-91b2";
+        let mut probe = outlet();
+        probe.id = outlet_id.into();
+        probe.label = "旧名称".into();
+        let mut first = result(HealthStatus::Healthy, "2026-02-01T00:01:00Z");
+        first.outlet_id = outlet_id.into();
+        first.label = probe.label.clone();
+        store
+            .sync_history_outlets(
+                &[history_snapshot(outlet_id, "旧名称")],
+                "2026-02-01T00:00:00Z",
+            )
+            .expect("initial catalogue");
+        store
+            .record_probe(&probe, &first, 1, 1)
+            .expect("old sample");
+        let mut renamed = history_snapshot(outlet_id, "新名称");
+        renamed.enabled = false;
+        store
+            .sync_history_outlets(&[renamed], "2026-02-01T00:02:00Z")
+            .expect("rename and disable");
+        probe.label = "新名称".into();
+        let mut second = result(HealthStatus::Healthy, "2026-02-01T00:03:00Z");
+        second.outlet_id = outlet_id.into();
+        second.label = probe.label.clone();
+        store
+            .record_probe(&probe, &second, 1, 1)
+            .expect("new sample");
+        store
+            .sync_history_outlets(&[], "2026-02-01T00:04:00Z")
+            .expect("delete catalogue item");
+        let history = store
+            .query_history(
+                &HistoryFilter {
+                    outlet_id: Some(outlet_id.into()),
+                    ..HistoryFilter::default()
+                },
+                "2026-02-01T01:00:00Z",
+            )
+            .expect("history after delete");
+        let probe_labels = history
+            .records
+            .iter()
+            .filter(|record| record.event_type == HistoryEventType::Probe)
+            .map(|record| record.outlet_label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(probe_labels, ["新名称", "旧名称"]);
+        assert!(history.records.iter().all(|record| record.deleted));
+        assert!(history.metrics[0].deleted);
+    }
+
+    #[test]
+    fn csv_export_is_filter_consistent_and_neutralizes_injection() {
+        let mut store = GuardianStore::open_in_memory().expect("store");
+        let outlet_id = "csv-outlet-2ca8";
+        store
+            .sync_history_outlets(
+                &[history_snapshot(outlet_id, "CSV 出口")],
+                "2026-02-01T00:00:00Z",
+            )
+            .expect("catalogue");
+        store
+            .connection
+            .execute(
+                "INSERT INTO probe_samples(outlet_id, observed_at, status, latency_ms, error_code, outlet_label, outlet_kind) VALUES (?1, '2026-02-01T00:10:00Z', 'down', NULL, ?2, '=cmd()', 'local_proxy')",
+                params![outlet_id, "https://private.invalid/token-value"],
+            )
+            .expect("hostile synthetic row");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("history.csv");
+        let rows = store
+            .export_history_csv(
+                &path,
+                &HistoryFilter {
+                    outlet_id: Some(outlet_id.into()),
+                    status: Some(HealthStatus::Down),
+                    event_type: Some(HistoryEventType::Probe),
+                    ..HistoryFilter::default()
+                },
+                "2026-02-01T01:00:00Z",
+            )
+            .expect("export");
+        assert_eq!(rows, 1);
+        let csv = fs::read_to_string(path).expect("csv");
+        assert!(csv.contains("\"'=cmd()\""));
+        assert!(csv.contains("redacted_reason"));
+        for forbidden in ["private.invalid", "token-value", "://"] {
+            assert!(!csv.contains(forbidden), "leaked {forbidden}: {csv}");
+        }
+    }
+
+    #[test]
+    fn retention_keeps_ongoing_failure_and_current_udp_evidence() {
+        let mut store = GuardianStore::open_in_memory().expect("store");
+        let outlet_id = "retention-outlet-18e4";
+        store
+            .sync_history_outlets(
+                &[history_snapshot(outlet_id, "保留测试")],
+                "2026-02-10T00:00:00Z",
+            )
+            .expect("catalogue");
+        store.connection.execute(
+            "INSERT INTO probe_samples(outlet_id, observed_at, status, outlet_label, outlet_kind) VALUES (?1, '2026-01-01T00:00:00Z', 'down', '保留测试', 'local_proxy')",
+            [outlet_id],
+        ).expect("old probe");
+        store.connection.execute(
+            "INSERT INTO state_events(outlet_id, occurred_at, from_status, to_status, reason, outlet_label, outlet_kind) VALUES (?1, '2026-01-01T00:00:00Z', 'healthy', 'down', 'synthetic', '保留测试', 'local_proxy')",
+            [outlet_id],
+        ).expect("ongoing failure");
+        store.connection.execute(
+            "INSERT INTO udp_capability_history(outlet_id, status, observed_at, evidence_version, probe_version, model_version, configuration_fingerprint, configuration_generation, reason_code) VALUES (?1, 'unknown', '2026-01-01T00:00:00Z', 1, 'synthetic', 1, 'synthetic', 1, 'synthetic')",
+            [outlet_id],
+        ).expect("old UDP evidence");
+        let history_id = store.connection.last_insert_rowid();
+        store
+            .connection
+            .execute(
+                "INSERT INTO udp_capability_current(outlet_id, history_id) VALUES (?1, ?2)",
+                params![outlet_id, history_id],
+            )
+            .expect("current UDP evidence");
+        store
+            .set_retention_days(1, "2026-02-10T00:00:00Z")
+            .expect("cleanup");
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM probe_samples", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("probe count"),
+            0
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM state_events", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("event count"),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM udp_capability_history", [], |row| row
+                    .get::<_, i64>(0))
+                .expect("UDP count"),
+            1
+        );
+        assert_eq!(store.retention_days().expect("setting"), 1);
+    }
+
+    #[test]
+    fn empty_samples_and_status_filtered_route_switch_are_well_defined() {
+        let mut store = GuardianStore::open_in_memory().expect("store");
+        let outlet_id = "empty-outlet-33d1";
+        store
+            .sync_history_outlets(
+                &[history_snapshot(outlet_id, "空样本出口")],
+                "2026-02-01T00:00:00Z",
+            )
+            .expect("catalogue");
+        let response = store
+            .query_history(&HistoryFilter::default(), "2026-02-01T01:00:00Z")
+            .expect("empty history");
+        assert!(response.metrics.is_empty());
+        assert!(response.records.is_empty());
+        let route_with_status = store
+            .query_history(
+                &HistoryFilter {
+                    status: Some(HealthStatus::Healthy),
+                    event_type: Some(HistoryEventType::RouteSwitch),
+                    ..HistoryFilter::default()
+                },
+                "2026-02-01T01:00:00Z",
+            )
+            .expect("empty intersection");
+        assert!(route_with_status.records.is_empty());
+    }
+
+    #[test]
+    fn thirty_day_volume_uses_time_index_and_stays_within_bounded_runtime() {
+        let mut store = GuardianStore::open_in_memory().expect("store");
+        let snapshots = (0..3)
+            .map(|index| history_snapshot(&format!("volume-outlet-{index}-a9e2"), "规模测试"))
+            .collect::<Vec<_>>();
+        store
+            .sync_history_outlets(&snapshots, "2026-03-01T00:00:00Z")
+            .expect("catalogue");
+        let end = parse_timestamp("2026-03-01T00:00:00Z").expect("timestamp");
+        let transaction = store.connection.transaction().expect("transaction");
+        {
+            let mut insert = transaction
+                .prepare(
+                    "INSERT INTO probe_samples(outlet_id, observed_at, status, latency_ms, outlet_label, outlet_kind) VALUES (?1, ?2, ?3, ?4, '规模测试', 'local_proxy')",
+                )
+                .expect("prepare");
+            for snapshot in &snapshots {
+                for sample in 0..14_400_i64 {
+                    let observed = end - chrono::Duration::seconds((14_400 - sample) * 180);
+                    let status = if sample % 97 == 0 { "down" } else { "healthy" };
+                    insert
+                        .execute(params![
+                            snapshot.outlet_id,
+                            observed.to_rfc3339_opts(SecondsFormat::Millis, true),
+                            status,
+                            20 + sample % 400,
+                        ])
+                        .expect("insert sample");
+                }
+            }
+        }
+        transaction.commit().expect("commit samples");
+
+        let plan = store
+            .connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id FROM probe_samples WHERE observed_at >= ?1 AND observed_at <= ?2 ORDER BY observed_at DESC LIMIT 100",
+            )
+            .and_then(|mut statement| {
+                statement
+                    .query_map(
+                        params!["2026-01-30T00:00:00Z", "2026-03-01T00:00:00Z"],
+                        |row| row.get::<_, String>(3),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .expect("query plan");
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("idx_probe_samples_time_outlet_status")),
+            "unexpected query plan: {plan:?}"
+        );
+
+        let filter = HistoryFilter {
+            window: crate::HistoryWindow::ThirtyDays,
+            ..HistoryFilter::default()
+        };
+        let query_started = std::time::Instant::now();
+        let response = store
+            .query_history(&filter, "2026-03-01T00:00:00Z")
+            .expect("30-day query");
+        assert_eq!(response.metrics.len(), 3);
+        assert_eq!(response.records.len(), 100);
+        assert!(query_started.elapsed() < std::time::Duration::from_secs(10));
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let export_started = std::time::Instant::now();
+        let rows = store
+            .export_history_csv(
+                directory.path().join("volume.csv"),
+                &filter,
+                "2026-03-01T00:00:00Z",
+            )
+            .expect("streaming export");
+        assert_eq!(rows, 43_200);
+        assert!(export_started.elapsed() < std::time::Duration::from_secs(20));
+    }
+
+    #[test]
+    fn migrates_v2_to_v4_transactionally_without_losing_existing_probe_data() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("guardian.db");
         {
@@ -990,13 +2091,83 @@ mod tests {
                 .connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .expect("version"),
-            3
+            4
         );
         let summaries = store.summaries().expect("preserved summaries");
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].outlet_id, "legacy-a");
         assert_eq!(summaries[0].samples, 1);
         assert_eq!(summaries[0].average_latency_ms, Some(42.0));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn migrates_v3_to_v4_without_losing_udp_or_health_evidence() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("guardian-v3.db");
+        {
+            let connection = Connection::open(&path).expect("v3 database");
+            connection
+                .execute_batch(
+                    r"
+                    CREATE TABLE outlets (id TEXT PRIMARY KEY, label TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE probe_samples (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, outlet_id TEXT NOT NULL,
+                        observed_at TEXT NOT NULL, port_reachable INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL, http_status INTEGER, latency_ms INTEGER,
+                        error_code TEXT, successful_targets INTEGER NOT NULL DEFAULT 0,
+                        total_targets INTEGER NOT NULL DEFAULT 1
+                    );
+                    CREATE TABLE outlet_state (
+                        outlet_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+                        consecutive_successes INTEGER NOT NULL, consecutive_failures INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE state_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, outlet_id TEXT NOT NULL,
+                        occurred_at TEXT NOT NULL, from_status TEXT NOT NULL,
+                        to_status TEXT NOT NULL, reason TEXT NOT NULL
+                    );
+                    CREATE TABLE route_switches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL,
+                        from_outlet TEXT, to_outlet TEXT NOT NULL, mode TEXT NOT NULL,
+                        reason TEXT NOT NULL, duration_ms INTEGER NOT NULL
+                    );
+                    CREATE TABLE udp_capability_history (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, outlet_id TEXT NOT NULL,
+                        status TEXT NOT NULL, observed_at TEXT NOT NULL, evidence_version INTEGER NOT NULL,
+                        probe_version TEXT NOT NULL, model_version INTEGER NOT NULL,
+                        configuration_fingerprint TEXT NOT NULL, configuration_generation INTEGER NOT NULL,
+                        reason_code TEXT NOT NULL
+                    );
+                    CREATE TABLE udp_capability_current (
+                        outlet_id TEXT PRIMARY KEY, history_id INTEGER NOT NULL
+                    );
+                    INSERT INTO outlets VALUES ('v3-outlet-a14f', 'V3 Outlet', '2026-01-01T00:00:00Z');
+                    INSERT INTO probe_samples(outlet_id, observed_at, status, latency_ms)
+                    VALUES ('v3-outlet-a14f', '2026-01-01T00:00:00Z', 'healthy', 33);
+                    INSERT INTO outlet_state VALUES ('v3-outlet-a14f', 'healthy', 1, 0, '2026-01-01T00:00:00Z');
+                    INSERT INTO udp_capability_history(outlet_id, status, observed_at, evidence_version, probe_version, model_version, configuration_fingerprint, configuration_generation, reason_code)
+                    VALUES ('v3-outlet-a14f', 'supported', '2026-01-01T00:00:00Z', 1, 'synthetic-v1', 1, 'synthetic-fingerprint', 7, 'synthetic');
+                    INSERT INTO udp_capability_current VALUES ('v3-outlet-a14f', 1);
+                    PRAGMA user_version=3;
+                    ",
+                )
+                .expect("seed v3");
+        }
+        let store = GuardianStore::open(&path).expect("migrate v3");
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("version"),
+            4
+        );
+        assert_eq!(store.summaries().expect("summary")[0].samples, 1);
+        let udp = store.udp_capabilities().expect("UDP evidence");
+        assert_eq!(udp.len(), 1);
+        assert_eq!(udp[0].status, UdpCapabilityStatus::Supported);
+        assert_eq!(store.retention_days().expect("retention"), 30);
     }
 
     #[test]

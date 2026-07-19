@@ -12,8 +12,9 @@ use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use vpn_hub_core::{
-    GuardianConfig, GuardianStore, HealthStatus, LatencySample, OutletConfig, OutletKind,
-    OutletSummary, ProbeOutletConfig, ProbeResult, RouteMode, RouteSwitchEvent, StateEvent,
+    GuardianConfig, GuardianStore, HealthStatus, HistoryExport, HistoryFilter, HistoryOutletKind,
+    HistoryOutletSnapshot, HistoryResponse, LatencySample, OutletConfig, OutletKind, OutletSummary,
+    ProbeOutletConfig, ProbeResult, RouteMode, RouteSwitchEvent, StateEvent,
     SubscriptionCredentialStatus, UdpCapabilityEvidence, UdpProbeTarget, is_current_udp_evidence,
     probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle, unknown_udp_evidence,
 };
@@ -39,6 +40,9 @@ fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
     let private = state.private_config()?;
     let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
+    store
+        .sync_history_outlets(&history_outlets(&private), &Utc::now().to_rfc3339())
+        .map_err(|error| format!("无法同步脱敏历史出口目录：{error}"))?;
     for outlet in private.enabled_outlets() {
         store
             .ensure_udp_capability(
@@ -83,6 +87,98 @@ fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
     })
 }
 
+fn history_outlets(private: &vpn_hub_core::PrivateRoutingConfig) -> Vec<HistoryOutletSnapshot> {
+    private
+        .outlets
+        .iter()
+        .map(|outlet| HistoryOutletSnapshot {
+            outlet_id: outlet.id.clone(),
+            label: outlet.label.clone(),
+            kind: match outlet.kind {
+                OutletKind::Subscription { .. } => HistoryOutletKind::Subscription,
+                OutletKind::LocalProxy { .. } => HistoryOutletKind::LocalProxy,
+            },
+            enabled: outlet.enabled,
+        })
+        .collect()
+}
+
+fn history_context(
+    state: &AppState,
+) -> Result<(std::path::PathBuf, Vec<HistoryOutletSnapshot>, String), String> {
+    let guardian = GuardianConfig::load(state.guardian_config_path())
+        .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
+    let private = state.private_config()?;
+    Ok((
+        guardian.database_path,
+        history_outlets(&private),
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+    ))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn get_history(
+    state: State<'_, AppState>,
+    filter: HistoryFilter,
+) -> Result<HistoryResponse, String> {
+    let (database_path, outlets, now) = history_context(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = GuardianStore::open(database_path)
+            .map_err(|error| format!("无法打开历史数据库：{error}"))?;
+        store
+            .sync_history_outlets(&outlets, &now)
+            .map_err(|error| format!("无法同步脱敏历史出口目录：{error}"))?;
+        store
+            .query_history(&filter, &now)
+            .map_err(|error| format!("无法查询历史：{error}"))
+    })
+    .await
+    .map_err(|_| "历史查询后台任务异常退出".to_string())?
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn export_history(
+    state: State<'_, AppState>,
+    filter: HistoryFilter,
+) -> Result<HistoryExport, String> {
+    let (database_path, outlets, now) = history_context(&state)?;
+    let timestamp = Utc::now().timestamp_millis();
+    let destination = state.history_export_path(timestamp);
+    let exported_path = destination.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = GuardianStore::open(database_path)
+            .map_err(|error| format!("无法打开历史数据库：{error}"))?;
+        store
+            .sync_history_outlets(&outlets, &now)
+            .map_err(|error| format!("无法同步脱敏历史出口目录：{error}"))?;
+        let rows = store
+            .export_history_csv(&destination, &filter, &now)
+            .map_err(|error| format!("无法导出脱敏 CSV：{error}"))?;
+        Ok(HistoryExport {
+            path: exported_path.to_string_lossy().into_owned(),
+            rows,
+        })
+    })
+    .await
+    .map_err(|_| "CSV 导出后台任务异常退出".to_string())?
+}
+
+#[tauri::command]
+pub async fn set_history_retention(state: State<'_, AppState>, days: u32) -> Result<u64, String> {
+    let (database_path, _, now) = history_context(&state)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut store = GuardianStore::open(database_path)
+            .map_err(|error| format!("无法打开历史数据库：{error}"))?;
+        store
+            .set_retention_days(days, &now)
+            .map_err(|error| format!("无法更新历史保留策略：{error}"))
+    })
+    .await
+    .map_err(|_| "历史清理后台任务异常退出".to_string())?
+}
+
 async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
@@ -90,6 +186,9 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
     let resolved = state.resolved_subscription_urls(&private)?;
     let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
+    store
+        .sync_history_outlets(&history_outlets(&private), &Utc::now().to_rfc3339())
+        .map_err(|error| format!("无法同步脱敏历史出口目录：{error}"))?;
 
     for outlet in private.enabled_outlets() {
         store
@@ -143,6 +242,9 @@ async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
     };
     let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
+    store
+        .sync_history_outlets(&history_outlets(&private), &Utc::now().to_rfc3339())
+        .map_err(|error| format!("无法同步脱敏历史出口目录：{error}"))?;
 
     run_controller_guardian_cycle(
         &controller,
@@ -448,6 +550,43 @@ mod tests {
                 provider_update_seconds: 180,
             },
         }
+    }
+
+    #[test]
+    fn history_catalogue_projects_multiple_subscriptions_without_secret_references() {
+        let mut config = vpn_hub_core::PrivateRoutingConfig::default();
+        config.outlets = (0..3)
+            .map(|index| OutletConfig {
+                id: format!("subscription-{index}"),
+                label: format!("订阅 {index}"),
+                enabled: index != 2,
+                kind: OutletKind::Subscription {
+                    secret_ref: format!("synthetic-ref-{index}"),
+                    provider_update_seconds: 180,
+                },
+            })
+            .chain(std::iter::once(OutletConfig {
+                id: "local-synthetic".into(),
+                label: "本地出口".into(),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: "socks5://127.0.0.1:45191".into(),
+                },
+            }))
+            .collect();
+        let catalogue = history_outlets(&config);
+        assert_eq!(catalogue.len(), 4);
+        assert_eq!(
+            catalogue
+                .iter()
+                .filter(|outlet| outlet.kind == HistoryOutletKind::Subscription)
+                .count(),
+            3
+        );
+        assert!(!catalogue[2].enabled);
+        let serialized = serde_json::to_string(&catalogue).expect("serialize safe catalogue");
+        assert!(!serialized.contains("synthetic-ref"));
+        assert!(!serialized.contains("socks5://"));
     }
 
     #[test]
