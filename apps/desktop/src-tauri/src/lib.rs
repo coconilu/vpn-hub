@@ -21,8 +21,7 @@ pub fn run() {
         .setup(|app| {
             lifecycle::install_tray(app)?;
             app.state::<DesktopCoordinator>()
-                .start(app.handle().clone())
-                .map_err(std::io::Error::other)?;
+                .start(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {

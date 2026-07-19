@@ -10,7 +10,7 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 use vpn_hub_core::{
     GuardianConfig, GuardianStore, HealthStatus, HistoryExport, HistoryFilter, HistoryOutletKind,
     HistoryOutletSnapshot, HistoryResponse, LatencySample, OutletConfig, OutletKind, OutletSummary,
@@ -217,6 +217,8 @@ pub async fn apply_settings(
     state: State<'_, AppState>,
     request: SettingsApplyRequest,
 ) -> Result<SettingsApplyResult, String> {
+    app.state::<lifecycle::DesktopCoordinator>()
+        .prepare_config_reload();
     let _transaction = state.lock_routing_transaction().await;
     let result = state.apply_settings(request)?;
     lifecycle::dispatch(
@@ -277,12 +279,7 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
     Ok(guardian.monitor.interval_seconds)
 }
 
-pub(crate) async fn record_routing_cycle(state: &AppState) -> Result<u64, String> {
-    let _transaction = state.lock_routing_transaction().await;
-    record_routing_cycle_locked(state).await
-}
-
-async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
+pub(crate) async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
     let private = state.private_config()?;
@@ -553,6 +550,8 @@ pub async fn start_development_core(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreStatus, String> {
+    app.state::<lifecycle::DesktopCoordinator>()
+        .prepare_manual_start();
     let _transaction = state.lock_routing_transaction().await;
     let mut status = match state.start_development_core().await {
         Ok(status) => status,
@@ -572,7 +571,9 @@ pub async fn start_development_core(
             "开发核心首次健康决策失败，已停止并保持 Fail Closed：{error}"
         ));
     }
-    lifecycle::dispatch(&app, LifecycleEvent::CoreStarted);
+    if let Some(pid) = status.pid {
+        lifecycle::dispatch(&app, LifecycleEvent::CoreStarted { pid });
+    }
     status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();
     Ok(status)
 }
@@ -583,6 +584,7 @@ pub async fn stop_development_core(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreStatus, String> {
+    app.state::<lifecycle::DesktopCoordinator>().prepare_stop();
     let _transaction = state.lock_routing_transaction().await;
     let status = state.stop_development_core()?;
     lifecycle::dispatch(&app, LifecycleEvent::CoreStopped);

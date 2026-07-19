@@ -1,9 +1,9 @@
 use std::{
     collections::{HashMap, VecDeque, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
+    hash::Hasher,
     sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -22,7 +22,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tauri_plugin_notification::NotificationExt;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{Notify, mpsc};
 use vpn_hub_core::{
     FAIL_CLOSED_OUTLET, GuardianConfig, GuardianStore, HealthStatus, RouteSwitchEvent, StateEvent,
 };
@@ -34,18 +34,24 @@ const RECOVERY_SIGNAL_COALESCE_MS: u64 = 5_000;
 const NETWORK_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 const RESUME_GAP: Duration = Duration::from_secs(30);
 const NOTIFICATION_WINDOW_MS: u64 = 60_000;
+const MAX_RECOVERY_ATTEMPTS: u32 = 5;
+const CONTROL_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+const OWNED_CORE_WATCH_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleEvent {
     WindowClose,
     OpenWindow,
     StopCore,
-    CoreStarted,
+    ManualStartRequested,
+    CoreStarted { pid: u32 },
     CoreStopped,
     OwnedCoreUnexpectedExit,
     RestartTimer,
     StartupFailed(StartupFailure),
     PortConflictObserved,
+    RecoveryChildPublished { pid: u32 },
+    RecoverySucceeded { pid: u32 },
     ConfigReload { now_ms: u64 },
     RecoverySignal { now_ms: u64 },
     ExplicitExit,
@@ -77,18 +83,24 @@ enum NotificationKind {
     CoreRecovered,
     PortConflict,
     ConsecutiveStartupFailures(u32),
+    RecoveryTerminal,
 }
 
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct LifecycleMachine {
     exiting: bool,
     core_expected: bool,
+    expected_pid: Option<u32>,
+    recovering_from_owned_exit: bool,
+    recovery_terminal: bool,
     restart_pending: bool,
     consecutive_startup_failures: u32,
     last_recovery_signal_ms: Option<u64>,
 }
 
 impl LifecycleMachine {
+    #[allow(clippy::too_many_lines)]
     fn reduce(&mut self, event: LifecycleEvent) -> Vec<LifecycleEffect> {
         if self.exiting {
             return Vec::new();
@@ -98,29 +110,41 @@ impl LifecycleMachine {
             LifecycleEvent::OpenWindow => vec![LifecycleEffect::ShowAndFocusWindow],
             LifecycleEvent::StopCore => {
                 self.core_expected = false;
+                self.expected_pid = None;
+                self.recovering_from_owned_exit = false;
+                self.recovery_terminal = false;
                 self.restart_pending = false;
                 vec![LifecycleEffect::StopOwnedCore, LifecycleEffect::RefreshTray]
             }
-            LifecycleEvent::CoreStarted => {
-                let recovered = self.consecutive_startup_failures > 0;
+            LifecycleEvent::ManualStartRequested => {
+                self.recovery_terminal = false;
+                self.consecutive_startup_failures = 0;
+                self.restart_pending = false;
+                Vec::new()
+            }
+            LifecycleEvent::CoreStarted { pid } => {
                 self.core_expected = true;
+                self.expected_pid = Some(pid);
+                self.recovering_from_owned_exit = false;
+                self.recovery_terminal = false;
                 self.restart_pending = false;
                 self.consecutive_startup_failures = 0;
-                let mut effects = vec![LifecycleEffect::RefreshTray];
-                if recovered {
-                    effects.push(LifecycleEffect::Notify(NotificationKind::CoreRecovered));
-                }
-                effects
+                vec![LifecycleEffect::RefreshTray]
             }
             LifecycleEvent::CoreStopped => {
                 self.core_expected = false;
+                self.expected_pid = None;
+                self.recovering_from_owned_exit = false;
+                self.recovery_terminal = false;
                 self.restart_pending = false;
                 vec![LifecycleEffect::RefreshTray]
             }
             LifecycleEvent::OwnedCoreUnexpectedExit => {
-                if !self.core_expected || self.restart_pending {
+                if !self.core_expected || self.restart_pending || self.recovery_terminal {
                     return Vec::new();
                 }
+                self.expected_pid = None;
+                self.recovering_from_owned_exit = true;
                 self.restart_pending = true;
                 let delay = restart_delay(self.consecutive_startup_failures);
                 vec![
@@ -130,19 +154,39 @@ impl LifecycleMachine {
                 ]
             }
             LifecycleEvent::RestartTimer => {
-                if !self.core_expected || !self.restart_pending {
+                if !self.core_expected || !self.restart_pending || self.recovery_terminal {
                     return Vec::new();
                 }
                 self.restart_pending = false;
+                self.consecutive_startup_failures =
+                    self.consecutive_startup_failures.saturating_add(1);
                 vec![LifecycleEffect::StartOwnedCore]
+            }
+            LifecycleEvent::RecoveryChildPublished { pid } => {
+                if !self.recovering_from_owned_exit || self.recovery_terminal {
+                    return Vec::new();
+                }
+                self.expected_pid = Some(pid);
+                vec![LifecycleEffect::RefreshTray]
+            }
+            LifecycleEvent::RecoverySucceeded { pid } => {
+                if !self.recovering_from_owned_exit || self.recovery_terminal {
+                    return Vec::new();
+                }
+                self.expected_pid = Some(pid);
+                self.recovering_from_owned_exit = false;
+                self.restart_pending = false;
+                self.consecutive_startup_failures = 0;
+                vec![
+                    LifecycleEffect::Notify(NotificationKind::CoreRecovered),
+                    LifecycleEffect::RefreshTray,
+                ]
             }
             LifecycleEvent::StartupFailed(kind) => {
                 if !self.core_expected {
                     return Vec::new();
                 }
-                self.consecutive_startup_failures =
-                    self.consecutive_startup_failures.saturating_add(1);
-                self.restart_pending = true;
+                self.expected_pid = None;
                 let mut effects = Vec::new();
                 if kind == StartupFailure::PortConflict {
                     effects.push(LifecycleEffect::Notify(NotificationKind::PortConflict));
@@ -154,6 +198,13 @@ impl LifecycleMachine {
                         ),
                     ));
                 }
+                if self.consecutive_startup_failures >= MAX_RECOVERY_ATTEMPTS {
+                    self.recovery_terminal = true;
+                    self.restart_pending = false;
+                    effects.push(LifecycleEffect::Notify(NotificationKind::RecoveryTerminal));
+                    return effects;
+                }
+                self.restart_pending = true;
                 effects.push(LifecycleEffect::ScheduleRestart(restart_delay(
                     self.consecutive_startup_failures,
                 )));
@@ -162,7 +213,25 @@ impl LifecycleMachine {
             LifecycleEvent::PortConflictObserved => {
                 vec![LifecycleEffect::Notify(NotificationKind::PortConflict)]
             }
-            LifecycleEvent::ConfigReload { now_ms } | LifecycleEvent::RecoverySignal { now_ms } => {
+            LifecycleEvent::ConfigReload { now_ms } => {
+                self.last_recovery_signal_ms = Some(now_ms);
+                let deliberate_recovery = self.core_expected
+                    && (self.recovery_terminal || self.recovering_from_owned_exit);
+                if deliberate_recovery {
+                    self.expected_pid = None;
+                    self.recovery_terminal = false;
+                    self.recovering_from_owned_exit = true;
+                    self.consecutive_startup_failures = 0;
+                    self.restart_pending = true;
+                }
+                let mut effects = vec![LifecycleEffect::RefreshTray];
+                if deliberate_recovery {
+                    effects.push(LifecycleEffect::ScheduleRestart(Duration::ZERO));
+                }
+                effects.push(LifecycleEffect::ProbeAllEnabled);
+                effects
+            }
+            LifecycleEvent::RecoverySignal { now_ms } => {
                 if self
                     .last_recovery_signal_ms
                     .is_some_and(|last| now_ms.saturating_sub(last) < RECOVERY_SIGNAL_COALESCE_MS)
@@ -170,14 +239,27 @@ impl LifecycleMachine {
                     return Vec::new();
                 }
                 self.last_recovery_signal_ms = Some(now_ms);
-                vec![
-                    LifecycleEffect::ProbeAllEnabled,
-                    LifecycleEffect::RefreshTray,
-                ]
+                let deliberate_recovery = self.core_expected
+                    && (self.recovery_terminal || self.recovering_from_owned_exit);
+                if deliberate_recovery {
+                    self.expected_pid = None;
+                    self.recovery_terminal = false;
+                    self.recovering_from_owned_exit = true;
+                    self.consecutive_startup_failures = 0;
+                    self.restart_pending = true;
+                }
+                let mut effects = vec![LifecycleEffect::RefreshTray];
+                if deliberate_recovery {
+                    effects.push(LifecycleEffect::ScheduleRestart(Duration::ZERO));
+                }
+                effects.push(LifecycleEffect::ProbeAllEnabled);
+                effects
             }
             LifecycleEvent::ExplicitExit | LifecycleEvent::OsShutdown => {
                 self.exiting = true;
                 self.core_expected = false;
+                self.expected_pid = None;
+                self.recovering_from_owned_exit = false;
                 self.restart_pending = false;
                 vec![
                     LifecycleEffect::StopOwnedCore,
@@ -409,41 +491,128 @@ fn route_switch_notification(event: &RouteSwitchEvent) -> SafeNotification {
     }
 }
 
+const SIGNAL_EXIT: u32 = 1 << 0;
+const SIGNAL_STOP: u32 = 1 << 1;
+const SIGNAL_CONFIG_RELOAD: u32 = 1 << 2;
+const SIGNAL_RECOVERY: u32 = 1 << 3;
+const SIGNAL_OPEN: u32 = 1 << 4;
+const SIGNAL_HIDE: u32 = 1 << 5;
+const SIGNAL_CORE_STARTED: u32 = 1 << 6;
+const SIGNAL_CORE_STOPPED: u32 = 1 << 7;
+const SIGNAL_PORT_CONFLICT: u32 = 1 << 8;
+const SIGNAL_MANUAL_START: u32 = 1 << 9;
+
+#[derive(Default)]
+struct ControlMailbox {
+    signals: AtomicU32,
+    core_pid: AtomicU32,
+    notify: Notify,
+}
+
+impl ControlMailbox {
+    fn post(&self, signal: u32) {
+        self.signals.fetch_or(signal, Ordering::AcqRel);
+        self.notify.notify_one();
+    }
+
+    fn post_core_started(&self, pid: u32) {
+        self.core_pid.store(pid, Ordering::Release);
+        self.post(SIGNAL_CORE_STARTED);
+    }
+
+    fn take(&self) -> (u32, u32) {
+        let signals = self.signals.swap(0, Ordering::AcqRel);
+        let pid = self.core_pid.load(Ordering::Acquire);
+        (signals, pid)
+    }
+}
+
 pub struct DesktopCoordinator {
-    sender: UnboundedSender<LifecycleEvent>,
-    receiver: Mutex<Option<UnboundedReceiver<LifecycleEvent>>>,
+    mailbox: Arc<ControlMailbox>,
     started: AtomicBool,
     exit_permitted: AtomicBool,
+    recovery_epoch: AtomicU64,
+    active_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl DesktopCoordinator {
     #[must_use]
     pub fn new() -> Self {
-        let (sender, receiver) = unbounded_channel();
         Self {
-            sender,
-            receiver: Mutex::new(Some(receiver)),
+            mailbox: Arc::new(ControlMailbox::default()),
             started: AtomicBool::new(false),
             exit_permitted: AtomicBool::new(false),
+            recovery_epoch: AtomicU64::new(0),
+            active_cancel: Mutex::new(None),
         }
     }
 
     pub fn dispatch(&self, event: LifecycleEvent) {
-        let _ = self.sender.send(event);
+        match event {
+            LifecycleEvent::ExplicitExit | LifecycleEvent::OsShutdown => {
+                self.invalidate_recovery();
+                self.mailbox.post(SIGNAL_EXIT);
+            }
+            LifecycleEvent::StopCore => {
+                self.invalidate_recovery();
+                self.mailbox.post(SIGNAL_STOP);
+            }
+            LifecycleEvent::ConfigReload { .. } => self.mailbox.post(SIGNAL_CONFIG_RELOAD),
+            LifecycleEvent::RecoverySignal { .. } => self.mailbox.post(SIGNAL_RECOVERY),
+            LifecycleEvent::OpenWindow => self.mailbox.post(SIGNAL_OPEN),
+            LifecycleEvent::WindowClose => self.mailbox.post(SIGNAL_HIDE),
+            LifecycleEvent::CoreStarted { pid } => self.mailbox.post_core_started(pid),
+            LifecycleEvent::CoreStopped => self.mailbox.post(SIGNAL_CORE_STOPPED),
+            LifecycleEvent::PortConflictObserved => self.mailbox.post(SIGNAL_PORT_CONFLICT),
+            LifecycleEvent::ManualStartRequested => {
+                self.invalidate_recovery();
+                self.mailbox.post(SIGNAL_MANUAL_START);
+            }
+            LifecycleEvent::OwnedCoreUnexpectedExit
+            | LifecycleEvent::RestartTimer
+            | LifecycleEvent::StartupFailed(_)
+            | LifecycleEvent::RecoveryChildPublished { .. }
+            | LifecycleEvent::RecoverySucceeded { .. } => {}
+        }
     }
 
-    pub fn start(&self, app: AppHandle) -> Result<(), String> {
+    pub fn start(&self, app: AppHandle) {
         if self.started.swap(true, Ordering::AcqRel) {
-            return Ok(());
+            return;
         }
-        let receiver = self
-            .receiver
-            .lock()
-            .map_err(|_| "桌面生命周期队列锁已损坏".to_string())?
-            .take()
-            .ok_or_else(|| "桌面生命周期队列已启动".to_string())?;
-        tauri::async_runtime::spawn(run_coordinator(app, receiver));
-        Ok(())
+        tauri::async_runtime::spawn(run_coordinator(app, Arc::clone(&self.mailbox)));
+    }
+
+    pub fn prepare_config_reload(&self) {
+        self.invalidate_recovery();
+    }
+
+    pub fn prepare_manual_start(&self) {
+        self.dispatch(LifecycleEvent::ManualStartRequested);
+    }
+
+    pub fn prepare_stop(&self) {
+        self.invalidate_recovery();
+    }
+
+    fn invalidate_recovery(&self) {
+        self.recovery_epoch.fetch_add(1, Ordering::AcqRel);
+        if let Ok(active) = self.active_cancel.lock()
+            && let Some(cancel) = active.as_ref()
+        {
+            cancel.store(true, Ordering::Release);
+        }
+        self.mailbox.notify.notify_one();
+    }
+
+    fn recovery_epoch(&self) -> u64 {
+        self.recovery_epoch.load(Ordering::Acquire)
+    }
+
+    fn set_active_cancel(&self, cancel: Option<Arc<AtomicBool>>) {
+        if let Ok(mut active) = self.active_cancel.lock() {
+            *active = cancel;
+        }
     }
 
     #[must_use]
@@ -557,74 +726,442 @@ fn tray_menu(
         .build()
 }
 
-async fn run_coordinator(app: AppHandle, mut receiver: UnboundedReceiver<LifecycleEvent>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkKind {
+    Probe,
+    Restart,
+}
+
+#[derive(Debug)]
+enum WorkMessage {
+    ProbeFinished {
+        id: u64,
+        interval_seconds: u64,
+        succeeded: bool,
+    },
+    RestartPublished {
+        id: u64,
+        pid: u32,
+    },
+    RestartFinished {
+        id: u64,
+        pid: Option<u32>,
+        outcome: RestartOutcome,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartOutcome {
+    Succeeded,
+    Failed(StartupFailure),
+    Cancelled,
+}
+
+struct ActiveWork {
+    id: u64,
+    kind: WorkKind,
+    cancel: Arc<AtomicBool>,
+    published_pid: Arc<AtomicU32>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ActiveWork {
+    async fn cancel_and_join(mut self, app: &AppHandle, clean_published_restart: bool) {
+        self.cancel.store(true, Ordering::Release);
+        cancel_and_join_handle(&mut self.handle, CONTROL_JOIN_TIMEOUT).await;
+        if clean_published_restart && self.kind == WorkKind::Restart {
+            let published_pid = self.published_pid.load(Ordering::Acquire);
+            if published_pid != 0 {
+                let _ = app
+                    .state::<AppState>()
+                    .stop_owned_core_if_pid(published_pid);
+            }
+        }
+        app.state::<DesktopCoordinator>().set_active_cancel(None);
+    }
+}
+
+async fn cancel_and_join_handle(handle: &mut tokio::task::JoinHandle<()>, timeout: Duration) {
+    if tokio::time::timeout(timeout, &mut *handle).await.is_err() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+fn start_probe_work(app: &AppHandle, id: u64, sender: mpsc::Sender<WorkMessage>) -> ActiveWork {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let published_pid = Arc::new(AtomicU32::new(0));
+    let task_cancel = Arc::clone(&cancel);
+    let task_app = app.clone();
+    let handle = tokio::spawn(async move {
+        let state = task_app.state::<AppState>();
+        let _transaction = state.lock_routing_transaction().await;
+        if task_cancel.load(Ordering::Acquire) {
+            let _ = sender
+                .send(WorkMessage::ProbeFinished {
+                    id,
+                    interval_seconds: 180,
+                    succeeded: false,
+                })
+                .await;
+            return;
+        }
+        let result = commands::record_routing_cycle_locked(&state).await;
+        let succeeded = result.is_ok() && !task_cancel.load(Ordering::Acquire);
+        let _ = sender
+            .send(WorkMessage::ProbeFinished {
+                id,
+                interval_seconds: result.unwrap_or(180),
+                succeeded,
+            })
+            .await;
+    });
+    ActiveWork {
+        id,
+        kind: WorkKind::Probe,
+        cancel,
+        published_pid,
+        handle,
+    }
+}
+
+fn start_restart_work(
+    app: &AppHandle,
+    id: u64,
+    epoch: u64,
+    sender: mpsc::Sender<WorkMessage>,
+) -> ActiveWork {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let published_pid = Arc::new(AtomicU32::new(0));
+    let task_cancel = Arc::clone(&cancel);
+    let task_published_pid = Arc::clone(&published_pid);
+    let task_app = app.clone();
+    let handle = tokio::spawn(run_restart_task(
+        task_app,
+        id,
+        epoch,
+        sender,
+        task_cancel,
+        task_published_pid,
+    ));
+    ActiveWork {
+        id,
+        kind: WorkKind::Restart,
+        cancel,
+        published_pid,
+        handle,
+    }
+}
+
+async fn run_restart_task(
+    app: AppHandle,
+    id: u64,
+    epoch: u64,
+    sender: mpsc::Sender<WorkMessage>,
+    cancel: Arc<AtomicBool>,
+    published_pid: Arc<AtomicU32>,
+) {
+    let state = app.state::<AppState>();
+    let _transaction = state.lock_routing_transaction().await;
+    if cancel.load(Ordering::Acquire) || app.state::<DesktopCoordinator>().recovery_epoch() != epoch
+    {
+        send_restart_finished(&sender, id, None, RestartOutcome::Cancelled).await;
+        return;
+    }
+    let status = state.start_development_core_cancellable(&cancel).await;
+    let Ok(status) = status else {
+        if cancel.load(Ordering::Acquire)
+            || app.state::<DesktopCoordinator>().recovery_epoch() != epoch
+        {
+            send_restart_finished(&sender, id, None, RestartOutcome::Cancelled).await;
+            return;
+        }
+        let failure = if state
+            .core_status()
+            .is_ok_and(|status| status.state == "external")
+        {
+            StartupFailure::PortConflict
+        } else {
+            StartupFailure::Other
+        };
+        send_restart_finished(&sender, id, None, RestartOutcome::Failed(failure)).await;
+        return;
+    };
+    let Some(pid) = status.pid else {
+        send_restart_finished(
+            &sender,
+            id,
+            None,
+            RestartOutcome::Failed(StartupFailure::Other),
+        )
+        .await;
+        return;
+    };
+    published_pid.store(pid, Ordering::Release);
+    let _ = sender.send(WorkMessage::RestartPublished { id, pid }).await;
+    let still_current = app.state::<DesktopCoordinator>().recovery_epoch() == epoch;
+    if cancel.load(Ordering::Acquire) || !still_current || !state.owned_core_is_running(pid) {
+        let _ = state.stop_owned_core_if_pid(pid);
+        send_restart_finished(&sender, id, Some(pid), RestartOutcome::Cancelled).await;
+        return;
+    }
+    let guardian_succeeded = commands::record_routing_cycle_locked(&state).await.is_ok();
+    let committed = guardian_succeeded
+        && !cancel.load(Ordering::Acquire)
+        && app.state::<DesktopCoordinator>().recovery_epoch() == epoch
+        && state.owned_core_is_running(pid);
+    if !committed {
+        let _ = state.stop_owned_core_if_pid(pid);
+    }
+    let outcome = if committed {
+        RestartOutcome::Succeeded
+    } else if cancel.load(Ordering::Acquire)
+        || app.state::<DesktopCoordinator>().recovery_epoch() != epoch
+    {
+        RestartOutcome::Cancelled
+    } else {
+        RestartOutcome::Failed(StartupFailure::Other)
+    };
+    send_restart_finished(&sender, id, Some(pid), outcome).await;
+}
+
+async fn send_restart_finished(
+    sender: &mpsc::Sender<WorkMessage>,
+    id: u64,
+    pid: Option<u32>,
+    outcome: RestartOutcome,
+) {
+    let _ = sender
+        .send(WorkMessage::RestartFinished { id, pid, outcome })
+        .await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
     let mut machine = LifecycleMachine::default();
-    let initial_running = app
-        .state::<AppState>()
-        .core_status()
-        .is_ok_and(|status| status.managed && status.state == "running");
-    machine.core_expected = initial_running;
+    if let Some(pid) = app.state::<AppState>().owned_core_pid() {
+        let _ = machine.reduce(LifecycleEvent::CoreStarted { pid });
+    }
     let mut deduper = NotificationDeduper::default();
     let mut transitions = TransitionNotifications::default();
+    let (work_sender, mut work_receiver) = mpsc::channel(8);
+    let (network_sender, mut network_receiver) = mpsc::channel(2);
+    let mut active: Option<ActiveWork> = None;
+    let mut network_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut pending_probe = true;
+    let mut next_work_id = 1_u64;
     let mut next_guardian = Instant::now();
-    let mut next_network_sample = Instant::now() + NETWORK_SAMPLE_INTERVAL;
-    let mut last_network_fingerprint = sample_network_fingerprint().await;
+    let mut next_network_sample = Instant::now();
+    let mut last_network_fingerprint: Option<u64> = None;
     let mut last_network_sample = Instant::now();
-    let mut restart_at: Option<Instant> = None;
-    let mut previously_owned_running = initial_running;
+    let mut restart_at: Option<(Instant, u64)> = None;
+    let mut watcher = tokio::time::interval(OWNED_CORE_WATCH_INTERVAL);
 
     loop {
+        if active.is_none() {
+            let due_restart = restart_at.is_some_and(|(deadline, _)| deadline <= Instant::now());
+            if due_restart {
+                let Some((_, epoch)) = restart_at.take() else {
+                    continue;
+                };
+                if epoch == app.state::<DesktopCoordinator>().recovery_epoch() {
+                    let effects = machine.reduce(LifecycleEvent::RestartTimer);
+                    if effects.contains(&LifecycleEffect::StartOwnedCore) {
+                        let work =
+                            start_restart_work(&app, next_work_id, epoch, work_sender.clone());
+                        next_work_id = next_work_id.saturating_add(1);
+                        app.state::<DesktopCoordinator>()
+                            .set_active_cancel(Some(Arc::clone(&work.cancel)));
+                        active = Some(work);
+                    }
+                }
+            } else if pending_probe {
+                let work = start_probe_work(&app, next_work_id, work_sender.clone());
+                next_work_id = next_work_id.saturating_add(1);
+                app.state::<DesktopCoordinator>()
+                    .set_active_cancel(Some(Arc::clone(&work.cancel)));
+                active = Some(work);
+                pending_probe = false;
+            }
+        }
         let restart_deadline =
-            restart_at.unwrap_or_else(|| Instant::now() + Duration::from_hours(24));
+            restart_at.map_or_else(|| Instant::now() + Duration::from_hours(24), |item| item.0);
         tokio::select! {
-            event = receiver.recv() => {
-                let Some(event) = event else { break };
-                if handle_event(&app, &mut machine, &mut deduper, &mut transitions, event, &mut restart_at).await {
+            () = mailbox.notify.notified() => {
+                let (signals, core_pid) = mailbox.take();
+                if signals & SIGNAL_EXIT != 0 {
+                    if let Some(work) = active.take() {
+                        work.cancel_and_join(&app, true).await;
+                    }
+                    if let Some(mut handle) = network_handle.take()
+                        && tokio::time::timeout(CONTROL_JOIN_TIMEOUT, &mut handle).await.is_err()
+                    {
+                        handle.abort();
+                        let _ = handle.await;
+                    }
+                    let state = app.state::<AppState>();
+                    let _transaction = state.lock_routing_transaction().await;
+                    let _ = state.stop_development_core_if_owned();
+                    app.state::<DesktopCoordinator>().permit_exit();
+                    app.exit(0);
                     break;
+                }
+                if signals & SIGNAL_STOP != 0 {
+                    if let Some(work) = active.take() {
+                        work.cancel_and_join(&app, true).await;
+                    }
+                    restart_at = None;
+                    pending_probe = false;
+                    let state = app.state::<AppState>();
+                    let _transaction = state.lock_routing_transaction().await;
+                    let _ = state.stop_development_core_if_owned();
+                    consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::StopCore), &mut pending_probe, &mut restart_at);
+                }
+                if signals & SIGNAL_MANUAL_START != 0 {
+                    restart_at = None;
+                    consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::ManualStartRequested), &mut pending_probe, &mut restart_at);
+                }
+                if signals & SIGNAL_CORE_STOPPED != 0 {
+                    restart_at = None;
+                    consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::CoreStopped), &mut pending_probe, &mut restart_at);
+                }
+                if signals & SIGNAL_CORE_STARTED != 0 && core_pid != 0 {
+                    consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::CoreStarted { pid: core_pid }), &mut pending_probe, &mut restart_at);
+                }
+                if signals & SIGNAL_PORT_CONFLICT != 0 {
+                    consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::PortConflictObserved), &mut pending_probe, &mut restart_at);
+                }
+                if signals & SIGNAL_CONFIG_RELOAD != 0 {
+                    if let Some(work) = active.take() {
+                        work.cancel_and_join(&app, true).await;
+                    }
+                    let effects = machine.reduce(LifecycleEvent::ConfigReload { now_ms: unix_time_ms() });
+                    consume_effects(&app, &mut deduper, effects, &mut pending_probe, &mut restart_at);
+                }
+                if signals & SIGNAL_RECOVERY != 0 {
+                    let effects = machine.reduce(LifecycleEvent::RecoverySignal { now_ms: unix_time_ms() });
+                    consume_effects(&app, &mut deduper, effects, &mut pending_probe, &mut restart_at);
+                }
+                if signals & SIGNAL_OPEN != 0 {
+                    consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::OpenWindow), &mut pending_probe, &mut restart_at);
+                } else if signals & SIGNAL_HIDE != 0 {
+                    consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::WindowClose), &mut pending_probe, &mut restart_at);
+                }
+            }
+            message = work_receiver.recv() => {
+                let Some(message) = message else { break };
+                match message {
+                    WorkMessage::RestartPublished { id, pid } if active.as_ref().is_some_and(|work| work.id == id) => {
+                        consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::RecoveryChildPublished { pid }), &mut pending_probe, &mut restart_at);
+                    }
+                    WorkMessage::RestartFinished { id, pid, outcome } if active.as_ref().is_some_and(|work| work.id == id) => {
+                        if let Some(mut work) = active.take() {
+                            let _ = (&mut work.handle).await;
+                        }
+                        app.state::<DesktopCoordinator>().set_active_cancel(None);
+                        match outcome {
+                            RestartOutcome::Succeeded => {
+                                if let Some(pid) = pid {
+                                    pending_probe = false;
+                                    consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::RecoverySucceeded { pid }), &mut pending_probe, &mut restart_at);
+                                    publish_transition_notifications(&app, &mut transitions, &mut deduper);
+                                }
+                            }
+                            RestartOutcome::Failed(failure) => {
+                                consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::StartupFailed(failure)), &mut pending_probe, &mut restart_at);
+                            }
+                            RestartOutcome::Cancelled => {}
+                        }
+                    }
+                    WorkMessage::ProbeFinished { id, interval_seconds, succeeded } if active.as_ref().is_some_and(|work| work.id == id) => {
+                        if let Some(mut work) = active.take() {
+                            let _ = (&mut work.handle).await;
+                        }
+                        app.state::<DesktopCoordinator>().set_active_cancel(None);
+                        next_guardian = Instant::now() + Duration::from_secs(interval_seconds.max(1));
+                        if succeeded {
+                            publish_transition_notifications(&app, &mut transitions, &mut deduper);
+                            refresh_tray(&app);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = watcher.tick() => {
+                if let Some(pid) = machine.expected_pid {
+                    let alive = app.state::<AppState>().owned_core_is_running(pid);
+                    if !alive && !machine.recovery_terminal {
+                        if active.as_ref().is_some_and(|work| work.kind == WorkKind::Restart) {
+                            if let Some(work) = active.as_ref() {
+                                work.cancel.store(true, Ordering::Release);
+                            }
+                        } else {
+                            let effects = machine.reduce(LifecycleEvent::OwnedCoreUnexpectedExit);
+                            consume_effects(&app, &mut deduper, effects, &mut pending_probe, &mut restart_at);
+                        }
+                    }
                 }
             }
             () = tokio::time::sleep_until(next_guardian.into()) => {
-                let interval = commands::record_routing_cycle(&app.state::<AppState>()).await.unwrap_or(180);
-                next_guardian = Instant::now() + Duration::from_secs(interval.max(1));
-                publish_transition_notifications(&app, &mut transitions, &mut deduper);
-                refresh_tray(&app);
-                let owned_running = app.state::<AppState>().core_status().is_ok_and(|status| status.managed && status.state == "running");
-                if previously_owned_running && !owned_running {
-                    let _ = handle_event(&app, &mut machine, &mut deduper, &mut transitions, LifecycleEvent::OwnedCoreUnexpectedExit, &mut restart_at).await;
-                }
-                previously_owned_running = owned_running;
+                next_guardian = Instant::now() + Duration::from_mins(3);
+                pending_probe = true;
             }
             () = tokio::time::sleep_until(next_network_sample.into()) => {
                 let now = Instant::now();
-                let fingerprint = sample_network_fingerprint().await;
                 let resumed = now.duration_since(last_network_sample) >= RESUME_GAP;
-                let network_changed = fingerprint != last_network_fingerprint;
                 last_network_sample = now;
-                last_network_fingerprint = fingerprint;
                 next_network_sample = now + NETWORK_SAMPLE_INTERVAL;
-                if resumed || network_changed {
-                    let event = LifecycleEvent::RecoverySignal { now_ms: unix_time_ms() };
-                    let _ = handle_event(&app, &mut machine, &mut deduper, &mut transitions, event, &mut restart_at).await;
-                    next_guardian = Instant::now() + Duration::from_secs(1);
+                if network_handle.is_none() {
+                    let sender = network_sender.clone();
+                    network_handle = Some(tokio::spawn(async move {
+                        let sample = sample_network_fingerprint().await;
+                        let _ = sender.send(sample).await;
+                    }));
+                }
+                if resumed {
+                    mailbox.post(SIGNAL_RECOVERY);
                 }
             }
-            () = tokio::time::sleep_until(restart_deadline.into()), if restart_at.is_some() => {
-                restart_at = None;
-                let _ = handle_event(&app, &mut machine, &mut deduper, &mut transitions, LifecycleEvent::RestartTimer, &mut restart_at).await;
+            sample = network_receiver.recv() => {
+                if let Some(mut handle) = network_handle.take() {
+                    let _ = (&mut handle).await;
+                }
+                if update_network_fingerprint(&mut last_network_fingerprint, sample.flatten()) {
+                    mailbox.post(SIGNAL_RECOVERY);
+                }
+            }
+            () = tokio::time::sleep_until(restart_deadline.into()), if restart_at.is_some() && active.is_none() => {
+                let Some((_, epoch)) = restart_at.take() else { continue };
+                if epoch == app.state::<DesktopCoordinator>().recovery_epoch() {
+                    let effects = machine.reduce(LifecycleEvent::RestartTimer);
+                    if effects.contains(&LifecycleEffect::StartOwnedCore) {
+                        let work = start_restart_work(&app, next_work_id, epoch, work_sender.clone());
+                        next_work_id = next_work_id.saturating_add(1);
+                        app.state::<DesktopCoordinator>().set_active_cancel(Some(Arc::clone(&work.cancel)));
+                        active = Some(work);
+                    }
+                }
             }
         }
     }
 }
 
-async fn handle_event(
+fn update_network_fingerprint(previous: &mut Option<u64>, sample: Option<u64>) -> bool {
+    let Some(sample) = sample else {
+        return false;
+    };
+    let changed = previous.is_some_and(|value| value != sample);
+    *previous = Some(sample);
+    changed
+}
+
+fn consume_effects(
     app: &AppHandle,
-    machine: &mut LifecycleMachine,
     deduper: &mut NotificationDeduper,
-    transitions: &mut TransitionNotifications,
-    event: LifecycleEvent,
-    restart_at: &mut Option<Instant>,
-) -> bool {
-    let effects = machine.reduce(event);
+    effects: Vec<LifecycleEffect>,
+    pending_probe: &mut bool,
+    restart_at: &mut Option<(Instant, u64)>,
+) {
     for effect in effects {
         match effect {
             LifecycleEffect::HideWindow => {
@@ -639,74 +1176,18 @@ async fn handle_event(
                     let _ = window.set_focus();
                 }
             }
-            LifecycleEffect::StopOwnedCore => {
-                let status = app.state::<AppState>().core_status();
-                if status.is_ok_and(|status| status.managed) {
-                    let _ = app.state::<AppState>().stop_development_core();
-                }
-                *restart_at = None;
-            }
-            LifecycleEffect::StartOwnedCore => {
-                let started = app
-                    .state::<AppState>()
-                    .start_development_core()
-                    .await
-                    .is_ok();
-                let healthy = started
-                    && commands::record_routing_cycle(&app.state::<AppState>())
-                        .await
-                        .is_ok();
-                if healthy {
-                    let recovered = machine.reduce(LifecycleEvent::CoreStarted);
-                    for effect in recovered {
-                        if let LifecycleEffect::Notify(kind) = effect {
-                            send_lifecycle_notification(app, deduper, kind);
-                        }
-                    }
-                } else {
-                    if started {
-                        let _ = app.state::<AppState>().stop_development_core();
-                    }
-                    let occupied = app
-                        .state::<AppState>()
-                        .core_status()
-                        .is_ok_and(|status| status.state == "external");
-                    let kind = if occupied {
-                        StartupFailure::PortConflict
-                    } else {
-                        StartupFailure::Other
-                    };
-                    for effect in machine.reduce(LifecycleEvent::StartupFailed(kind)) {
-                        match effect {
-                            LifecycleEffect::Notify(kind) => {
-                                send_lifecycle_notification(app, deduper, kind);
-                            }
-                            LifecycleEffect::ScheduleRestart(delay) => {
-                                *restart_at = Some(Instant::now() + delay);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                refresh_tray(app);
-            }
-            LifecycleEffect::ProbeAllEnabled => {
-                let _ = commands::record_routing_cycle(&app.state::<AppState>()).await;
-                publish_transition_notifications(app, transitions, deduper);
-            }
+            LifecycleEffect::ProbeAllEnabled => *pending_probe = true,
             LifecycleEffect::RefreshTray => refresh_tray(app),
             LifecycleEffect::Notify(kind) => send_lifecycle_notification(app, deduper, kind),
             LifecycleEffect::ScheduleRestart(delay) => {
-                *restart_at = Some(Instant::now() + delay);
+                let epoch = app.state::<DesktopCoordinator>().recovery_epoch();
+                *restart_at = Some((Instant::now() + delay, epoch));
             }
-            LifecycleEffect::ExitApplication => {
-                app.state::<DesktopCoordinator>().permit_exit();
-                app.exit(0);
-                return true;
-            }
+            LifecycleEffect::StopOwnedCore
+            | LifecycleEffect::StartOwnedCore
+            | LifecycleEffect::ExitApplication => {}
         }
     }
-    false
 }
 
 fn refresh_tray(app: &AppHandle) {
@@ -766,6 +1247,13 @@ fn send_lifecycle_notification(
             title: "自管核心连续启动失败".into(),
             body: format!("自管核心已连续失败 {count} 次，将继续按有界退避重试。"),
         },
+        NotificationKind::RecoveryTerminal => SafeNotification {
+            key: "owned-core-recovery-terminal".into(),
+            title: "自管核心自动恢复已暂停".into(),
+            body: format!(
+                "自管核心连续 {MAX_RECOVERY_ATTEMPTS} 次恢复失败，当前保持 Fail Closed；请手动启动或等待配置、网络变化后重试。"
+            ),
+        },
     };
     if deduper.allow(&notification, unix_time_ms()) {
         TauriNotificationSink { app }.send(&notification);
@@ -815,54 +1303,89 @@ fn unix_time_ms() -> u64 {
     u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
 }
 
-fn network_fingerprint() -> u64 {
-    let mut hasher = DefaultHasher::new();
+#[derive(Debug)]
+struct CommandSample {
+    fingerprint: Option<u64>,
+    pid: u32,
+    reader_joined: bool,
+}
+
+#[cfg(target_os = "windows")]
+fn sample_command_output(mut command: Command, timeout: Duration) -> CommandSample {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return CommandSample {
+            fingerprint: None,
+            pid: 0,
+            reader_joined: true,
+        };
+    };
+    let pid = child.id();
+    let reader = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut hasher = DefaultHasher::new();
+            let mut buffer = [0_u8; 8_192];
+            loop {
+                let length = stdout.read(&mut buffer)?;
+                if length == 0 {
+                    break;
+                }
+                hasher.write(&buffer[..length]);
+            }
+            std::io::Result::Ok(hasher.finish())
+        })
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let reader_result = reader.map(std::thread::JoinHandle::join);
+    let reader_joined = reader_result.as_ref().is_none_or(Result::is_ok);
+    let fingerprint = match (status, reader_result) {
+        (Some(status), Some(Ok(Ok(fingerprint)))) if status.success() => Some(fingerprint),
+        _ => None,
+    };
+    CommandSample {
+        fingerprint,
+        pid,
+        reader_joined,
+    }
+}
+
+fn network_fingerprint() -> Option<u64> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        if let Ok(mut child) = Command::new("ipconfig")
-            .arg("/all")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-        {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => {
-                        let mut bytes = Vec::new();
-                        if let Some(mut stdout) = child.stdout.take() {
-                            let _ = stdout.read_to_end(&mut bytes);
-                        }
-                        bytes.hash(&mut hasher);
-                        break;
-                    }
-                    Ok(None) if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) | Err(_) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                }
-            }
-        }
+        let mut command = Command::new("ipconfig");
+        command.arg("/all").creation_flags(CREATE_NO_WINDOW);
+        let sample = sample_command_output(command, Duration::from_secs(2));
+        debug_assert!(sample.reader_joined || sample.pid == 0);
+        sample.fingerprint
     }
     #[cfg(not(target_os = "windows"))]
     {
-        "network-monitor-unavailable".hash(&mut hasher);
+        None
     }
-    hasher.finish()
 }
 
-async fn sample_network_fingerprint() -> u64 {
+async fn sample_network_fingerprint() -> Option<u64> {
     tokio::task::spawn_blocking(network_fingerprint)
         .await
-        .unwrap_or_default()
+        .unwrap_or(None)
 }
 
 #[cfg(test)]
@@ -926,10 +1449,206 @@ mod tests {
         );
         let failed = machine.reduce(LifecycleEvent::StartupFailed(StartupFailure::Other));
         assert!(failed.contains(&LifecycleEffect::ScheduleRestart(Duration::from_secs(2))));
+        assert_eq!(
+            machine.reduce(LifecycleEvent::RestartTimer),
+            vec![LifecycleEffect::StartOwnedCore]
+        );
         let failed_again = machine.reduce(LifecycleEvent::StartupFailed(StartupFailure::Other));
         assert!(failed_again.contains(&LifecycleEffect::Notify(
             NotificationKind::ConsecutiveStartupFailures(2)
         )));
+    }
+
+    #[test]
+    fn recovery_has_five_attempt_terminal_limit_and_deliberate_reset_only() {
+        let mut machine = LifecycleMachine {
+            core_expected: true,
+            ..LifecycleMachine::default()
+        };
+        machine.reduce(LifecycleEvent::OwnedCoreUnexpectedExit);
+        for attempt in 1..=MAX_RECOVERY_ATTEMPTS {
+            assert_eq!(
+                machine.reduce(LifecycleEvent::RestartTimer),
+                vec![LifecycleEffect::StartOwnedCore]
+            );
+            machine.reduce(LifecycleEvent::RecoveryChildPublished { pid: 100 + attempt });
+            let effects = machine.reduce(LifecycleEvent::StartupFailed(StartupFailure::Other));
+            assert_eq!(machine.expected_pid, None);
+            if attempt < MAX_RECOVERY_ATTEMPTS {
+                assert!(
+                    effects
+                        .iter()
+                        .any(|effect| matches!(effect, LifecycleEffect::ScheduleRestart(_)))
+                );
+            } else {
+                assert!(
+                    effects.contains(&LifecycleEffect::Notify(NotificationKind::RecoveryTerminal))
+                );
+                assert!(
+                    effects
+                        .iter()
+                        .all(|effect| !matches!(effect, LifecycleEffect::ScheduleRestart(_)))
+                );
+            }
+        }
+        assert!(machine.recovery_terminal);
+        assert!(machine.reduce(LifecycleEvent::RestartTimer).is_empty());
+        let deliberate = machine.reduce(LifecycleEvent::RecoverySignal { now_ms: 50_000 });
+        assert!(!machine.recovery_terminal);
+        assert!(deliberate.contains(&LifecycleEffect::ScheduleRestart(Duration::ZERO)));
+    }
+
+    #[test]
+    fn first_automatic_replacement_emits_recovered_after_publish_and_guardian_commit() {
+        let mut machine = LifecycleMachine {
+            core_expected: true,
+            expected_pid: Some(10),
+            ..LifecycleMachine::default()
+        };
+        machine.reduce(LifecycleEvent::OwnedCoreUnexpectedExit);
+        machine.reduce(LifecycleEvent::RestartTimer);
+        let published = machine.reduce(LifecycleEvent::RecoveryChildPublished { pid: 11 });
+        assert_eq!(machine.expected_pid, Some(11));
+        assert!(!published.contains(&LifecycleEffect::Notify(NotificationKind::CoreRecovered)));
+        let committed = machine.reduce(LifecycleEvent::RecoverySucceeded { pid: 11 });
+        assert!(committed.contains(&LifecycleEffect::Notify(NotificationKind::CoreRecovered)));
+        assert!(!machine.recovering_from_owned_exit);
+    }
+
+    #[test]
+    fn config_reload_refreshes_structure_before_scheduling_probe() {
+        let mut machine = LifecycleMachine::default();
+        let effects = machine.reduce(LifecycleEvent::ConfigReload { now_ms: 100_000 });
+        let refresh = effects
+            .iter()
+            .position(|effect| *effect == LifecycleEffect::RefreshTray)
+            .expect("refresh effect");
+        let probe = effects
+            .iter()
+            .position(|effect| *effect == LifecycleEffect::ProbeAllEnabled)
+            .expect("probe effect");
+        assert!(refresh < probe);
+        let repeated = machine.reduce(LifecycleEvent::ConfigReload { now_ms: 100_001 });
+        assert_eq!(repeated.first(), Some(&LifecycleEffect::RefreshTray));
+        assert!(repeated.contains(&LifecycleEffect::ProbeAllEnabled));
+    }
+
+    #[test]
+    fn fixed_mailbox_coalesces_flood_without_losing_exit_or_stop() {
+        let mailbox = ControlMailbox::default();
+        for _ in 0..100_000 {
+            mailbox.post(SIGNAL_CONFIG_RELOAD);
+            mailbox.post(SIGNAL_RECOVERY);
+        }
+        mailbox.post(SIGNAL_STOP);
+        mailbox.post(SIGNAL_EXIT);
+        let (signals, _) = mailbox.take();
+        assert_ne!(signals & SIGNAL_EXIT, 0);
+        assert_ne!(signals & SIGNAL_STOP, 0);
+        assert_ne!(signals & SIGNAL_CONFIG_RELOAD, 0);
+        assert_ne!(signals & SIGNAL_RECOVERY, 0);
+        assert_eq!(mailbox.take().0, 0);
+    }
+
+    #[test]
+    fn failed_network_sample_preserves_previous_without_false_change() {
+        let mut previous = Some(41);
+        assert!(!update_network_fingerprint(&mut previous, None));
+        assert_eq!(previous, Some(41));
+        assert!(!update_network_fingerprint(&mut previous, Some(41)));
+        assert!(update_network_fingerprint(&mut previous, Some(42)));
+        assert_eq!(previous, Some(42));
+    }
+
+    #[tokio::test]
+    async fn slow_background_task_is_cancelled_and_joined_within_control_bound() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task_cancel = Arc::clone(&cancel);
+        let joined = Arc::new(AtomicBool::new(false));
+        let task_joined = Arc::clone(&joined);
+        let mut handle = tokio::spawn(async move {
+            while !task_cancel.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            task_joined.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        cancel.store(true, Ordering::Release);
+        cancel_and_join_handle(&mut handle, Duration::from_millis(250)).await;
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(joined.load(Ordering::Acquire));
+        assert!(handle.is_finished());
+    }
+
+    #[cfg(target_os = "windows")]
+    fn powershell_command(script: &str) -> Command {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .creation_flags(CREATE_NO_WINDOW);
+        command
+    }
+
+    #[cfg(target_os = "windows")]
+    fn process_exists(pid: u32) -> bool {
+        powershell_command(&format!(
+            "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+        ))
+        .status()
+        .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn network_sampler_drains_large_output_and_hashes_changes_without_leaking_child() {
+        let large = sample_command_output(
+            powershell_command("[Console]::Out.Write(('A' * 262144))"),
+            Duration::from_secs(5),
+        );
+        assert!(large.fingerprint.is_some());
+        assert!(large.reader_joined);
+        assert!(!process_exists(large.pid));
+
+        let changed = sample_command_output(
+            powershell_command("[Console]::Out.Write(('B' * 262144))"),
+            Duration::from_secs(5),
+        );
+        assert!(changed.fingerprint.is_some());
+        assert_ne!(large.fingerprint, changed.fingerprint);
+        assert!(changed.reader_joined);
+        assert!(!process_exists(changed.pid));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn network_sampler_timeout_kills_only_its_child_and_joins_reader() {
+        let sample = sample_command_output(
+            powershell_command("Start-Sleep -Seconds 5; [Console]::Out.Write('late')"),
+            Duration::from_millis(150),
+        );
+        assert!(sample.fingerprint.is_none());
+        assert!(sample.reader_joined);
+        assert!(!process_exists(sample.pid));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn network_sampler_rejects_failed_or_incomplete_samples() {
+        let failed = sample_command_output(
+            powershell_command("[Console]::Out.Write('partial'); exit 7"),
+            Duration::from_secs(2),
+        );
+        assert!(failed.fingerprint.is_none());
+        assert!(failed.reader_joined);
+        assert!(!process_exists(failed.pid));
     }
 
     #[test]
