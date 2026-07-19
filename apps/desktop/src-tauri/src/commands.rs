@@ -290,11 +290,26 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
 }
 
 pub(crate) async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
+    record_routing_cycle_locked_with_mode(state, true).await
+}
+
+async fn record_owned_controller_cycle_locked(state: &AppState) -> Result<u64, String> {
+    record_routing_cycle_locked_with_mode(state, false).await
+}
+
+async fn record_routing_cycle_locked_with_mode(
+    state: &AppState,
+    allow_direct_fallback: bool,
+) -> Result<u64, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
     let private = state.private_config()?;
     let Some(controller) = state.controller_client()? else {
-        return record_direct_guardian_cycle(state).await;
+        return if allow_direct_fallback {
+            record_direct_guardian_cycle(state).await
+        } else {
+            Err("应用自管核心未提供可验证 Controller；不会把直连探测降级当作启动成功".into())
+        };
     };
     let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
@@ -562,11 +577,11 @@ pub async fn start_development_core(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreStatus, String> {
-    let start_epoch = app
-        .state::<lifecycle::DesktopCoordinator>()
-        .prepare_manual_start();
+    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let start_epoch = coordinator.prepare_manual_start(&cancel)?;
     let _transaction = state.lock_routing_transaction().await;
-    let mut status = match state.start_development_core().await {
+    let mut status = match state.start_development_core_cancellable(&cancel).await {
         Ok(status) => status,
         Err(error) => {
             if state
@@ -575,18 +590,35 @@ pub async fn start_development_core(
             {
                 lifecycle::dispatch(&app, LifecycleEvent::PortConflictObserved);
             }
+            coordinator.complete_manual_start_failure(start_epoch);
             return Err(error);
         }
     };
-    if let Err(error) = record_routing_cycle_locked(&state).await {
-        let _ = state.stop_development_core();
-        return Err(format!(
-            "开发核心首次健康决策失败，已停止并保持 Fail Closed：{error}"
-        ));
+    let Some(pid) = status.pid else {
+        coordinator.complete_manual_start_failure(start_epoch);
+        return Err("应用自管核心未发布可验证 PID；已保持 Fail Closed".into());
+    };
+    if !coordinator.manual_start_allowed(start_epoch)
+        || !state.owned_core_controller_is_running(pid)
+    {
+        let _ = state.stop_owned_core_if_pid(pid);
+        coordinator.complete_manual_start_failure(start_epoch);
+        return Err("应用自管核心在首次 Guardian 前失去 PID 或 Controller ownership；已停止并保持 Fail Closed".into());
     }
-    if let Some(pid) = status.pid {
-        app.state::<lifecycle::DesktopCoordinator>()
-            .complete_manual_start(pid, start_epoch);
+    let guardian_result = record_owned_controller_cycle_locked(&state).await;
+    if guardian_result.is_err()
+        || !coordinator.manual_start_allowed(start_epoch)
+        || !state.owned_core_controller_is_running(pid)
+    {
+        let _ = state.stop_owned_core_if_pid(pid);
+        coordinator.complete_manual_start_failure(start_epoch);
+        return Err("应用自管核心未通过首次 Guardian 的 PID 与 Controller ownership 复核；已停止并保持 Fail Closed".into());
+    }
+    if !coordinator.complete_manual_start(pid, start_epoch)
+        || !state.owned_core_controller_is_running(pid)
+    {
+        let _ = state.stop_owned_core_if_pid(pid);
+        return Err("停止请求已优先于迟到的启动结果；应用自管核心已清理".into());
     }
     status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();
     Ok(status)
@@ -598,12 +630,29 @@ pub async fn stop_development_core(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreStatus, String> {
-    let stop_epoch = app.state::<lifecycle::DesktopCoordinator>().prepare_stop();
-    let _transaction = state.lock_routing_transaction().await;
-    let status = state.stop_development_core()?;
-    app.state::<lifecycle::DesktopCoordinator>()
-        .complete_stop(stop_epoch);
-    Ok(status)
+    let resolution = app
+        .state::<lifecycle::DesktopCoordinator>()
+        .request_stop()
+        .await;
+    Ok(match resolution {
+        lifecycle::StopRequestResult::Stopped => CoreStatus {
+            state: "stopped".into(),
+            managed: false,
+            pid: None,
+            started_at: None,
+            message: "应用自管核心与待恢复任务已停止".into(),
+        },
+        lifecycle::StopRequestResult::Pending => {
+            let pid = state.owned_core_pid();
+            CoreStatus {
+                state: "stopping".into(),
+                managed: pid.is_some(),
+                pid,
+                started_at: None,
+                message: "停止请求处理中；不会报告为已停止，后台将继续有界清理".into(),
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -705,6 +754,10 @@ mod tests {
             .await
             .expect("clean refresh");
         assert_eq!(interval, 180);
+        let strict_error = record_owned_controller_cycle_locked(&state)
+            .await
+            .expect_err("manual startup must reject the direct Guardian fallback");
+        assert!(strict_error.contains("Controller"));
         let refreshed = load_dashboard(&state).expect("refreshed dashboard");
         assert!(refreshed.routing.outlets.is_empty());
         assert!(refreshed.summaries.is_empty());

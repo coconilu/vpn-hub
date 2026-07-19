@@ -1845,6 +1845,7 @@ impl AppState {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     pub async fn start_development_core(&self) -> Result<CoreStatus, String> {
         self.start_development_core_cancellable(&AtomicBool::new(false))
             .await
@@ -2100,6 +2101,7 @@ impl AppState {
         })
     }
 
+    #[cfg(test)]
     pub fn stop_development_core(&self) -> Result<CoreStatus, String> {
         let mut guard = self
             .managed_core
@@ -2134,6 +2136,30 @@ impl AppState {
 
     pub fn owned_core_is_running(&self, expected_pid: u32) -> bool {
         self.owned_core_pid() == Some(expected_pid)
+    }
+
+    pub fn owned_core_controller_is_running(&self, expected_pid: u32) -> bool {
+        let addresses = {
+            let Ok(mut guard) = self.managed_core.lock() else {
+                return false;
+            };
+            let Some(core) = guard.as_mut() else {
+                return false;
+            };
+            if core.child.id() != expected_pid || core.child.try_wait().ok().flatten().is_some() {
+                *guard = None;
+                drop(guard);
+                let _ = self.reset_routing_session();
+                return false;
+            }
+            let Some(entry) = loopback_socket_address(&core.entry_host, core.entry_port) else {
+                return false;
+            };
+            let controller = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), core.controller_port);
+            [entry, controller]
+        };
+        owns_loopback_listeners(expected_pid, &addresses)
+            && self.owned_core_is_running(expected_pid)
     }
 
     pub fn stop_owned_core_if_pid(&self, expected_pid: u32) -> Result<bool, String> {
@@ -2809,6 +2835,7 @@ fn remove_proxy_environment(command: &mut Command) {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+    use crate::lifecycle::{DesktopCoordinator, LifecycleEvent};
     use std::{
         collections::BTreeMap,
         io,
@@ -2844,6 +2871,50 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    fn install_fake_owned_controller(state: &AppState, lifetime_ms: u64) -> u32 {
+        let entry = ProbePortLease::reserve().expect("fake entry lease");
+        let entry_port = entry.port();
+        let controller =
+            ProbePortLease::reserve_excluding(&[entry_port]).expect("fake controller lease");
+        let controller_port = controller.port();
+        drop(entry);
+        drop(controller);
+
+        let script = format!(
+            "$entry=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,{entry_port}); \
+             $controller=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,{controller_port}); \
+             $entry.Start(); $controller.Start(); Start-Sleep -Milliseconds {lifetime_ms}"
+        );
+        let child = hidden_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .spawn()
+            .expect("owned fake controller child");
+        let pid = child.id();
+        *state.managed_core.lock().expect("managed core") = Some(ManagedCore {
+            child,
+            started_at: "test".into(),
+            entry_host: "127.0.0.1".into(),
+            entry_port,
+            controller_port,
+            controller_secret: "test-only".into(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.owned_core_controller_is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            state.owned_core_controller_is_running(pid),
+            "fake child must own both entry and Controller listeners"
+        );
+        pid
     }
 
     impl DurableFileOps for FailingDurableOps {
@@ -4179,7 +4250,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     }
 
     #[test]
-    fn owned_core_observer_detects_exit_before_guardian_tick() {
+    fn controller_ownership_rejects_child_that_exits_before_guardian() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
         let state = AppState::new_for_test(workspace_root, directory.path());
@@ -4207,7 +4278,48 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             std::thread::sleep(Duration::from_millis(25));
         }
         assert!(!state.owned_core_is_running(pid));
+        assert!(!state.owned_core_controller_is_running(pid));
         assert!(state.managed_core.lock().expect("managed core").is_none());
+    }
+
+    #[test]
+    fn controller_ownership_detects_child_exit_during_guardian_window() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let pid = install_fake_owned_controller(&state, 2_000);
+
+        assert!(state.owned_core_controller_is_running(pid));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.owned_core_controller_is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!state.owned_core_controller_is_running(pid));
+        assert!(state.managed_core.lock().expect("managed core").is_none());
+    }
+
+    #[test]
+    fn stop_epoch_cancels_manual_start_and_late_pid_is_cleaned_exactly() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let coordinator = DesktopCoordinator::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let epoch = coordinator
+            .prepare_manual_start(&cancel)
+            .expect("manual start epoch");
+        let pid = install_fake_owned_controller(&state, 30_000);
+
+        coordinator.dispatch(LifecycleEvent::StopCore);
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(!coordinator.manual_start_allowed(epoch));
+        assert!(
+            state
+                .stop_owned_core_if_pid(pid)
+                .expect("exact late cleanup")
+        );
+        assert!(!coordinator.complete_manual_start(pid, epoch));
+        assert!(state.owned_core_pid().is_none());
     }
 
     #[tokio::test]

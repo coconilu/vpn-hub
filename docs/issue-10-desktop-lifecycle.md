@@ -8,8 +8,8 @@
 | --- | --- | --- |
 | 关闭窗口 | `HideWindow` | 不停止，应用留在托盘 |
 | 托盘“打开” / 左键 | `ShowAndFocusWindow` | 不启动或重启 |
-| 托盘“停止应用自管核心” | `StopOwnedCore` | 只停止 `AppState` 当前持有的 child |
-| 明确退出 / OS shutdown | cancel + bounded join → stop → permit exit | 高优先级取消后台工作，最多等待 3 秒后中止任务，只回收 owned child，再退出 |
+| 托盘“停止核心 / 取消恢复” | durable `pending_stop` → bounded retry → `StopOwnedCore` | 取消手动启动、自动恢复和退避；只停止 `AppState` 当前持有或迟到发布的 owned child |
+| 明确退出 / OS shutdown | cancel + bounded join → durable stop → permit exit | 每次等待与清理尝试都有 3 秒硬边界；若事务忙则保持事件循环并重试，确认 owned child 已清理后才允许退出 |
 | owned child 意外退出 | 通知 → 有界退避 → restart → full Guardian | 独立 PID watcher 以 250ms 周期核对同一 owned PID |
 | 配置提交 | `RefreshTray` → restart（按需）→ full Guardian | 提交后立即刷新动态投影，探测异步执行 |
 | 手动路由模式 / 出口变更成功 | `RefreshTray` → collect transitions | Guardian 决策成功后立即刷新并发送一次跃迁通知，不追加 probe |
@@ -17,7 +17,9 @@
 
 ## 并发与恢复事务
 
-恢复启动、手动启动、停止和配置应用共享同一把 routing transaction 锁。自动恢复从启动前检查、child 发布、首次 Guardian 决策到最终提交均处于这条事务边界内。手动启动和停止完成事件携带各自的 recovery epoch；同批 Stop 优先，跨批 stale completion 会被丢弃，CoreStarted 还必须验证 `AppState` 正持有同一 PID。配置应用只有在提交成功后才提升 epoch，预览过期、验证失败或提交失败不会取消既有退避恢复。
+恢复启动、手动启动、停止和配置应用共享同一把 routing transaction 锁。自动恢复从启动前检查、child 发布、首次 Guardian 决策到最终提交均处于这条事务边界内。Stop 使用持久内存意图和 recovery epoch fence：命令最多等待 3 秒，未确认时返回 `stopping`，但 coordinator 会保持事件接收与有界重试，绝不提前投影 `stopped`。只有 `AppState` 确认没有 owned 或待发布 child 后，所有并发 Stop waiter 才一起完成；重复 Stop 和已经停止时的 Stop 都安全。配置应用只有在提交成功后才提升 epoch，预览过期、验证失败或提交失败不会取消既有退避恢复。
+
+手动启动在首次 Guardian 前后都核对同一 PID、入口 listener 和 Controller listener 的进程归属。Controller 不可验证时，直连 Guardian fallback 只适用于普通无核心巡检，不能让手动启动成功。Stop 会设置手动启动的取消标记；若 child 在 Stop 后迟到发布，只精确清理该 PID，并丢弃 stale completion。
 
 启动中的 child 由 `PendingChild` 守卫，在发布前出错、取消或任务被 abort 时都会 kill 并 wait，避免迟到子进程。`mihomo -t` 也使用可取消的 owned child 与异步状态轮询；控制任务首次等待超时后 abort，再执行一次有界 join，不做无上限等待。
 
@@ -38,7 +40,7 @@
 - 当前配置的 loopback `entry_host:entry_port`；
 - 当前稳定 `outlet_id`，无可用出口时明确显示 `fail-closed`；
 - 配置顺序下的所有逻辑出口及 enabled/disabled、health 状态；
-- 只在确有应用 owned child 时启用“停止应用自管核心”。
+- 在已有 owned child、手动启动中、自动恢复、退避等待或终止恢复态时启用“停止核心 / 取消恢复”；即使当前尚无 child，也允许用户幂等取消恢复。
 
 新增、删除、停用、重排或修改入口后不复用旧投影。托盘不展示订阅 URL、节点、token、secret reference、探测目标或本机出口 endpoint。
 

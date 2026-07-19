@@ -22,7 +22,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tauri_plugin_notification::NotificationExt;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use vpn_hub_core::{
     FAIL_CLOSED_OUTLET, GuardianConfig, GuardianStore, HealthStatus, RouteSwitchEvent, StateEvent,
 };
@@ -44,6 +44,7 @@ pub enum LifecycleEvent {
     OpenWindow,
     StopCore,
     ManualStartRequested,
+    ManualStartFailed,
     CoreStarted { pid: u32 },
     CoreStopped,
     OwnedCoreUnexpectedExit,
@@ -113,7 +114,7 @@ impl LifecycleMachine {
                 self.core_expected = false;
                 self.expected_pid = None;
                 self.recovering_from_owned_exit = false;
-                self.recovery_terminal = false;
+                self.recovery_terminal = true;
                 self.restart_pending = false;
                 vec![LifecycleEffect::StopOwnedCore, LifecycleEffect::RefreshTray]
             }
@@ -122,6 +123,14 @@ impl LifecycleMachine {
                 self.consecutive_startup_failures = 0;
                 self.restart_pending = false;
                 Vec::new()
+            }
+            LifecycleEvent::ManualStartFailed => {
+                self.core_expected = false;
+                self.expected_pid = None;
+                self.recovering_from_owned_exit = false;
+                self.recovery_terminal = true;
+                self.restart_pending = false;
+                vec![LifecycleEffect::RefreshTray]
             }
             LifecycleEvent::CoreStarted { pid } => {
                 self.core_expected = true;
@@ -217,9 +226,10 @@ impl LifecycleMachine {
             LifecycleEvent::RouteChanged => vec![LifecycleEffect::RefreshTray],
             LifecycleEvent::ConfigReload { now_ms } => {
                 self.last_recovery_signal_ms = Some(now_ms);
-                let deliberate_recovery = self.core_expected
-                    && (self.recovery_terminal || self.recovering_from_owned_exit);
+                let deliberate_recovery = self.recovery_terminal
+                    || (self.core_expected && self.recovering_from_owned_exit);
                 if deliberate_recovery {
+                    self.core_expected = true;
                     self.expected_pid = None;
                     self.recovery_terminal = false;
                     self.recovering_from_owned_exit = true;
@@ -282,6 +292,7 @@ pub struct TrayProjection {
     pub entry_port: u16,
     pub current_outlet_id: String,
     pub core_managed: bool,
+    pub stop_available: bool,
     pub outlets: Vec<TrayOutletProjection>,
 }
 
@@ -317,6 +328,7 @@ impl TrayProjection {
             entry_port: private.entry.port,
             current_outlet_id,
             core_managed,
+            stop_available: core_managed,
             outlets: private
                 .outlets
                 .into_iter()
@@ -504,6 +516,13 @@ const SIGNAL_CORE_STOPPED: u32 = 1 << 7;
 const SIGNAL_PORT_CONFLICT: u32 = 1 << 8;
 const SIGNAL_MANUAL_START: u32 = 1 << 9;
 const SIGNAL_ROUTE_CHANGED: u32 = 1 << 10;
+const SIGNAL_MANUAL_FAILED: u32 = 1 << 11;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRequestResult {
+    Stopped,
+    Pending,
+}
 
 #[derive(Default)]
 struct ControlMailbox {
@@ -511,6 +530,7 @@ struct ControlMailbox {
     core_pid: AtomicU32,
     core_epoch: AtomicU64,
     core_stop_epoch: AtomicU64,
+    manual_epoch: AtomicU64,
     notify: Notify,
 }
 
@@ -531,12 +551,18 @@ impl ControlMailbox {
         self.post(SIGNAL_CORE_STOPPED);
     }
 
-    fn take(&self) -> (u32, u32, u64, u64) {
+    fn post_manual_failed(&self, epoch: u64) {
+        self.manual_epoch.store(epoch, Ordering::Release);
+        self.post(SIGNAL_MANUAL_FAILED);
+    }
+
+    fn take(&self) -> (u32, u32, u64, u64, u64) {
         let signals = self.signals.swap(0, Ordering::AcqRel);
         let pid = self.core_pid.load(Ordering::Acquire);
         let epoch = self.core_epoch.load(Ordering::Acquire);
         let stop_epoch = self.core_stop_epoch.load(Ordering::Acquire);
-        (signals, pid, epoch, stop_epoch)
+        let manual_epoch = self.manual_epoch.load(Ordering::Acquire);
+        (signals, pid, epoch, stop_epoch, manual_epoch)
     }
 }
 
@@ -546,6 +572,11 @@ pub struct DesktopCoordinator {
     exit_permitted: AtomicBool,
     recovery_epoch: AtomicU64,
     active_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    manual_cancel: Mutex<Option<(u64, Arc<AtomicBool>)>>,
+    pending_stop: AtomicBool,
+    stop_available: AtomicBool,
+    exit_requested: AtomicBool,
+    stop_waiters: Mutex<Vec<oneshot::Sender<StopRequestResult>>>,
 }
 
 impl DesktopCoordinator {
@@ -557,32 +588,44 @@ impl DesktopCoordinator {
             exit_permitted: AtomicBool::new(false),
             recovery_epoch: AtomicU64::new(0),
             active_cancel: Mutex::new(None),
+            manual_cancel: Mutex::new(None),
+            pending_stop: AtomicBool::new(false),
+            stop_available: AtomicBool::new(false),
+            exit_requested: AtomicBool::new(false),
+            stop_waiters: Mutex::new(Vec::new()),
         }
     }
 
     pub fn dispatch(&self, event: LifecycleEvent) {
         match event {
             LifecycleEvent::ExplicitExit | LifecycleEvent::OsShutdown => {
-                self.invalidate_recovery();
+                self.exit_requested.store(true, Ordering::Release);
+                self.begin_stop(None);
                 self.mailbox.post(SIGNAL_EXIT);
             }
             LifecycleEvent::StopCore => {
-                self.invalidate_recovery();
-                self.mailbox.post(SIGNAL_STOP);
+                self.begin_stop(None);
             }
             LifecycleEvent::ConfigReload { .. } => self.mailbox.post(SIGNAL_CONFIG_RELOAD),
             LifecycleEvent::RecoverySignal { .. } => self.mailbox.post(SIGNAL_RECOVERY),
             LifecycleEvent::OpenWindow => self.mailbox.post(SIGNAL_OPEN),
             LifecycleEvent::WindowClose => self.mailbox.post(SIGNAL_HIDE),
             LifecycleEvent::CoreStarted { pid } => {
+                self.stop_available.store(true, Ordering::Release);
                 self.mailbox.post_core_started(pid, self.recovery_epoch());
             }
-            LifecycleEvent::CoreStopped => self.mailbox.post_core_stopped(self.recovery_epoch()),
+            LifecycleEvent::CoreStopped => {
+                self.stop_available.store(false, Ordering::Release);
+                self.mailbox.post_core_stopped(self.recovery_epoch());
+            }
             LifecycleEvent::PortConflictObserved => self.mailbox.post(SIGNAL_PORT_CONFLICT),
             LifecycleEvent::RouteChanged => self.mailbox.post(SIGNAL_ROUTE_CHANGED),
             LifecycleEvent::ManualStartRequested => {
                 self.invalidate_recovery();
                 self.mailbox.post(SIGNAL_MANUAL_START);
+            }
+            LifecycleEvent::ManualStartFailed => {
+                self.mailbox.post_manual_failed(self.recovery_epoch());
             }
             LifecycleEvent::OwnedCoreUnexpectedExit
             | LifecycleEvent::RestartTimer
@@ -603,32 +646,104 @@ impl DesktopCoordinator {
         self.invalidate_recovery();
     }
 
-    pub fn prepare_manual_start(&self) -> u64 {
+    pub fn prepare_manual_start(&self, cancel: &Arc<AtomicBool>) -> Result<u64, String> {
+        if self.pending_stop.load(Ordering::Acquire) {
+            return Err("停止请求尚未完成；不会启动迟到的应用自管核心".into());
+        }
         let epoch = self.invalidate_recovery();
+        if let Ok(mut manual) = self.manual_cancel.lock() {
+            *manual = Some((epoch, Arc::clone(cancel)));
+        }
+        if self.pending_stop.load(Ordering::Acquire) || self.recovery_epoch() != epoch {
+            cancel.store(true, Ordering::Release);
+            self.finish_manual_start(epoch);
+            return Err("停止请求已优先于启动；不会发布应用自管核心".into());
+        }
+        self.stop_available.store(true, Ordering::Release);
         self.mailbox.post(SIGNAL_MANUAL_START);
-        epoch
+        Ok(epoch)
     }
 
-    pub fn complete_manual_start(&self, pid: u32, epoch: u64) {
-        if self.recovery_epoch() == epoch {
+    pub fn complete_manual_start(&self, pid: u32, epoch: u64) -> bool {
+        let accepted = self.manual_start_allowed(epoch);
+        if accepted {
             self.mailbox.post_core_started(pid, epoch);
         }
+        self.finish_manual_start(epoch);
+        accepted && self.manual_start_allowed(epoch)
     }
 
-    pub fn prepare_stop(&self) -> u64 {
-        self.invalidate_recovery()
-    }
-
-    pub fn complete_stop(&self, epoch: u64) {
-        if self.recovery_epoch() == epoch {
-            self.mailbox.post_core_stopped(epoch);
+    pub fn complete_manual_start_failure(&self, epoch: u64) {
+        if self.recovery_epoch() == epoch && !self.pending_stop.load(Ordering::Acquire) {
+            self.stop_available.store(true, Ordering::Release);
+            self.mailbox.post_manual_failed(epoch);
         }
+        self.finish_manual_start(epoch);
+    }
+
+    #[must_use]
+    pub fn manual_start_allowed(&self, epoch: u64) -> bool {
+        self.recovery_epoch() == epoch && !self.pending_stop.load(Ordering::Acquire)
+    }
+
+    fn finish_manual_start(&self, epoch: u64) {
+        if let Ok(mut manual) = self.manual_cancel.lock()
+            && manual
+                .as_ref()
+                .is_some_and(|(current, _)| *current == epoch)
+        {
+            *manual = None;
+        }
+    }
+
+    pub async fn request_stop(&self) -> StopRequestResult {
+        let (sender, receiver) = oneshot::channel();
+        self.begin_stop(Some(sender));
+        await_stop_result(receiver, CONTROL_JOIN_TIMEOUT).await
+    }
+
+    fn begin_stop(&self, waiter: Option<oneshot::Sender<StopRequestResult>>) {
+        if let Some(waiter) = waiter
+            && let Ok(mut waiters) = self.stop_waiters.lock()
+        {
+            waiters.push(waiter);
+        }
+        if !self.pending_stop.swap(true, Ordering::AcqRel) {
+            self.invalidate_recovery();
+        }
+        self.stop_available.store(true, Ordering::Release);
+        self.mailbox.post(SIGNAL_STOP);
+    }
+
+    fn resolve_stop(&self) {
+        self.pending_stop.store(false, Ordering::Release);
+        self.stop_available.store(false, Ordering::Release);
+        if let Ok(mut waiters) = self.stop_waiters.lock() {
+            for waiter in waiters.drain(..) {
+                let _ = waiter.send(StopRequestResult::Stopped);
+            }
+        }
+    }
+
+    #[must_use]
+    fn pending_stop(&self) -> bool {
+        self.pending_stop.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    fn stop_available(&self) -> bool {
+        self.stop_available.load(Ordering::Acquire)
     }
 
     fn invalidate_recovery(&self) -> u64 {
         let epoch = self.recovery_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         if let Ok(active) = self.active_cancel.lock()
             && let Some(cancel) = active.as_ref()
+        {
+            cancel.store(true, Ordering::Release);
+        }
+        if let Ok(manual) = self.manual_cancel.lock()
+            && let Some((_, cancel)) = manual.as_ref()
         {
             cancel.store(true, Ordering::Release);
         }
@@ -656,6 +771,17 @@ impl DesktopCoordinator {
     }
 }
 
+async fn await_stop_result(
+    receiver: oneshot::Receiver<StopRequestResult>,
+    timeout: Duration,
+) -> StopRequestResult {
+    tokio::time::timeout(timeout, receiver)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(StopRequestResult::Pending)
+}
+
 impl Default for DesktopCoordinator {
     fn default() -> Self {
         Self::new()
@@ -667,14 +793,16 @@ pub fn dispatch(app: &AppHandle, event: LifecycleEvent) {
 }
 
 pub fn install_tray(app: &App) -> tauri::Result<()> {
-    let projection =
+    let mut projection =
         TrayProjection::load(&app.state::<AppState>()).unwrap_or_else(|_| TrayProjection {
             entry_host: "127.0.0.1".into(),
             entry_port: 0,
             current_outlet_id: FAIL_CLOSED_OUTLET.into(),
             core_managed: false,
+            stop_available: false,
             outlets: Vec::new(),
         });
+    projection.stop_available |= app.state::<DesktopCoordinator>().stop_available();
     let menu = tray_menu(app.handle(), &projection)?;
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
@@ -726,8 +854,8 @@ fn tray_menu(
     let stop = MenuItem::with_id(
         app,
         "stop_core",
-        "停止应用自管核心",
-        projection.core_managed,
+        "停止核心 / 取消恢复",
+        projection.stop_available,
         None::<&str>,
     )?;
     let mut builder = MenuBuilder::new(app)
@@ -779,6 +907,9 @@ enum WorkMessage {
         pid: Option<u32>,
         outcome: RestartOutcome,
     },
+    StopFinished {
+        confirmed: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -820,13 +951,35 @@ async fn cancel_and_join_handle(handle: &mut tokio::task::JoinHandle<()>, timeou
     }
 }
 
-async fn stop_owned_core_bounded(app: &AppHandle) {
+async fn stop_owned_core_bounded(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
+    stop_owned_core_with_timeout(&state, CONTROL_JOIN_TIMEOUT).await
+}
+
+async fn stop_owned_core_with_timeout(state: &AppState, timeout: Duration) -> bool {
     let cleanup = async {
         let _transaction = state.lock_routing_transaction().await;
-        let _ = state.stop_development_core_if_owned();
+        state.stop_development_core_if_owned()?;
+        Ok::<bool, String>(state.owned_core_pid().is_none())
     };
-    let _ = tokio::time::timeout(CONTROL_JOIN_TIMEOUT, cleanup).await;
+    tokio::time::timeout(timeout, cleanup)
+        .await
+        .is_ok_and(|result| result.unwrap_or(false))
+}
+
+fn start_stop_work(
+    app: &AppHandle,
+    active: Option<ActiveWork>,
+    sender: mpsc::Sender<WorkMessage>,
+) -> tokio::task::JoinHandle<()> {
+    let task_app = app.clone();
+    tokio::spawn(async move {
+        if let Some(work) = active {
+            work.cancel_and_join(&task_app, true).await;
+        }
+        let confirmed = stop_owned_core_bounded(&task_app).await;
+        let _ = sender.send(WorkMessage::StopFinished { confirmed }).await;
+    })
 }
 
 fn start_probe_work(app: &AppHandle, id: u64, sender: mpsc::Sender<WorkMessage>) -> ActiveWork {
@@ -948,7 +1101,7 @@ async fn run_restart_task(
     published_pid.store(pid, Ordering::Release);
     let _ = sender.send(WorkMessage::RestartPublished { id, pid }).await;
     let still_current = app.state::<DesktopCoordinator>().recovery_epoch() == epoch;
-    let child_alive = state.owned_core_is_running(pid);
+    let child_alive = state.owned_core_controller_is_running(pid);
     if cancel.load(Ordering::Acquire) || !still_current || !child_alive {
         let _ = state.stop_owned_core_if_pid(pid);
         let outcome = if owned_child_exited.load(Ordering::Acquire) || !child_alive {
@@ -960,7 +1113,7 @@ async fn run_restart_task(
         return;
     }
     let guardian_succeeded = commands::record_routing_cycle_locked(&state).await.is_ok();
-    let child_alive = state.owned_core_is_running(pid);
+    let child_alive = state.owned_core_controller_is_running(pid);
     let epoch_current = app.state::<DesktopCoordinator>().recovery_epoch() == epoch;
     let deliberately_cancelled = cancel.load(Ordering::Acquire)
         && !owned_child_exited.load(Ordering::Acquire)
@@ -995,6 +1148,9 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
     let mut machine = LifecycleMachine::default();
     if let Some(pid) = app.state::<AppState>().owned_core_pid() {
         let _ = machine.reduce(LifecycleEvent::CoreStarted { pid });
+        app.state::<DesktopCoordinator>()
+            .stop_available
+            .store(true, Ordering::Release);
     }
     let mut deduper = NotificationDeduper::default();
     let mut transitions = TransitionNotifications::default();
@@ -1003,6 +1159,8 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
     let (network_sender, mut network_receiver) = mpsc::channel(2);
     let mut active: Option<ActiveWork> = None;
     let mut network_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut stop_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut stop_retry_at: Option<Instant> = None;
     let mut pending_probe = true;
     let mut next_work_id = 1_u64;
     let mut next_guardian = Instant::now();
@@ -1013,7 +1171,15 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
     let mut watcher = tokio::time::interval(OWNED_CORE_WATCH_INTERVAL);
 
     loop {
-        if active.is_none() {
+        let coordinator = app.state::<DesktopCoordinator>();
+        if coordinator.pending_stop()
+            && stop_handle.is_none()
+            && stop_retry_at.is_none_or(|deadline| deadline <= Instant::now())
+        {
+            stop_retry_at = None;
+            stop_handle = Some(start_stop_work(&app, active.take(), work_sender.clone()));
+        }
+        if active.is_none() && !coordinator.pending_stop() {
             let due_restart = restart_at.is_some_and(|(deadline, _)| deadline <= Instant::now());
             if due_restart {
                 let Some((_, epoch)) = restart_at.take() else {
@@ -1041,38 +1207,33 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
         }
         let restart_deadline =
             restart_at.map_or_else(|| Instant::now() + Duration::from_hours(24), |item| item.0);
+        let stop_retry_deadline =
+            stop_retry_at.unwrap_or_else(|| Instant::now() + Duration::from_hours(24));
         tokio::select! {
             () = mailbox.notify.notified() => {
-                let (signals, core_pid, core_epoch, core_stop_epoch) = mailbox.take();
-                if signals & SIGNAL_EXIT != 0 {
-                    if let Some(work) = active.take() {
-                        work.cancel_and_join(&app, true).await;
-                    }
-                    if let Some(mut handle) = network_handle.take()
-                        && tokio::time::timeout(CONTROL_JOIN_TIMEOUT, &mut handle).await.is_err()
-                    {
-                        handle.abort();
-                        let _ = tokio::time::timeout(CONTROL_JOIN_TIMEOUT, &mut handle).await;
-                    }
-                    stop_owned_core_bounded(&app).await;
-                    app.state::<DesktopCoordinator>().permit_exit();
-                    app.exit(0);
-                    break;
+                let (signals, core_pid, core_epoch, core_stop_epoch, manual_epoch) = mailbox.take();
+                if signals & SIGNAL_EXIT != 0
+                    && let Some(mut handle) = network_handle.take()
+                    && tokio::time::timeout(CONTROL_JOIN_TIMEOUT, &mut handle).await.is_err()
+                {
+                    handle.abort();
+                    let _ = tokio::time::timeout(CONTROL_JOIN_TIMEOUT, &mut handle).await;
                 }
                 if signals & SIGNAL_STOP != 0 {
-                    if let Some(work) = active.take() {
-                        work.cancel_and_join(&app, true).await;
-                    }
                     restart_at = None;
                     pending_probe = false;
-                    stop_owned_core_bounded(&app).await;
-                    consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::StopCore), &mut pending_probe, &mut restart_at);
                 }
                 if signals & SIGNAL_MANUAL_START != 0 {
                     restart_at = None;
                     consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::ManualStartRequested), &mut pending_probe, &mut restart_at);
                 }
                 let current_epoch = app.state::<DesktopCoordinator>().recovery_epoch();
+                if signals & SIGNAL_MANUAL_FAILED != 0
+                    && manual_epoch == current_epoch
+                    && !app.state::<DesktopCoordinator>().pending_stop()
+                {
+                    consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::ManualStartFailed), &mut pending_probe, &mut restart_at);
+                }
                 let accepted_core_stopped = signals & SIGNAL_CORE_STOPPED != 0
                     && core_stop_epoch == current_epoch;
                 if accepted_core_stopped {
@@ -1094,14 +1255,21 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                 if signals & SIGNAL_PORT_CONFLICT != 0 {
                     consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::PortConflictObserved), &mut pending_probe, &mut restart_at);
                 }
-                if signals & SIGNAL_CONFIG_RELOAD != 0 {
+                if signals & SIGNAL_CONFIG_RELOAD != 0
+                    && !app.state::<DesktopCoordinator>().pending_stop()
+                {
                     if let Some(work) = active.take() {
                         work.cancel_and_join(&app, true).await;
                     }
                     let effects = machine.reduce(LifecycleEvent::ConfigReload { now_ms: unix_time_ms() });
+                    if effects.iter().any(|effect| matches!(effect, LifecycleEffect::ScheduleRestart(_))) {
+                        app.state::<DesktopCoordinator>().stop_available.store(true, Ordering::Release);
+                    }
                     consume_effects(&app, &mut deduper, effects, &mut pending_probe, &mut restart_at);
                 }
-                if signals & SIGNAL_RECOVERY != 0 {
+                if signals & SIGNAL_RECOVERY != 0
+                    && !app.state::<DesktopCoordinator>().pending_stop()
+                {
                     let effects = machine.reduce(LifecycleEvent::RecoverySignal { now_ms: unix_time_ms() });
                     consume_effects(&app, &mut deduper, effects, &mut pending_probe, &mut restart_at);
                 }
@@ -1152,6 +1320,24 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                             refresh_tray(&app);
                         }
                     }
+                    WorkMessage::StopFinished { confirmed } => {
+                        if let Some(mut handle) = stop_handle.take() {
+                            let _ = tokio::time::timeout(CONTROL_JOIN_TIMEOUT, &mut handle).await;
+                        }
+                        if confirmed && app.state::<AppState>().owned_core_pid().is_none() {
+                            stop_retry_at = None;
+                            consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::StopCore), &mut pending_probe, &mut restart_at);
+                            app.state::<DesktopCoordinator>().resolve_stop();
+                            refresh_tray(&app);
+                            if app.state::<DesktopCoordinator>().exit_requested.swap(false, Ordering::AcqRel) {
+                                app.state::<DesktopCoordinator>().permit_exit();
+                                app.exit(0);
+                                break;
+                            }
+                        } else {
+                            stop_retry_at = Some(Instant::now() + OWNED_CORE_WATCH_INTERVAL);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1199,7 +1385,7 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                     mailbox.post(SIGNAL_RECOVERY);
                 }
             }
-            () = tokio::time::sleep_until(restart_deadline.into()), if restart_at.is_some() && active.is_none() => {
+            () = tokio::time::sleep_until(restart_deadline.into()), if restart_at.is_some() && active.is_none() && !app.state::<DesktopCoordinator>().pending_stop() => {
                 let Some((_, epoch)) = restart_at.take() else { continue };
                 if epoch == app.state::<DesktopCoordinator>().recovery_epoch() {
                     let effects = machine.reduce(LifecycleEvent::RestartTimer);
@@ -1210,6 +1396,9 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                         active = Some(work);
                     }
                 }
+            }
+            () = tokio::time::sleep_until(stop_retry_deadline.into()), if stop_retry_at.is_some() && stop_handle.is_none() => {
+                stop_retry_at = None;
             }
         }
     }
@@ -1275,9 +1464,10 @@ fn consume_effects(
 }
 
 fn refresh_tray(app: &AppHandle) {
-    let Ok(projection) = TrayProjection::load(&app.state::<AppState>()) else {
+    let Ok(mut projection) = TrayProjection::load(&app.state::<AppState>()) else {
         return;
     };
+    projection.stop_available |= app.state::<DesktopCoordinator>().stop_available();
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
@@ -1626,7 +1816,7 @@ mod tests {
         }
         mailbox.post(SIGNAL_STOP);
         mailbox.post(SIGNAL_EXIT);
-        let (signals, _, _, _) = mailbox.take();
+        let (signals, _, _, _, _) = mailbox.take();
         assert_ne!(signals & SIGNAL_EXIT, 0);
         assert_ne!(signals & SIGNAL_STOP, 0);
         assert_ne!(signals & SIGNAL_CONFIG_RELOAD, 0);
@@ -1637,28 +1827,146 @@ mod tests {
     #[test]
     fn stop_epoch_rejects_a_stale_manual_start_completion() {
         let coordinator = DesktopCoordinator::new();
-        let stale_epoch = coordinator.prepare_manual_start();
-        coordinator.prepare_stop();
-        coordinator.complete_manual_start(4_242, stale_epoch);
+        let stale_epoch = coordinator
+            .prepare_manual_start(&Arc::new(AtomicBool::new(false)))
+            .expect("manual epoch");
+        coordinator.begin_stop(None);
+        assert!(!coordinator.complete_manual_start(4_242, stale_epoch));
 
-        let (signals, pid, _, _) = coordinator.mailbox.take();
+        let (signals, pid, _, _, _) = coordinator.mailbox.take();
         assert_ne!(signals & SIGNAL_MANUAL_START, 0);
         assert_eq!(signals & SIGNAL_CORE_STARTED, 0);
         assert_eq!(pid, 0);
     }
 
     #[test]
-    fn newer_manual_start_epoch_rejects_a_stale_stop_completion() {
+    fn pending_stop_rejects_a_new_manual_start() {
         let coordinator = DesktopCoordinator::new();
-        let stale_stop_epoch = coordinator.prepare_stop();
-        let start_epoch = coordinator.prepare_manual_start();
-        coordinator.complete_stop(stale_stop_epoch);
-        coordinator.complete_manual_start(4_243, start_epoch);
+        coordinator.begin_stop(None);
+        let start = coordinator.prepare_manual_start(&Arc::new(AtomicBool::new(false)));
 
-        let (signals, pid, _, _) = coordinator.mailbox.take();
-        assert_eq!(signals & SIGNAL_CORE_STOPPED, 0);
-        assert_ne!(signals & SIGNAL_CORE_STARTED, 0);
-        assert_eq!(pid, 4_243);
+        assert!(start.is_err());
+        let (signals, pid, _, _, _) = coordinator.mailbox.take();
+        assert_ne!(signals & SIGNAL_STOP, 0);
+        assert_eq!(signals & (SIGNAL_MANUAL_START | SIGNAL_CORE_STARTED), 0);
+        assert_eq!(pid, 0);
+    }
+
+    #[test]
+    fn failed_manual_start_keeps_terminal_stop_action_available() {
+        let coordinator = DesktopCoordinator::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let epoch = coordinator
+            .prepare_manual_start(&cancel)
+            .expect("manual epoch");
+        coordinator.complete_manual_start_failure(epoch);
+
+        assert!(coordinator.stop_available());
+        let (signals, _, _, _, manual_epoch) = coordinator.mailbox.take();
+        assert_ne!(signals & SIGNAL_MANUAL_FAILED, 0);
+        assert_eq!(manual_epoch, epoch);
+    }
+
+    #[tokio::test]
+    async fn stop_timeout_returns_pending_without_resolving_the_durable_intent() {
+        let coordinator = DesktopCoordinator::new();
+        let (sender, receiver) = oneshot::channel();
+        coordinator.begin_stop(Some(sender));
+
+        assert_eq!(
+            await_stop_result(receiver, Duration::from_millis(20)).await,
+            StopRequestResult::Pending
+        );
+        assert!(coordinator.pending_stop());
+        assert!(coordinator.stop_available());
+    }
+
+    #[tokio::test]
+    async fn repeated_stop_waiters_resolve_together_and_already_stopped_is_safe() {
+        let coordinator = DesktopCoordinator::new();
+        let initial_epoch = coordinator.recovery_epoch();
+        let (first_sender, first_receiver) = oneshot::channel();
+        let (second_sender, second_receiver) = oneshot::channel();
+        coordinator.begin_stop(Some(first_sender));
+        let stop_epoch = coordinator.recovery_epoch();
+        coordinator.begin_stop(Some(second_sender));
+
+        assert!(stop_epoch > initial_epoch);
+        assert_eq!(coordinator.recovery_epoch(), stop_epoch);
+        coordinator.resolve_stop();
+        assert_eq!(first_receiver.await, Ok(StopRequestResult::Stopped));
+        assert_eq!(second_receiver.await, Ok(StopRequestResult::Stopped));
+        assert!(!coordinator.pending_stop());
+
+        let (already_sender, already_receiver) = oneshot::channel();
+        coordinator.begin_stop(Some(already_sender));
+        coordinator.resolve_stop();
+        assert_eq!(already_receiver.await, Ok(StopRequestResult::Stopped));
+    }
+
+    #[tokio::test]
+    async fn busy_routing_transaction_never_projects_stopped_and_eventually_confirms() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let transaction = state.lock_routing_transaction().await;
+        let coordinator = DesktopCoordinator::new();
+        coordinator.begin_stop(None);
+        let mut machine = LifecycleMachine {
+            core_expected: true,
+            recovering_from_owned_exit: true,
+            restart_pending: true,
+            ..LifecycleMachine::default()
+        };
+
+        assert!(!stop_owned_core_with_timeout(&state, Duration::from_millis(20)).await);
+        assert!(coordinator.pending_stop());
+        assert!(machine.core_expected);
+        assert!(machine.recovering_from_owned_exit);
+        assert!(machine.restart_pending);
+
+        drop(transaction);
+        assert!(stop_owned_core_with_timeout(&state, Duration::from_secs(1)).await);
+        let effects = machine.reduce(LifecycleEvent::StopCore);
+        coordinator.resolve_stop();
+        assert!(effects.contains(&LifecycleEffect::StopOwnedCore));
+        assert!(!machine.core_expected);
+        assert!(machine.recovery_terminal);
+        assert!(!machine.restart_pending);
+        assert!(!coordinator.pending_stop());
+    }
+
+    #[test]
+    fn stop_cancels_backoff_and_network_signals_until_explicit_reload() {
+        let mut machine = LifecycleMachine {
+            core_expected: true,
+            expected_pid: Some(42),
+            ..LifecycleMachine::default()
+        };
+        let unexpected = machine.reduce(LifecycleEvent::OwnedCoreUnexpectedExit);
+        assert!(
+            unexpected
+                .iter()
+                .any(|effect| { matches!(effect, LifecycleEffect::ScheduleRestart(_)) })
+        );
+        machine.reduce(LifecycleEvent::StopCore);
+
+        assert!(machine.reduce(LifecycleEvent::RestartTimer).is_empty());
+        let network_tick = machine.reduce(LifecycleEvent::RecoverySignal { now_ms: 10_000 });
+        assert!(network_tick.contains(&LifecycleEffect::ProbeAllEnabled));
+        assert!(network_tick.iter().all(|effect| {
+            !matches!(
+                effect,
+                LifecycleEffect::ScheduleRestart(_) | LifecycleEffect::StartOwnedCore
+            )
+        }));
+        assert!(!machine.core_expected);
+        assert!(machine.recovery_terminal);
+
+        let explicit = machine.reduce(LifecycleEvent::ConfigReload { now_ms: 20_000 });
+        assert!(explicit.contains(&LifecycleEffect::ScheduleRestart(Duration::ZERO)));
+        assert!(machine.core_expected);
+        assert!(!machine.recovery_terminal);
     }
 
     #[test]
@@ -1744,7 +2052,7 @@ mod tests {
         let coordinator = DesktopCoordinator::new();
         coordinator.dispatch(LifecycleEvent::RouteChanged);
         coordinator.dispatch(LifecycleEvent::RouteChanged);
-        let (signals, _, _, _) = coordinator.mailbox.take();
+        let (signals, _, _, _, _) = coordinator.mailbox.take();
         assert_ne!(signals & SIGNAL_ROUTE_CHANGED, 0);
         assert_eq!(signals & (SIGNAL_CONFIG_RELOAD | SIGNAL_RECOVERY), 0);
     }
@@ -1975,6 +2283,7 @@ mod tests {
             entry_port: 42_137,
             current_outlet_id: "subscription-c".into(),
             core_managed: true,
+            stop_available: true,
             outlets: vec![
                 TrayOutletProjection {
                     outlet_id: "subscription-c".into(),
