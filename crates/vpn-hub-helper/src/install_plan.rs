@@ -49,6 +49,7 @@ pub enum PlanOperation {
         side: ProtectedMaterialSide,
     },
     StopOwnedJob,
+    RestoreTunSnapshot,
     RemoveServiceRegistration,
     RemoveProtectedReference {
         reference_name: String,
@@ -57,6 +58,7 @@ pub enum PlanOperation {
     VerifyNoOwnedJob,
     VerifyNoServiceRegistration,
     VerifyNoProtectedReferences,
+    VerifyNoTunState,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -142,6 +144,7 @@ impl InstallPlan {
                 },
             ],
             InstallAction::Upgrade => vec![
+                PlanOperation::RestoreTunSnapshot,
                 PlanOperation::StopOwnedJob,
                 PlanOperation::VerifySignedArtifact {
                     relative_path: "bin/vpn-hub-helper.exe".into(),
@@ -158,6 +161,7 @@ impl InstallPlan {
                 PlanOperation::VerifyNoOwnedJob,
             ],
             InstallAction::Uninstall => vec![
+                PlanOperation::RestoreTunSnapshot,
                 PlanOperation::StopOwnedJob,
                 PlanOperation::RemoveServiceRegistration,
                 PlanOperation::RemoveProtectedReference {
@@ -170,6 +174,7 @@ impl InstallPlan {
                 PlanOperation::VerifyNoOwnedJob,
                 PlanOperation::VerifyNoServiceRegistration,
                 PlanOperation::VerifyNoProtectedReferences,
+                PlanOperation::VerifyNoTunState,
             ],
         };
         Ok(Self {
@@ -235,8 +240,12 @@ mod tests {
         let plan =
             InstallPlan::build(InstallAction::Upgrade, "install-a", &"b".repeat(64)).unwrap();
         assert!(matches!(
-            plan.operations.first(),
-            Some(PlanOperation::StopOwnedJob)
+            plan.operations.as_slice(),
+            [
+                PlanOperation::RestoreTunSnapshot,
+                PlanOperation::StopOwnedJob,
+                ..
+            ]
         ));
         assert!(matches!(
             plan.operations.last(),
@@ -257,5 +266,14 @@ mod tests {
             plan.operations
                 .contains(&PlanOperation::VerifyNoProtectedReferences)
         );
+        assert!(matches!(
+            plan.operations.as_slice(),
+            [
+                PlanOperation::RestoreTunSnapshot,
+                PlanOperation::StopOwnedJob,
+                ..
+            ]
+        ));
+        assert!(plan.operations.contains(&PlanOperation::VerifyNoTunState));
     }
 }

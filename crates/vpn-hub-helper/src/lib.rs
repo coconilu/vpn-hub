@@ -17,6 +17,7 @@ mod service_shell;
 mod status;
 mod supervisor;
 mod transport;
+mod tun;
 
 pub use authority::{
     AuthorityError, AuthorityFileGuard, AuthorityLease, AuthorityRegistry, SupervisorAuthority,
@@ -52,6 +53,13 @@ pub use supervisor::{
 };
 #[cfg(target_os = "windows")]
 pub use transport::{NamedPipeClient, TransportError, serve_one_named_pipe_request};
+pub use tun::{
+    AddressFamily, ExecutableIdentity, ExecutableRole, ExpectedDisposition, FileTunJournalStore,
+    LeakCheck, NetworkSnapshot, OutletTransport, PlatformCapability, ProcessExclusionCapability,
+    ProcessNetworkPolicy, ProcessRule, RegisteredOutlet, TrafficClass, TransportProtocol,
+    TunBackend, TunConsent, TunError, TunJournal, TunJournalPhase, TunJournalStore, TunPlan,
+    TunPlanAction, TunPlanBuilder, TunTransaction, WindowsPlanOnlyTunBackend,
+};
 
 /// Current helper protocol major version.
 pub const PROTOCOL_VERSION: u16 = 1;

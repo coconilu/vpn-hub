@@ -179,6 +179,27 @@ export async function previewSettings(request: SettingsPreviewRequest): Promise<
         && (JSON.stringify(draft) !== JSON.stringify(browserSettings.draft)
           || request.credential_intents.length > 0),
       request_fingerprint: fingerprint,
+      tun_plan: {
+        requested_enabled: false,
+        active: false,
+        supported: false,
+        consent_required: true,
+        reason_code: "windows_verified_application_identity_exclusion_unavailable",
+        generation: fingerprint,
+        subscription_outlet_ids: draft.outlets
+          .filter((outlet) => outlet.enabled && outlet.kind === "subscription")
+          .map((outlet) => outlet.outlet_id),
+        local_outlet_ids: draft.outlets
+          .filter((outlet) => outlet.enabled && outlet.kind === "local_proxy")
+          .map((outlet) => outlet.outlet_id),
+        missing_executable_identity_outlet_ids: draft.outlets
+          .filter((outlet) => outlet.enabled && outlet.kind === "local_proxy")
+          .map((outlet) => outlet.outlet_id),
+        control_plane_policy: "deny_external_egress_loopback_ipc_only",
+        core_policy: "owned_upstream_only",
+        local_outlet_policy: "registered_executable_identity_only",
+        leak_matrix_disposition: "fail_closed_reject",
+      },
     };
     browserSettingsPreviewTicket = result.can_apply ? fingerprint : null;
     return result;

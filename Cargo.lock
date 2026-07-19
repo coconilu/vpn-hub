@@ -4836,6 +4836,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "vpn-hub-core",
  "vpn-hub-windows-security",
  "windows-service",
  "zeroize",

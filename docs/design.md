@@ -195,23 +195,20 @@ proxy-providers:
 | 内部端口 16666 | 超实惠 |
 | 内部端口 26666 | SpeedCat |
 
-### 7.2 必须直连绕过的进程
+### 7.2 Windows TUN 防递归能力门禁
 
-当统一客户端开启 TUN 时，必须排除两个上游核心，否则会形成递归代理：
+旧方案曾用固定供应商进程名、固定端口和 Mihomo `PROCESS-NAME,...,DIRECT` 作为防递归规则。该方案已经废弃：产品支持动态出口，进程名可以伪造，PID 会复用，端口也不是进程身份；更关键的是，Mihomo 官方 TUN 文档没有提供 Windows 按进程排除字段。普通路由规则不能证明 Windows 应用身份，也不能作为安全边界。
 
-```yaml
-rules:
-  - PROCESS-NAME,chaoshihuiCore.exe,DIRECT
-  - PROCESS-NAME,chaoshihui.exe,DIRECT
-  - PROCESS-NAME,chaoshihuiHelperService.exe,DIRECT
-  - PROCESS-NAME,SpeedCatCore.exe,DIRECT
-  - PROCESS-NAME,SpeedCat.exe,DIRECT
-  - PROCESS-NAME,SpeedCatHelperService.exe,DIRECT
-  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
-  - MATCH,MASTER
-```
+当前规则由 `vpn-hub-helper::tun` 的 typed `TunPlan` 表达，并在能力不足时 Fail Closed：
 
-注意：`127.0.0.0/8` 的直连规则用于避免本地环路，但不能放在会绕开出站代理定义的位置错误使用。最终配置需要通过真实流量测试确认。
+| 角色 | 身份来源 | 网络 disposition |
+|---|---|---|
+| GUI / Helper | 当前安装签名工件的绝对路径 + SHA-256 | 外网拒绝，仅保留必要 loopback 控制面；不得获得泛化 bypass |
+| VPN Hub Core | 当前安装拥有的 Core 工件身份 | 仅允许计划内上游 transport |
+| `subscription` 出口 | 稳定 outlet ID；凭据不进入计划 | 不需要本地进程排除；业务与 DNS 仍受 Fail Closed 策略约束 |
+| `local_proxy` 出口 | 稳定 outlet ID + 明确 loopback endpoint + 用户登记的绝对路径/SHA-256 | 仅该已登记基础设施客户端可获得最小 bypass；不扫描或控制其他进程 |
+
+只有 Windows backend 能把 WFP/ALE normalized application identity 与实际 TUN/packet-routing executor 协同起来落实上述 disposition，且能同时快照和恢复 IPv4/IPv6 路由、DNS、适配器与 TUN 状态时，才允许启用。普通 WFP permit/block 只做授权或阻断，并不会自动让流量绕过 TUN 路由，不能单独视为 transport bypass。缺任一能力、身份不匹配或全部出口失效时，IPv4/IPv6 × TCP/UDP/DNS 均拒绝真实网络直连；不能退化为进程名、PID、固定端口或全局 `DIRECT`。
 
 ## 8. 策略组设计
 
@@ -512,8 +509,8 @@ sequenceDiagram
 
 ### Phase 4：TUN、服务与发布
 
-- LocalSystem Helper Service。
-- TUN 权限和防循环规则。
+- 最小权限 LocalService Helper Service。
+- 可选 TUN 的能力门禁、事务 journal 和防循环规则；当前生产 Windows adapter 明确 `unsupported`，未修改本机网络。
 - Mihomo 自动拉起。
 - 凭据库和配置 ACL。
 - 安装、升级、卸载和恢复测试。
@@ -534,7 +531,8 @@ sequenceDiagram
 | Mihomo 崩溃 | Guardian 自动拉起并记录 Core 事件 |
 | 电脑睡眠后恢复 | 重检端口、DNS、路由和出口状态 |
 | Wi-Fi 切换 | 重新检测物理接口和全部出口 |
-| TUN 开启 | 两个上游 Core 不发生递归代理 |
+| TUN 请求启用 | 未具备 WFP/ALE 应用身份排除和完整恢复能力时明确 unsupported 并保持关闭 |
+| TUN 隔离验收 | 已登记 Core / local client 不递归；GUI/Helper 无泛化 bypass；未知进程不被扫描或修改 |
 | 应用退出 | 按用户选择恢复原系统代理或留在托盘 |
 | 数据库损坏 | 备份损坏文件并重建，代理核心仍可运行 |
 
