@@ -4904,6 +4904,7 @@ name = "vpn-hub-core"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "hmac",
  "keyring-core",
  "rand 0.9.5",
  "reqwest",
@@ -4917,6 +4918,7 @@ dependencies = [
  "tokio",
  "toml 1.1.3+spec-1.1.0",
  "windows-native-keyring-store",
+ "zeroize",
 ]
 
 [[package]]

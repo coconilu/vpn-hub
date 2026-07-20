@@ -8,6 +8,7 @@ import {
   isCurrentPreviewResponse,
   moveItem,
 } from "./lib/settingsModel";
+import { buildEntrySwitchFoundationPreview } from "./lib/entrySwitchModel";
 import type { CredentialState, LocalProxyProtocol, SafeSettingsView, SettingsDraft, SettingsOutlet, SettingsPreview } from "./types";
 
 interface Props { currentOutletId: string | null; onApplied: () => Promise<void>; onNotice: (message: string) => void }
@@ -21,6 +22,9 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const [credentialIntentById, setCredentialIntentById] = useState<Record<string, "set" | "delete">>({});
   const [replacement, setReplacement] = useState<string | null>(null);
   const [failClosed, setFailClosed] = useState(false);
+  const [entrySwitchConfirmed, setEntrySwitchConfirmed] = useState(false);
+  const [applySystemProxy, setApplySystemProxy] = useState(false);
+  const [entrySwitchTarget, setEntrySwitchTarget] = useState<{ host: string; port: number } | null>(null);
   const [preview, setPreview] = useState<SettingsPreview | null>(null);
   const [pageState, setPageState] = useState<PageState>("loading");
   const [error, setError] = useState<string | null>(null);
@@ -31,7 +35,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const dirty = draft !== null && (JSON.stringify(draft) !== baseline
     || credentialIntentCount > 0 || replacement !== null || failClosed);
 
-  useEffect(() => { void getSettings().then((settings) => { setView(settings); setDraft(settings.draft); setBaseline(JSON.stringify(settings.draft)); setPageState("clean"); }).catch((reason) => { setError(String(reason)); setPageState("error"); }); }, []);
+  useEffect(() => { void getSettings().then((settings) => { setView(settings); setDraft(settings.draft); setEntrySwitchTarget(settings.draft.entry); setBaseline(JSON.stringify(settings.draft)); setPageState("clean"); }).catch((reason) => { setError(String(reason)); setPageState("error"); }); }, []);
   useEffect(() => { if (pageState === "error") errorRef.current?.focus(); }, [pageState]);
 
   const invalidatePreview = () => {
@@ -96,6 +100,13 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const canApply = preview !== null && preview.issues.length === 0
     && preview.request_fingerprint === currentRequest.request_fingerprint
     && (preview.diff.changes.length > 0 || credentialIntentCount > 0);
+  const originalEntry = view.draft.entry;
+  const entrySwitchPreview = buildEntrySwitchFoundationPreview(
+    originalEntry,
+    entrySwitchTarget ?? originalEntry,
+    applySystemProxy,
+    entrySwitchConfirmed,
+  );
 
   return <main className="settings-view">
     <header className="settings-header"><div><h1>设置</h1><p>统一入口、动态出口与 Guardian 策略。普通保存不会修改系统代理、TUN、Service 或第三方客户端。</p></div><div className="settings-actions">
@@ -107,13 +118,24 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     {preview && <section className="settings-preview" aria-label="设置变更预览"><h2>变更预览</h2><ul>{preview.diff.changes.map((change) => <li key={change.code}>{change.summary}</li>)}{credentialIntentCount > 0 && <li>将更新 {credentialIntentCount} 个凭据状态；预览不读取或回显凭据。</li>}</ul>{preview.issues.length > 0 && <ul className="validation-list">{preview.issues.map((issue) => <li key={`${issue.field}-${issue.code}`}>{issue.message}</li>)}</ul>}</section>}
 
     <section className="settings-card"><h2>统一入口与路由</h2><div className="settings-grid">
-      <label>入口地址<input value={draft.entry.host} onChange={(event) => changeDraft((current) => ({ ...current, entry: { ...current.entry, host: event.target.value } }))} /></label>
-      <label>入口端口<input type="number" min="1" max="65535" value={draft.entry.port} onChange={(event) => changeDraft((current) => ({ ...current, entry: { ...current.entry, port: Number(event.target.value) } }))} /></label>
+      <label>当前入口地址<input value={draft.entry.host} readOnly aria-readonly="true" /></label>
+      <label>当前入口端口<input type="number" value={draft.entry.port} readOnly aria-readonly="true" /></label>
       <label>默认模式<select value={draft.route_mode} onChange={(event) => changeDraft((current) => ({ ...current, route_mode: event.target.value as SettingsDraft["route_mode"] }))}><option value="priority">按优先级</option><option value="fastest">最低延迟</option><option value="manual">手动</option></select></label>
       <label>手动出口<select value={draft.manual_outlet ?? ""} onChange={(event) => changeDraft((current) => ({ ...current, manual_outlet: event.target.value || null }))}><option value="">未选择</option>{enabledOutlets.map((outlet) => <option key={outlet.outlet_id} value={outlet.outlet_id}>{outlet.label}</option>)}</select></label>
       <label>冷却时间（秒）<input type="number" min="1" max="86400" value={draft.cooldown_seconds} onChange={(event) => changeDraft((current) => ({ ...current, cooldown_seconds: Number(event.target.value) }))} /></label>
       <label>改善阈值（毫秒）<input type="number" min="0" max="60000" value={draft.minimum_improvement_ms} onChange={(event) => changeDraft((current) => ({ ...current, minimum_improvement_ms: Number(event.target.value) }))} /></label>
     </div><label className="wide-field">HTTPS 探测目标（每行一个）<textarea rows={3} value={draft.probe_targets.join("\n")} onChange={(event) => changeDraft((current) => ({ ...current, probe_targets: event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean) }))} /></label></section>
+
+    <section className="settings-card fail-closed-card" aria-labelledby="entry-switch-title">
+      <h2 id="entry-switch-title">安全入口切换预览</h2>
+      <p>当前入口 {originalEntry.host}:{originalEntry.port}。普通“应用设置”不能修改入口或 Windows 系统代理。</p>
+      <div className="settings-grid"><label>目标 loopback 地址<input value={entrySwitchTarget?.host ?? originalEntry.host} onChange={(event) => setEntrySwitchTarget((current) => ({ host: event.target.value, port: current?.port ?? originalEntry.port }))} /></label><label>目标端口<input type="number" min="1" max="65535" value={entrySwitchTarget?.port ?? originalEntry.port} onChange={(event) => setEntrySwitchTarget((current) => ({ host: current?.host ?? originalEntry.host, port: Number(event.target.value) }))} /></label></div>
+      <label className="check-field"><input type="checkbox" checked={applySystemProxy} onChange={(event) => setApplySystemProxy(event.target.checked)} />切换成功后同时应用当前用户的 Windows 系统代理</label>
+      <label className="check-field"><input type="checkbox" checked={entrySwitchConfirmed} onChange={(event) => setEntrySwitchConfirmed(event.target.checked)} />我确认：只有 Controller、出口和 Fail Closed 全部验证通过后才提交入口</label>
+      <ol>{entrySwitchPreview.steps.map((step) => <li key={step}>{step}</li>)}</ol>
+      <div role="status" aria-live="polite"><strong>当前不可执行：</strong><ul>{entrySwitchPreview.issues.map((issue) => <li key={issue.code}>{issue.message}</li>)}</ul></div>
+      <button className="primary-button" type="button" disabled aria-disabled="true" title="等待隔离 Windows live acceptance">执行安全切换</button>
+    </section>
 
     <section className="settings-card"><h2>Guardian 与历史</h2><div className="settings-grid compact">
       {([ ["刷新周期（秒）", "refresh_interval_seconds", 5, 86400], ["连接超时（毫秒）", "connect_timeout_ms", 1, 120000], ["请求超时（毫秒）", "request_timeout_ms", 1, 120000], ["失败阈值", "failure_threshold", 1, 100], ["恢复阈值", "recovery_threshold", 1, 100], ["历史保留（天）", "retention_days", 1, 3650] ] as const).map(([label, field, min, max]) => <label key={field}>{label}<input type="number" min={min} max={max} value={draft[field]} onChange={(event) => changeDraft((current) => ({ ...current, [field]: Number(event.target.value) }))} /></label>)}

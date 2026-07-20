@@ -18,7 +18,9 @@ use vpn_hub_core::{
     OutletConfig, OutletKind, UdpCapabilityEvidence, UdpCapabilityStatus, current_udp_status,
 };
 
-use crate::{AuthorityFileGuard, InstallationReference, SupervisorAuthority};
+use crate::{
+    AuthorityFileGuard, InstallationReference, SupervisorAuthority, validate_installation_location,
+};
 
 const JOURNAL_SCHEMA_VERSION: u16 = 2;
 const PLAN_SCHEMA_VERSION: u16 = 2;
@@ -794,18 +796,21 @@ impl TunAuthorityGuard {
         authority_id: &str,
         generation: u64,
     ) -> Result<Self, TunError> {
-        if !installation.helper_enabled {
+        if !installation.helper_enabled() {
             return Err(TunError::AuthorityConflict);
         }
         let program_data = std::env::var_os("ProgramData")
             .map(PathBuf::from)
             .ok_or(TunError::AuthorityConflict)?;
-        installation
-            .validate(&program_data)
-            .map_err(|_| TunError::AuthorityConflict)?;
+        validate_installation_location(
+            installation.install_id(),
+            installation.program_data_root(),
+            &program_data,
+        )
+        .map_err(|_| TunError::AuthorityConflict)?;
         Self::acquire_at(
             &installation.tun_authority_path(),
-            &installation.install_id,
+            installation.install_id(),
             authority_id,
             generation,
         )

@@ -35,6 +35,12 @@ mod windows {
         Executable,
         Mutable,
         SecretMaterial,
+        /// Mutable state owned by the current interactive user boundary. The
+        /// DACL must contain exactly that SID and SYSTEM.
+        CurrentUserMutableFile,
+        /// Mutable directory for current-user atomic state replacement. The
+        /// DACL must contain exactly that SID and SYSTEM.
+        CurrentUserMutableDirectory,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,11 +49,24 @@ mod windows {
         file_index: u64,
     }
     use windows_sys::Win32::{
-        Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, FILETIME},
+        Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, FILETIME, LocalFree},
         NetworkManagement::IpHelper::{
             GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
         },
-        Security::SECURITY_ATTRIBUTES,
+        Networking::WinInet::{
+            INTERNET_OPTION_PER_CONNECTION_OPTION, INTERNET_OPTION_REFRESH,
+            INTERNET_OPTION_SETTINGS_CHANGED, INTERNET_PER_CONN_AUTOCONFIG_URL,
+            INTERNET_PER_CONN_FLAGS, INTERNET_PER_CONN_FLAGS_UI, INTERNET_PER_CONN_OPTION_LISTW,
+            INTERNET_PER_CONN_OPTIONW, INTERNET_PER_CONN_PROXY_BYPASS,
+            INTERNET_PER_CONN_PROXY_SERVER, InternetQueryOptionW, InternetSetOptionW,
+            PROXY_TYPE_AUTO_DETECT, PROXY_TYPE_AUTO_PROXY_URL, PROXY_TYPE_DIRECT, PROXY_TYPE_PROXY,
+        },
+        Security::{
+            Cryptography::{
+                CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+            },
+            SECURITY_ATTRIBUTES,
+        },
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_READ,
@@ -55,6 +74,322 @@ mod windows {
         },
         System::Threading::GetProcessTimes,
     };
+
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct WinInetLanProxySnapshot {
+        pub flags: u32,
+        pub proxy_server: Option<String>,
+        pub proxy_bypass: Option<String>,
+        pub auto_config_url: Option<String>,
+    }
+
+    impl std::fmt::Debug for WinInetLanProxySnapshot {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("WinInetLanProxySnapshot")
+                .field("flags", &self.flags)
+                .field("proxy_server_configured", &self.proxy_server.is_some())
+                .field("proxy_bypass_configured", &self.proxy_bypass.is_some())
+                .field("auto_configured", &self.auto_config_url.is_some())
+                .finish()
+        }
+    }
+
+    impl WinInetLanProxySnapshot {
+        /// Validates the lossless default-LAN representation.
+        ///
+        /// # Errors
+        /// Returns `Unsupported` for unknown flags, inconsistent option
+        /// presence, or unbounded strings.
+        pub fn validate(&self) -> io::Result<()> {
+            let known = PROXY_TYPE_DIRECT
+                | PROXY_TYPE_PROXY
+                | PROXY_TYPE_AUTO_PROXY_URL
+                | PROXY_TYPE_AUTO_DETECT;
+            if self.flags == 0
+                || self.flags & !known != 0
+                || (self.flags & PROXY_TYPE_PROXY != 0) != self.proxy_server.is_some()
+                || (self.flags & PROXY_TYPE_AUTO_PROXY_URL != 0) != self.auto_config_url.is_some()
+                || self
+                    .proxy_server
+                    .as_ref()
+                    .is_some_and(|value| value.is_empty() || value.len() > 4_096)
+                || self
+                    .proxy_bypass
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 16_384)
+                || self
+                    .auto_config_url
+                    .as_ref()
+                    .is_some_and(|value| value.is_empty() || value.len() > 4_096)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "WinINet proxy state is outside the supported default LAN contract",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// Queries only the default LAN connection for the current interactive
+    /// process identity. The caller must separately reject service, RAS, VPN,
+    /// and multi-connection contexts before invoking this function.
+    ///
+    /// # Errors
+    /// Returns an OS error for failed `WinINet` queries and `Unsupported` for
+    /// a state outside the bounded default-LAN contract.
+    pub fn query_current_user_default_lan_proxy() -> io::Result<WinInetLanProxySnapshot> {
+        let list_size = u32::try_from(size_of::<INTERNET_PER_CONN_OPTION_LISTW>())
+            .map_err(|_| io::Error::other("WinINet option list size overflow"))?;
+        let mut options = [
+            option_number(INTERNET_PER_CONN_FLAGS_UI),
+            option_string(INTERNET_PER_CONN_PROXY_SERVER),
+            option_string(INTERNET_PER_CONN_PROXY_BYPASS),
+            option_string(INTERNET_PER_CONN_AUTOCONFIG_URL),
+        ];
+        let mut list = INTERNET_PER_CONN_OPTION_LISTW {
+            dwSize: list_size,
+            pszConnection: std::ptr::null_mut(),
+            dwOptionCount: 4,
+            dwOptionError: 0,
+            pOptions: options.as_mut_ptr(),
+        };
+        let mut size = list_size;
+        let queried = unsafe {
+            InternetQueryOptionW(
+                std::ptr::null(),
+                INTERNET_OPTION_PER_CONNECTION_OPTION,
+                (&raw mut list).cast(),
+                &raw mut size,
+            )
+        };
+        if queried == 0 {
+            free_option_strings(&mut options);
+            return Err(io::Error::last_os_error());
+        }
+        let proxy_server = take_option_string(&mut options[1]);
+        let proxy_bypass = take_option_string(&mut options[2]);
+        let auto_config_url = take_option_string(&mut options[3]);
+        free_option_strings(&mut options);
+        let snapshot = WinInetLanProxySnapshot {
+            flags: unsafe { options[0].Value.dwValue },
+            proxy_server: proxy_server?,
+            proxy_bypass: proxy_bypass?,
+            auto_config_url: auto_config_url?,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Applies a validated default-LAN snapshot through `WinINet`, broadcasts
+    /// `SETTINGS_CHANGED` + `REFRESH`, then requires an exact query-back match.
+    ///
+    /// # Errors
+    /// Returns an OS error for failed set/notification/query operations,
+    /// `Unsupported` for an unrepresentable snapshot, or an exact-verification
+    /// failure when the query-back state differs.
+    pub fn set_current_user_default_lan_proxy(
+        snapshot: &WinInetLanProxySnapshot,
+    ) -> io::Result<()> {
+        snapshot.validate()?;
+        let list_size = u32::try_from(size_of::<INTERNET_PER_CONN_OPTION_LISTW>())
+            .map_err(|_| io::Error::other("WinINet option list size overflow"))?;
+        let mut proxy = wide(snapshot.proxy_server.as_deref());
+        let mut bypass = wide(snapshot.proxy_bypass.as_deref());
+        let mut auto_config = wide(snapshot.auto_config_url.as_deref());
+        let mut options = [
+            INTERNET_PER_CONN_OPTIONW {
+                dwOption: INTERNET_PER_CONN_FLAGS,
+                Value: windows_sys::Win32::Networking::WinInet::INTERNET_PER_CONN_OPTIONW_0 {
+                    dwValue: snapshot.flags,
+                },
+            },
+            set_string_option(INTERNET_PER_CONN_PROXY_SERVER, &mut proxy),
+            set_string_option(INTERNET_PER_CONN_PROXY_BYPASS, &mut bypass),
+            set_string_option(INTERNET_PER_CONN_AUTOCONFIG_URL, &mut auto_config),
+        ];
+        let mut list = INTERNET_PER_CONN_OPTION_LISTW {
+            dwSize: list_size,
+            pszConnection: std::ptr::null_mut(),
+            dwOptionCount: 4,
+            dwOptionError: 0,
+            pOptions: options.as_mut_ptr(),
+        };
+        let applied = unsafe {
+            InternetSetOptionW(
+                std::ptr::null(),
+                INTERNET_OPTION_PER_CONNECTION_OPTION,
+                (&raw mut list).cast(),
+                list_size,
+            )
+        };
+        if applied == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for option in [INTERNET_OPTION_SETTINGS_CHANGED, INTERNET_OPTION_REFRESH] {
+            let refreshed =
+                unsafe { InternetSetOptionW(std::ptr::null(), option, std::ptr::null(), 0) };
+            if refreshed == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if query_current_user_default_lan_proxy()? != *snapshot {
+            return Err(io::Error::other(
+                "WinINet proxy query-back verification failed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Encrypts bytes for the current Windows user with UI disabled. No
+    /// machine-scope flag is used, so service identities cannot decrypt it.
+    ///
+    /// # Errors
+    /// Returns an OS or bounds error when current-user protection fails.
+    pub fn protect_current_user_data(plaintext: &[u8], entropy: &[u8]) -> io::Result<Vec<u8>> {
+        crypt_data(plaintext, entropy, true)
+    }
+
+    /// Decrypts bytes protected for the current Windows user with UI disabled.
+    ///
+    /// # Errors
+    /// Returns an OS, bounds, or integrity error when unprotection fails.
+    pub fn unprotect_current_user_data(ciphertext: &[u8], entropy: &[u8]) -> io::Result<Vec<u8>> {
+        crypt_data(ciphertext, entropy, false)
+    }
+
+    fn crypt_data(input: &[u8], entropy: &[u8], protect: bool) -> io::Result<Vec<u8>> {
+        if input.is_empty()
+            || input.len() > 1024 * 1024
+            || entropy.is_empty()
+            || entropy.len() > 4096
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DPAPI input is outside bounds",
+            ));
+        }
+        let mut input_blob = CRYPT_INTEGER_BLOB {
+            cbData: u32::try_from(input.len()).map_err(io::Error::other)?,
+            pbData: input.as_ptr().cast_mut(),
+        };
+        let mut entropy_blob = CRYPT_INTEGER_BLOB {
+            cbData: u32::try_from(entropy.len()).map_err(io::Error::other)?,
+            pbData: entropy.as_ptr().cast_mut(),
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        // SAFETY: all input slices remain live for the call; output is initialized
+        // by DPAPI and released with LocalFree below. UI is explicitly forbidden.
+        let ok = unsafe {
+            if protect {
+                CryptProtectData(
+                    &raw mut input_blob,
+                    std::ptr::null(),
+                    &raw mut entropy_blob,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &raw mut output,
+                )
+            } else {
+                CryptUnprotectData(
+                    &raw mut input_blob,
+                    std::ptr::null_mut(),
+                    &raw mut entropy_blob,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &raw mut output,
+                )
+            }
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if output.pbData.is_null() || output.cbData == 0 || output.cbData > 1024 * 1024 {
+            if !output.pbData.is_null() {
+                unsafe { LocalFree(output.pbData.cast()) };
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DPAPI output is outside bounds",
+            ));
+        }
+        // SAFETY: DPAPI returned exactly cbData initialized bytes.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
+        unsafe { LocalFree(output.pbData.cast()) };
+        Ok(bytes)
+    }
+
+    fn option_number(option: u32) -> INTERNET_PER_CONN_OPTIONW {
+        INTERNET_PER_CONN_OPTIONW {
+            dwOption: option,
+            Value: windows_sys::Win32::Networking::WinInet::INTERNET_PER_CONN_OPTIONW_0 {
+                dwValue: 0,
+            },
+        }
+    }
+
+    fn option_string(option: u32) -> INTERNET_PER_CONN_OPTIONW {
+        INTERNET_PER_CONN_OPTIONW {
+            dwOption: option,
+            Value: windows_sys::Win32::Networking::WinInet::INTERNET_PER_CONN_OPTIONW_0 {
+                pszValue: std::ptr::null_mut(),
+            },
+        }
+    }
+
+    fn set_string_option(option: u32, value: &mut Option<Vec<u16>>) -> INTERNET_PER_CONN_OPTIONW {
+        INTERNET_PER_CONN_OPTIONW {
+            dwOption: option,
+            Value: windows_sys::Win32::Networking::WinInet::INTERNET_PER_CONN_OPTIONW_0 {
+                pszValue: value.as_mut().map_or(std::ptr::null_mut(), Vec::as_mut_ptr),
+            },
+        }
+    }
+
+    fn wide(value: Option<&str>) -> Option<Vec<u16>> {
+        value.map(|value| value.encode_utf16().chain(std::iter::once(0)).collect())
+    }
+
+    fn take_option_string(option: &mut INTERNET_PER_CONN_OPTIONW) -> io::Result<Option<String>> {
+        let pointer = unsafe { option.Value.pszValue };
+        if pointer.is_null() {
+            return Ok(None);
+        }
+        let mut length = 0_usize;
+        while length <= 32_768 && unsafe { *pointer.add(length) } != 0 {
+            length += 1;
+        }
+        if length > 32_768 {
+            unsafe { windows_sys::Win32::Foundation::GlobalFree(pointer.cast()) };
+            option.Value.pszValue = std::ptr::null_mut();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WinINet string is unbounded",
+            ));
+        }
+        let value = String::from_utf16(unsafe { std::slice::from_raw_parts(pointer, length) })
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "WinINet string is invalid"));
+        unsafe { windows_sys::Win32::Foundation::GlobalFree(pointer.cast()) };
+        option.Value.pszValue = std::ptr::null_mut();
+        value.map(Some)
+    }
+
+    fn free_option_strings(options: &mut [INTERNET_PER_CONN_OPTIONW]) {
+        for option in options.iter_mut().skip(1) {
+            let pointer = unsafe { option.Value.pszValue };
+            if !pointer.is_null() {
+                unsafe { windows_sys::Win32::Foundation::GlobalFree(pointer.cast()) };
+                option.Value.pszValue = std::ptr::null_mut();
+            }
+        }
+    }
 
     /// Validates installation root containment, reparse-point absence, owner,
     /// and every ACE trustee/mask using handles opened without following links.
@@ -162,6 +497,139 @@ mod windows {
         Ok((file, identity))
     }
 
+    /// Opens and validates a current-user mutable file under a protected
+    /// `ProgramData` root. The exact returned handle is the handle whose
+    /// containment, owner, DACL, reparse status, and identity were checked.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe containment, ACLs, links, identity, or access.
+    pub fn open_current_user_mutable_file(
+        root: &Path,
+        path: &Path,
+        interactive_user_sid: &str,
+    ) -> io::Result<(std::fs::File, FileIdentity)> {
+        let mut handles = open_current_user_chain(root, path, interactive_user_sid, false)?;
+        let file = handles
+            .pop()
+            .ok_or_else(|| io::Error::other("verified file missing"))?;
+        let identity = file_identity(&file)?;
+        Ok((file, identity))
+    }
+
+    /// Opens and validates the exact current-user mutable directory handle.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe containment, ACLs, links, identity, or access.
+    pub fn open_current_user_mutable_directory(
+        root: &Path,
+        path: &Path,
+        interactive_user_sid: &str,
+    ) -> io::Result<std::fs::File> {
+        let mut handles = open_current_user_chain(root, path, interactive_user_sid, true)?;
+        handles
+            .pop()
+            .ok_or_else(|| io::Error::other("verified directory missing"))
+    }
+
+    /// Opens the shared desktop/LocalService authority file through one
+    /// validated no-follow handle. The shared DACL policy intentionally differs
+    /// from current-user-only entry-switch state.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe containment, ACLs, links, identity, or access.
+    pub fn open_shared_authority_file(
+        root: &Path,
+        path: &Path,
+        interactive_user_sid: &str,
+    ) -> io::Result<(std::fs::File, FileIdentity)> {
+        validate_sid(interactive_user_sid)?;
+        let relative = safe_relative_path(root, path)?;
+        if relative.components().count() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authority path is not fixed",
+            ));
+        }
+        let root_file = open_no_follow(root)?;
+        let expected_root = normalize_final_path(&root_file)?;
+        validate_secure_handle(&root_file, interactive_user_sid, ProtectedPathPolicy::Root)?;
+        let file = open_no_follow_mutable(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "authority is not a file",
+            ));
+        }
+        let final_path = normalize_final_path(&file)?;
+        if !final_path.starts_with(&expected_root) || final_path == expected_root {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authority escapes root",
+            ));
+        }
+        validate_secure_handle(&file, interactive_user_sid, ProtectedPathPolicy::Mutable)?;
+        let identity = file_identity(&file)?;
+        Ok((file, identity))
+    }
+
+    fn open_current_user_chain(
+        root: &Path,
+        path: &Path,
+        interactive_user_sid: &str,
+        target_is_directory: bool,
+    ) -> io::Result<Vec<std::fs::File>> {
+        validate_sid(interactive_user_sid)?;
+        let relative = safe_relative_path(root, path)?;
+        let root_file = open_no_follow(root)?;
+        let expected_root = normalize_final_path(&root_file)?;
+        validate_secure_handle(&root_file, interactive_user_sid, ProtectedPathPolicy::Root)?;
+        let components = relative.components().collect::<Vec<_>>();
+        let mut current = root.to_path_buf();
+        let mut handles = vec![root_file];
+        for (index, component) in components.iter().enumerate() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unsafe component",
+                ));
+            };
+            current.push(name);
+            let final_component = index + 1 == components.len();
+            let file = if final_component && !target_is_directory {
+                open_no_follow_mutable(&current)?
+            } else {
+                open_no_follow(&current)?
+            };
+            let metadata = file.metadata()?;
+            let type_matches = if final_component && !target_is_directory {
+                metadata.is_file()
+            } else {
+                metadata.is_dir()
+            };
+            if !type_matches {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "protected path type mismatch",
+                ));
+            }
+            let final_path = normalize_final_path(&file)?;
+            if !final_path.starts_with(&expected_root) || final_path == expected_root {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "path escapes root",
+                ));
+            }
+            let policy = if final_component && !target_is_directory {
+                ProtectedPathPolicy::CurrentUserMutableFile
+            } else {
+                ProtectedPathPolicy::CurrentUserMutableDirectory
+            };
+            validate_secure_handle(&file, interactive_user_sid, policy)?;
+            handles.push(file);
+        }
+        Ok(handles)
+    }
+
     /// Reopens a file under the same no-follow/share contract and reads its identity.
     ///
     /// # Errors
@@ -175,6 +643,22 @@ mod windows {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)?;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "reparse points are forbidden",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn open_no_follow_mutable(path: &Path) -> io::Result<std::fs::File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .share_mode(FILE_SHARE_READ)
             .open(path)?;
         if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -264,6 +748,10 @@ mod windows {
             | ProtectedPathPolicy::SecretMaterial => {
                 matches!(owner, "S-1-5-18" | "S-1-5-19" | "S-1-5-32-544")
             }
+            ProtectedPathPolicy::CurrentUserMutableFile
+            | ProtectedPathPolicy::CurrentUserMutableDirectory => {
+                matches!(owner, "S-1-5-18" | "S-1-5-32-544") || owner == interactive_user_sid
+            }
         };
         if !allowed_owner {
             return Err(io::Error::new(
@@ -306,9 +794,18 @@ mod windows {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "trustee missing"))?
                 .to_string();
             let trustee = trustee.trim_end_matches('\0');
-            if !matches!(trustee, "S-1-5-18" | "S-1-5-19" | "S-1-5-32-544")
-                && trustee != interactive_user_sid
-            {
+            let current_user_only = matches!(
+                policy,
+                ProtectedPathPolicy::CurrentUserMutableFile
+                    | ProtectedPathPolicy::CurrentUserMutableDirectory
+            );
+            let allowed = if current_user_only {
+                trustee == "S-1-5-18" || trustee == interactive_user_sid
+            } else {
+                matches!(trustee, "S-1-5-18" | "S-1-5-19" | "S-1-5-32-544")
+                    || trustee == interactive_user_sid
+            };
+            if !allowed {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "broad or unexpected DACL trustee",
@@ -327,10 +824,25 @@ mod windows {
                 validate_user_mask(ace.mask(), policy)?;
             }
         }
-        if !has_system
-            || (policy != ProtectedPathPolicy::Root && !has_local_service)
-            || (policy != ProtectedPathPolicy::SecretMaterial && !has_user)
-        {
+        let current_user_only = matches!(
+            policy,
+            ProtectedPathPolicy::CurrentUserMutableFile
+                | ProtectedPathPolicy::CurrentUserMutableDirectory
+        );
+        if current_user_only && dacl.len() != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "current-user mutable DACL must contain exactly two ACEs",
+            ));
+        }
+        let required_missing = if current_user_only {
+            !has_system || !has_user || has_local_service
+        } else {
+            !has_system
+                || (policy != ProtectedPathPolicy::Root && !has_local_service)
+                || (policy != ProtectedPathPolicy::SecretMaterial && !has_user)
+        };
+        if required_missing {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "required installation principal missing",
@@ -351,7 +863,10 @@ mod windows {
             | AccessRights::Bit8;
         let mutable = matches!(
             policy,
-            ProtectedPathPolicy::Mutable | ProtectedPathPolicy::MutableDirectory
+            ProtectedPathPolicy::Mutable
+                | ProtectedPathPolicy::MutableDirectory
+                | ProtectedPathPolicy::CurrentUserMutableFile
+                | ProtectedPathPolicy::CurrentUserMutableDirectory
         );
         if mask.intersects(administration)
             || (!mutable && mask.intersects(file_write | AccessRights::Bit6))
@@ -368,6 +883,7 @@ mod windows {
             ProtectedPathPolicy::Root
                 | ProtectedPathPolicy::StrictDirectory
                 | ProtectedPathPolicy::MutableDirectory
+                | ProtectedPathPolicy::CurrentUserMutableDirectory
                 | ProtectedPathPolicy::Executable
         );
         if !readable || (requires_execute && !executable) {
@@ -650,6 +1166,18 @@ mod windows {
         }
 
         #[test]
+        fn current_user_dpapi_round_trip_is_entropy_bound() {
+            let plaintext = b"entry-switch-test-payload";
+            let ciphertext = protect_current_user_data(plaintext, b"install-a/user-a").unwrap();
+            assert_ne!(ciphertext, plaintext);
+            assert_eq!(
+                unprotect_current_user_data(&ciphertext, b"install-a/user-a").unwrap(),
+                plaintext
+            );
+            assert!(unprotect_current_user_data(&ciphertext, b"install-b/user-a").is_err());
+        }
+
+        #[test]
         fn user_writable_executable_acl_is_rejected() {
             let account = std::env::var("USERNAME").unwrap();
             let sid = lookup_local_account_sid(&account).unwrap();
@@ -688,6 +1216,49 @@ mod windows {
                 )
                 .is_err()
             );
+        }
+
+        #[test]
+        fn current_user_mutable_acl_accepts_exact_user_and_system() {
+            let sid = lookup_local_account_sid(&std::env::var("USERNAME").unwrap()).unwrap();
+            let file: LocalBox<SecurityDescriptor> =
+                format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{sid})").parse().unwrap();
+            validate_dacl(
+                file.dacl().unwrap(),
+                &sid,
+                ProtectedPathPolicy::CurrentUserMutableFile,
+            )
+            .unwrap();
+            let directory: LocalBox<SecurityDescriptor> =
+                format!("D:P(A;;GA;;;SY)(A;;GRGWGX;;;{sid})")
+                    .parse()
+                    .unwrap();
+            validate_dacl(
+                directory.dacl().unwrap(),
+                &sid,
+                ProtectedPathPolicy::CurrentUserMutableDirectory,
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn current_user_mutable_acl_rejects_service_admin_extra_and_user_admin_rights() {
+            let sid = lookup_local_account_sid(&std::env::var("USERNAME").unwrap()).unwrap();
+            for sddl in [
+                format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{sid})(A;;GR;;;LS)"),
+                format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{sid})(A;;GR;;;BA)"),
+                format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})"),
+            ] {
+                let descriptor: LocalBox<SecurityDescriptor> = sddl.parse().unwrap();
+                assert!(
+                    validate_dacl(
+                        descriptor.dacl().unwrap(),
+                        &sid,
+                        ProtectedPathPolicy::CurrentUserMutableFile,
+                    )
+                    .is_err()
+                );
+            }
         }
 
         #[test]
@@ -746,12 +1317,27 @@ mod windows {
             drop(guard);
             std::fs::rename(&executable, &replacement).unwrap();
         }
+
+        #[test]
+        fn mutable_no_follow_handle_blocks_replacement_until_released() {
+            let temp = tempfile::tempdir().unwrap();
+            let authority = temp.path().join("authority.lease");
+            let replacement = temp.path().join("replacement.lease");
+            std::fs::write(&authority, b"sentinel").unwrap();
+            let guard = open_no_follow_mutable(&authority).unwrap();
+            assert!(std::fs::rename(&authority, &replacement).is_err());
+            drop(guard);
+            std::fs::rename(&authority, &replacement).unwrap();
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
 pub use windows::{
-    FileIdentity, ProtectedPathPolicy, create_restricted_named_pipe, lookup_local_account_sid,
-    network_state_records, open_verified_file, process_creation_identity,
+    FileIdentity, ProtectedPathPolicy, WinInetLanProxySnapshot, create_restricted_named_pipe,
+    lookup_local_account_sid, network_state_records, open_current_user_mutable_directory,
+    open_current_user_mutable_file, open_shared_authority_file, open_verified_file,
+    process_creation_identity, protect_current_user_data, query_current_user_default_lan_proxy,
+    set_current_user_default_lan_proxy, unprotect_current_user_data,
     validate_protected_installation, verified_file_identity,
 };

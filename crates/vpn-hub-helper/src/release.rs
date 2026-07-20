@@ -316,6 +316,7 @@ impl ReleaseOperation {
                 Self::HelperOperation {
                     helper_step: PlanOperation::ApplyProgramDataAcl { .. }
                         | PlanOperation::ProvisionAuthorityLeaseFile
+                        | PlanOperation::ProvisionEntrySwitchState { .. }
                         | PlanOperation::ProvisionTunAuthorityLeaseFile
                         | PlanOperation::RegisterService { .. }
                         | PlanOperation::ConfigureNamedPipeAcl { .. }
@@ -378,7 +379,7 @@ impl ReleaseMigrationPlan {
                 operations.push(ReleaseOperation::VerifyNoOrphans);
             }
             ReleaseLifecycleAction::Upgrade => {
-                let (safety_prefix, remaining) = helper_operations.split_at(3);
+                let (safety_prefix, remaining) = helper_operations.split_at(4);
                 operations.extend(
                     safety_prefix
                         .iter()
@@ -403,7 +404,7 @@ impl ReleaseMigrationPlan {
                 operations.push(ReleaseOperation::VerifyNoOrphans);
             }
             ReleaseLifecycleAction::Uninstall => {
-                let (safety_prefix, remaining) = helper_operations.split_at(3);
+                let (safety_prefix, remaining) = helper_operations.split_at(4);
                 operations.extend(
                     safety_prefix
                         .iter()
@@ -478,6 +479,7 @@ fn verify_helper_recovery_prefix(
     ) && !matches!(
         operations,
         [
+            PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent { .. },
             PlanOperation::EnterFailClosed,
             PlanOperation::StopOwnedJob,
             PlanOperation::RestoreTunSnapshot,
@@ -833,6 +835,10 @@ mod migration_tests {
                     plan.operations.as_slice(),
                     [
                         ReleaseOperation::HelperOperation {
+                            helper_step:
+                                PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent { .. }
+                        },
+                        ReleaseOperation::HelperOperation {
                             helper_step: PlanOperation::EnterFailClosed
                         },
                         ReleaseOperation::HelperOperation {
@@ -966,6 +972,9 @@ mod migration_tests {
             backend.completed.as_slice(),
             [
                 ReleaseOperation::HelperOperation {
+                    helper_step: PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent { .. }
+                },
+                ReleaseOperation::HelperOperation {
                     helper_step: PlanOperation::EnterFailClosed
                 },
                 ReleaseOperation::HelperOperation {
@@ -990,7 +999,8 @@ mod migration_tests {
         assert!(!backend.rolled_back.iter().any(|operation| matches!(
             operation,
             ReleaseOperation::HelperOperation {
-                helper_step: PlanOperation::EnterFailClosed
+                helper_step: PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent { .. }
+                    | PlanOperation::EnterFailClosed
                     | PlanOperation::StopOwnedJob
                     | PlanOperation::RestoreTunSnapshot
             }

@@ -58,19 +58,91 @@ impl AuthorityFileGuard {
         Self::acquire_inner(path, authority, generation, false)
     }
 
+    /// Opens the installer-provisioned entry-switch authority lease through a
+    /// no-follow, containment- and ACL-validated handle, then locks and writes
+    /// that same handle.
+    ///
+    /// # Errors
+    /// Returns an authority error before mutation if any validation or lock fails.
+    #[cfg(target_os = "windows")]
+    pub fn acquire_protected_entry_switch(
+        installation: &crate::InstallationReference,
+        interactive_user_sid: &str,
+        authority: SupervisorAuthority,
+        generation: u64,
+    ) -> Result<Self, AuthorityError> {
+        let (file, _) = vpn_hub_windows_security::open_current_user_mutable_file(
+            installation.program_data_root(),
+            &installation.entry_switch_authority_path(),
+            interactive_user_sid,
+        )
+        .map_err(|_| AuthorityError::CrossProcessLease)?;
+        Self::acquire_file(file, authority, generation)
+    }
+
+    /// Acquires the shared desktop/LocalService authority from the exact
+    /// validated `ProgramData` handle without reopening it by path.
+    ///
+    /// # Errors
+    /// Returns an authority error before mutation if validation or locking fails.
+    #[cfg(target_os = "windows")]
+    pub fn acquire_protected_shared(
+        installation: &crate::InstallationReference,
+        interactive_user_sid: &str,
+        authority: SupervisorAuthority,
+        generation: u64,
+    ) -> Result<Self, AuthorityError> {
+        let (file, _) = vpn_hub_windows_security::open_shared_authority_file(
+            installation.program_data_root(),
+            &installation.authority_path(),
+            interactive_user_sid,
+        )
+        .map_err(|_| AuthorityError::CrossProcessLease)?;
+        Self::acquire_file(file, authority, generation)
+    }
+
+    /// Acquires a helper's shared authority when its validated root is already
+    /// known from installer-owned startup metadata.
+    ///
+    /// # Errors
+    /// Returns an authority error before mutation if validation or locking fails.
+    #[cfg(target_os = "windows")]
+    pub fn acquire_protected_shared_root(
+        root: &Path,
+        interactive_user_sid: &str,
+        authority: SupervisorAuthority,
+        generation: u64,
+    ) -> Result<Self, AuthorityError> {
+        let (file, _) = vpn_hub_windows_security::open_shared_authority_file(
+            root,
+            &root.join("authority.lease"),
+            interactive_user_sid,
+        )
+        .map_err(|_| AuthorityError::CrossProcessLease)?;
+        Self::acquire_file(file, authority, generation)
+    }
+
     fn acquire_inner(
         path: &Path,
         authority: SupervisorAuthority,
         generation: u64,
         create: bool,
     ) -> Result<Self, AuthorityError> {
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(create)
             .truncate(false)
             .read(true)
             .write(true)
             .open(path)
             .map_err(|_| AuthorityError::CrossProcessLease)?;
+        Self::acquire_file(file, authority, generation)
+    }
+
+    fn acquire_file(
+        mut file: File,
+        authority: SupervisorAuthority,
+        generation: u64,
+    ) -> Result<Self, AuthorityError> {
         file.try_lock_exclusive()
             .map_err(|_| AuthorityError::AlreadyHeld)?;
         file.set_len(0)
@@ -243,6 +315,11 @@ mod tests {
             Err(AuthorityError::AlreadyHeld)
         ));
         drop(helper);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "authority=helper\ngeneration=1\n",
+            "failed lock must not truncate or rewrite"
+        );
         assert!(AuthorityFileGuard::acquire(&path, SupervisorAuthority::Desktop, 1).is_ok());
     }
 }

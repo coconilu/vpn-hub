@@ -178,16 +178,19 @@ impl<B: CoreBackend, P: ManifestProvider> HelperRuntime<B, P> {
         })
     }
 
+    #[cfg(target_os = "windows")]
     pub fn acquire_helper_with_authority_file(
         backend: B,
         provider: P,
-        authority_path: &Path,
+        program_data_root: &Path,
+        interactive_user_sid: &str,
         now_ms: i64,
     ) -> Result<Self, RuntimeError> {
         let manifest = provider.load()?;
         let network_fingerprint = backend.network_fingerprint()?;
-        let cross_process_guard = crate::AuthorityFileGuard::acquire_existing(
-            authority_path,
+        let cross_process_guard = crate::AuthorityFileGuard::acquire_protected_shared_root(
+            program_data_root,
+            interactive_user_sid,
             SupervisorAuthority::Helper,
             manifest.generation,
         )

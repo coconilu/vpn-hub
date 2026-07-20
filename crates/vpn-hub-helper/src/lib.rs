@@ -24,10 +24,12 @@ pub use authority::{
     AuthorityError, AuthorityFileGuard, AuthorityLease, AuthorityRegistry, SupervisorAuthority,
 };
 pub use install_plan::{
-    AccountContract, InstallAction, InstallPlan, InstallPlanError, PlanOperation,
-    ProtectedMaterialSide,
+    AccountContract, ExistingArtifactMode, InstallAction, InstallPlan, InstallPlanError,
+    PlanOperation, ProtectedMaterialSide,
 };
-pub use installation::{InstallationReference, InstallationReferenceError};
+pub use installation::{
+    InstallationReference, InstallationReferenceError, validate_installation_location,
+};
 pub use manifest::{
     CoreArtifact, EntrySummary, ManifestError, OutletHealthSummary, OutletKindSummary,
     OutletSummary, SupervisionManifest, load_manifest,

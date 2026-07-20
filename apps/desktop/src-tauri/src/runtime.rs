@@ -560,7 +560,8 @@ impl Drop for PendingChild {
 }
 
 struct ProbePortLease {
-    _listener: TcpListener,
+    #[allow(dead_code)] // held for RAII; tests also inspect it for zero-connect preview proof
+    listener: TcpListener,
     address: SocketAddr,
 }
 
@@ -584,10 +585,7 @@ impl ProbePortLease {
                 .local_addr()
                 .map_err(|_| "无法读取隔离 UDP 探测端口".to_string())?;
             if !matches!(address.port(), 3_666 | 6_666) && !excluded.contains(&address.port()) {
-                return Ok(Self {
-                    _listener: listener,
-                    address,
-                });
+                return Ok(Self { listener, address });
             }
         }
         Err("无法获得安全的隔离 UDP 探测端口".into())
@@ -775,9 +773,17 @@ fn select_supervisor_route_with_program_data(
     let Ok(reference) = InstallationReference::load(&reference_path, program_data) else {
         return SupervisorRoute::FailClosed;
     };
-    if !reference.helper_enabled {
-        return AuthorityFileGuard::acquire_existing(
-            &reference.authority_path(),
+    if !reference.helper_enabled() {
+        let Ok(account) = env::var("USERNAME") else {
+            return SupervisorRoute::FailClosed;
+        };
+        let Ok(interactive_user_sid) = vpn_hub_windows_security::lookup_local_account_sid(&account)
+        else {
+            return SupervisorRoute::FailClosed;
+        };
+        return AuthorityFileGuard::acquire_protected_shared(
+            &reference,
+            &interactive_user_sid,
             SupervisorAuthority::Desktop,
             1,
         )
@@ -788,7 +794,7 @@ fn select_supervisor_route_with_program_data(
     let Some(store) = secret_store else {
         return SupervisorRoute::FailClosed;
     };
-    let Ok(Some(key_hex)) = store.get(&reference.client_secret_ref) else {
+    let Ok(Some(key_hex)) = store.get(reference.client_secret_ref()) else {
         return SupervisorRoute::FailClosed;
     };
     let key_hex = zeroize::Zeroizing::new(key_hex);
@@ -796,7 +802,7 @@ fn select_supervisor_route_with_program_data(
         return SupervisorRoute::FailClosed;
     };
     SupervisorRoute::HelperOwned {
-        client: NamedPipeClient::new(reference.install_id, Arc::new(key)),
+        client: NamedPipeClient::new(reference.install_id().to_owned(), Arc::new(key)),
         last_status: Box::new(Mutex::new(None)),
     }
 }
@@ -1087,15 +1093,16 @@ impl AppState {
             }
         };
         if let Some(candidate) = candidate.as_ref() {
-            if candidate.entry != current.entry
-                && is_endpoint_reachable(&candidate.entry.host, candidate.entry.port)
-            {
+            if candidate.entry != current.entry {
                 issues.push(ValidationIssue::new(
-                    "entry.port",
-                    "entry_port_occupied",
-                    "候选统一入口已被其他监听器占用；应用不会停止或接管该进程",
+                    "entry",
+                    "dedicated_entry_switch_required",
+                    "统一入口只能通过专用安全切换事务修改；普通设置不会暂存核心、应用系统代理或提交入口",
                 ));
             }
+            // Settings preview is pure and must never contact a user-entered
+            // port. Exact ownership is checked only inside the separately
+            // consented entry-switch transaction; startup also re-checks it.
             let current_active = self
                 .routing_engine
                 .lock()
@@ -1218,6 +1225,9 @@ impl AppState {
         let candidate = draft
             .private_candidate(&current)
             .map_err(|_| "设置候选在提交前校验失败".to_string())?;
+        if candidate.entry != current.entry {
+            return Err("统一入口只能通过专用安全切换事务修改；普通设置已拒绝该变更".into());
+        }
         let current_active = self
             .routing_engine
             .lock()
@@ -3322,16 +3332,16 @@ mod tests {
         ));
         drop(default_route);
 
-        let reference = InstallationReference {
-            schema_version: 1,
-            install_id: "install-a".into(),
-            helper_enabled: true,
-            program_data_root: install_root,
-            client_secret_ref: "helper.install-a.protocol".into(),
-        };
         fs::write(
             data.join("helper-installation.json"),
-            serde_json::to_vec(&reference).expect("reference json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "install_id": "install-a",
+                "helper_enabled": true,
+                "program_data_root": install_root,
+                "client_secret_ref": "helper.install-a.protocol",
+            }))
+            .expect("reference json"),
         )
         .expect("reference");
         let store = TestSecretStore::default();
@@ -4147,7 +4157,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     }
 
     #[test]
-    fn occupied_random_entry_is_rejected_without_stopping_unknown_listener() {
+    fn settings_preview_never_contacts_a_user_entered_port() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
         let state = AppState::new_for_test(workspace_root, directory.path());
@@ -4180,9 +4190,14 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             preview
                 .issues
                 .iter()
-                .any(|issue| issue.code == "entry_port_occupied")
+                .any(|issue| issue.code == "dedicated_entry_switch_required")
         );
-        assert!(TcpStream::connect(lease.address()).is_ok());
+        lease.listener.set_nonblocking(true).expect("nonblocking");
+        assert_eq!(
+            lease.listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "preview must not connect to or probe the candidate entry"
+        );
     }
 
     #[test]
