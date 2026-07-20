@@ -6,10 +6,11 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::RouteMode;
+use crate::{RouteMode, UdpCapabilityEvidence, UdpCapabilityStatus, current_udp_status};
 
 pub const CURRENT_CONFIG_VERSION: u32 = 1;
 pub const MASTER_SELECTOR: &str = "VPN-HUB-MASTER";
+pub const UDP_SELECTOR: &str = "VPN-HUB-UDP";
 pub const FAIL_CLOSED_PROXY: &str = "REJECT";
 const DEFAULT_ENTRY_PORT: u16 = 3_666;
 const LEGACY_SUBSCRIPTION_ID: &str = "subscription-a";
@@ -18,6 +19,7 @@ const LEGACY_SECRET_REF: &str = "legacy.subscription-a";
 const RESERVED_OUTLET_IDS: [&str; 1] = ["fail-closed"];
 
 pub type ResolvedSubscriptionUrls = BTreeMap<String, String>;
+pub type UdpCapabilityMap = BTreeMap<String, UdpCapabilityEvidence>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -147,6 +149,7 @@ pub struct RuntimeConfigSummary {
     pub controller_port: u16,
     pub enabled_outlet_count: usize,
     pub configured_subscription_count: usize,
+    pub udp_supported_outlet_count: usize,
     pub has_direct_fallback: bool,
 }
 
@@ -613,15 +616,79 @@ pub fn generate_mihomo_config(
     resolved_subscriptions: &ResolvedSubscriptionUrls,
     controller_secret: &str,
 ) -> Result<(String, RuntimeConfigSummary), PrivateConfigError> {
+    generate_mihomo_config_with_udp_capabilities(
+        config,
+        resolved_subscriptions,
+        controller_secret,
+        &UdpCapabilityMap::new(),
+    )
+}
+
+/// Generates a dynamic fail-closed Mihomo config with an independently
+/// constrained UDP selector. Unknown and TCP-only outlets are never UDP
+/// candidates.
+///
+/// # Errors
+///
+/// Returns a sanitized validation or generation failure.
+#[allow(clippy::too_many_lines)]
+pub fn generate_mihomo_config_with_udp_capabilities(
+    config: &PrivateRoutingConfig,
+    resolved_subscriptions: &ResolvedSubscriptionUrls,
+    controller_secret: &str,
+    udp_capabilities: &UdpCapabilityMap,
+) -> Result<(String, RuntimeConfigSummary), PrivateConfigError> {
+    generate_mihomo_config_document(
+        config,
+        resolved_subscriptions,
+        controller_secret,
+        udp_capabilities,
+    )
+}
+
+/// Generates the complete candidate groups on a caller-owned temporary
+/// loopback entry. Callers explicitly select fail-closed members before
+/// reloading the same groups onto the configured product entry.
+///
+/// # Errors
+///
+/// Returns a sanitized validation or generation failure.
+pub fn generate_mihomo_startup_config(
+    config: &PrivateRoutingConfig,
+    resolved_subscriptions: &ResolvedSubscriptionUrls,
+    controller_secret: &str,
+    udp_capabilities: &UdpCapabilityMap,
+    startup_entry_port: u16,
+) -> Result<(String, RuntimeConfigSummary), PrivateConfigError> {
+    let mut startup = config.clone();
+    startup.entry.port = startup_entry_port;
+    generate_mihomo_config_document(
+        &startup,
+        resolved_subscriptions,
+        controller_secret,
+        udp_capabilities,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn generate_mihomo_config_document(
+    config: &PrivateRoutingConfig,
+    resolved_subscriptions: &ResolvedSubscriptionUrls,
+    controller_secret: &str,
+    udp_capabilities: &UdpCapabilityMap,
+) -> Result<(String, RuntimeConfigSummary), PrivateConfigError> {
     config.validate()?;
     let mut providers = BTreeMap::new();
     let mut proxies = Vec::new();
     let mut groups = Vec::new();
     let mut master_proxies = vec![FAIL_CLOSED_PROXY.to_owned()];
+    let mut udp_proxies = Vec::new();
     let mut configured_subscription_count = 0;
 
     for outlet in config.enabled_outlets() {
         let proxy_name = outlet_proxy_name(&outlet.id);
+        let udp_supported = current_udp_status(outlet, udp_capabilities.get(&outlet.id))
+            == UdpCapabilityStatus::Supported;
         match &outlet.kind {
             OutletKind::Subscription {
                 secret_ref,
@@ -671,9 +738,12 @@ pub fn generate_mihomo_config(
                     },
                     server: address.ip().to_string(),
                     port: address.port(),
-                    udp: false,
+                    udp: udp_supported,
                 });
             }
+        }
+        if udp_supported {
+            udp_proxies.push(proxy_name.clone());
         }
         master_proxies.push(proxy_name);
     }
@@ -681,6 +751,17 @@ pub fn generate_mihomo_config(
         name: MASTER_SELECTOR.into(),
         group_type: "select".into(),
         proxies: master_proxies,
+        use_providers: Vec::new(),
+        url: None,
+        interval: None,
+        tolerance: None,
+        lazy: None,
+    });
+    udp_proxies.push(FAIL_CLOSED_PROXY.to_owned());
+    groups.push(ProxyGroup {
+        name: UDP_SELECTOR.into(),
+        group_type: "select".into(),
+        proxies: udp_proxies.clone(),
         use_providers: Vec::new(),
         url: None,
         interval: None,
@@ -701,13 +782,16 @@ pub fn generate_mihomo_config(
         external_controller: format!("127.0.0.1:{}", config.controller_port),
         secret: controller_secret.into(),
         profile: ProfileConfig {
-            store_selected: false,
+            store_selected: true,
             store_fake_ip: false,
         },
         proxies,
         proxy_providers: providers,
         proxy_groups: groups,
-        rules: vec![format!("MATCH,{MASTER_SELECTOR}")],
+        rules: vec![
+            format!("NETWORK,UDP,{UDP_SELECTOR}"),
+            format!("MATCH,{MASTER_SELECTOR}"),
+        ],
     };
     let yaml = serde_yaml::to_string(&document).map_err(|_| PrivateConfigError::Generate)?;
     Ok((
@@ -717,6 +801,7 @@ pub fn generate_mihomo_config(
             controller_port: config.controller_port,
             enabled_outlet_count: config.enabled_outlets().count(),
             configured_subscription_count,
+            udp_supported_outlet_count: udp_proxies.len().saturating_sub(1),
             has_direct_fallback: false,
         },
     ))
@@ -785,20 +870,26 @@ fn validate_outlet_id(id: &str) -> Result<(), PrivateConfigError> {
     Ok(())
 }
 
-fn parse_loopback(value: &str, field: &str) -> Result<IpAddr, PrivateConfigError> {
+/// Normalizes an explicitly local host without invoking DNS. `localhost`
+/// always maps to IPv4 loopback; IP literals retain their address family.
+#[must_use]
+pub fn normalize_loopback_host(value: &str) -> Option<IpAddr> {
     let ip = if value.eq_ignore_ascii_case("localhost") {
         IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    } else if let Some(literal) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        IpAddr::V6(literal.parse::<std::net::Ipv6Addr>().ok()?)
     } else {
-        value
-            .parse::<IpAddr>()
-            .map_err(|_| PrivateConfigError::Invalid(format!("{field} must be loopback")))?
+        value.parse::<IpAddr>().ok()?
     };
-    if !ip.is_loopback() {
-        return Err(PrivateConfigError::Invalid(format!(
-            "{field} must be loopback"
-        )));
-    }
-    Ok(ip)
+    ip.is_loopback().then_some(ip)
+}
+
+fn parse_loopback(value: &str, field: &str) -> Result<IpAddr, PrivateConfigError> {
+    normalize_loopback_host(value)
+        .ok_or_else(|| PrivateConfigError::Invalid(format!("{field} must be loopback")))
 }
 
 fn parse_local_proxy_endpoint(
@@ -1023,6 +1114,36 @@ mod tests {
     }
 
     #[test]
+    fn loopback_host_normalization_is_explicit_and_dns_free() {
+        assert_eq!(
+            normalize_loopback_host("localhost"),
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            normalize_loopback_host("LOCALHOST"),
+            Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        );
+        assert_eq!(
+            normalize_loopback_host("127.0.0.2"),
+            Some("127.0.0.2".parse().expect("IPv4 loopback"))
+        );
+        assert_eq!(
+            normalize_loopback_host("::1"),
+            Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(
+            normalize_loopback_host("[::1]"),
+            Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        );
+        for rejected in ["0.0.0.0", "::", "192.0.2.1", "example.invalid"] {
+            assert_eq!(normalize_loopback_host(rejected), None);
+        }
+        for malformed in ["[localhost]", "[127.0.0.1]", "[::1", "::1]"] {
+            assert_eq!(normalize_loopback_host(malformed), None);
+        }
+    }
+
+    #[test]
     fn rejects_remote_duplicate_and_recursive_local_endpoints() {
         let mut config = PrivateRoutingConfig {
             outlets: vec![local("local-a", "socks5://192.0.2.1:2666", true)],
@@ -1203,5 +1324,161 @@ probe_targets = ["https://a.invalid/", "https://b.invalid/"]
         assert!(!yaml.contains("VPN-HUB-OUTLET-sub-a"));
         assert!(yaml.contains("REJECT"));
         assert_eq!(summary.configured_subscription_count, 0);
+        let document = serde_yaml::from_str::<serde_yaml::Value>(&yaml).expect("runtime yaml");
+        let udp_candidates = document
+            .get("proxy-groups")
+            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(|groups| {
+                groups.iter().find(|group| {
+                    group.get("name").and_then(serde_yaml::Value::as_str) == Some(UDP_SELECTOR)
+                })
+            })
+            .and_then(|group| group.get("proxies"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("UDP candidates");
+        assert_eq!(
+            udp_candidates
+                .iter()
+                .filter_map(serde_yaml::Value::as_str)
+                .collect::<Vec<_>>(),
+            [FAIL_CLOSED_PROXY]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn udp_selector_contains_only_evidence_backed_supported_outlets() {
+        let config = PrivateRoutingConfig {
+            entry: EntryConfig {
+                host: "127.0.0.1".into(),
+                port: 4_567,
+            },
+            outlets: vec![
+                subscription("sub-supported", "secret.supported"),
+                subscription("sub-unknown", "secret.unknown"),
+                local("local-tcp-only", "socks5://127.0.0.1:2666", true),
+                local("local-supported", "socks5://127.0.0.1:4666", true),
+            ],
+            ..PrivateRoutingConfig::default()
+        };
+        let resolved = [
+            (
+                "secret.supported".into(),
+                "https://supported.invalid/provider".into(),
+            ),
+            (
+                "secret.unknown".into(),
+                "https://unknown.invalid/provider".into(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let capabilities = config
+            .outlets
+            .iter()
+            .map(|outlet| {
+                let status = match outlet.id.as_str() {
+                    "sub-supported" | "local-supported" => UdpCapabilityStatus::Supported,
+                    "local-tcp-only" => UdpCapabilityStatus::TcpOnly,
+                    _ => UdpCapabilityStatus::Unknown,
+                };
+                let mut evidence = crate::unknown_udp_evidence(outlet, "test");
+                evidence.status = status;
+                (outlet.id.clone(), evidence)
+            })
+            .collect();
+        let (yaml, summary) = generate_mihomo_config_with_udp_capabilities(
+            &config,
+            &resolved,
+            "test-secret",
+            &capabilities,
+        )
+        .expect("config");
+        let document = serde_yaml::from_str::<serde_yaml::Value>(&yaml).expect("runtime yaml");
+        let groups = document
+            .get("proxy-groups")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("groups");
+        let udp_group = groups
+            .iter()
+            .find(|group| {
+                group.get("name").and_then(serde_yaml::Value::as_str) == Some(UDP_SELECTOR)
+            })
+            .expect("UDP group");
+        let udp_candidates = udp_group
+            .get("proxies")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("UDP candidates")
+            .iter()
+            .filter_map(serde_yaml::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            udp_candidates,
+            [
+                "VPN-HUB-OUTLET-sub-supported",
+                "VPN-HUB-OUTLET-local-supported",
+                FAIL_CLOSED_PROXY
+            ]
+        );
+        assert_eq!(
+            document
+                .get("rules")
+                .and_then(serde_yaml::Value::as_sequence)
+                .and_then(|rules| rules.first())
+                .and_then(serde_yaml::Value::as_str),
+            Some("NETWORK,UDP,VPN-HUB-UDP")
+        );
+        assert!(!yaml.contains("DIRECT"));
+        assert_eq!(summary.udp_supported_outlet_count, 2);
+        let proxies = document
+            .get("proxies")
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("local proxies");
+        assert_eq!(
+            proxies
+                .iter()
+                .find(|proxy| {
+                    proxy.get("name").and_then(serde_yaml::Value::as_str)
+                        == Some("VPN-HUB-OUTLET-local-tcp-only")
+                })
+                .and_then(|proxy| proxy.get("udp"))
+                .and_then(serde_yaml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            proxies
+                .iter()
+                .find(|proxy| {
+                    proxy.get("name").and_then(serde_yaml::Value::as_str)
+                        == Some("VPN-HUB-OUTLET-local-supported")
+                })
+                .and_then(|proxy| proxy.get("udp"))
+                .and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+        let (startup_yaml, startup_summary) =
+            generate_mihomo_startup_config(&config, &resolved, "test-secret", &capabilities, 4_568)
+                .expect("startup config");
+        let startup_document =
+            serde_yaml::from_str::<serde_yaml::Value>(&startup_yaml).expect("startup yaml");
+        assert_eq!(
+            startup_document.get("proxy-groups"),
+            document.get("proxy-groups"),
+            "startup and runtime group membership must be identical so REJECT selection survives reload"
+        );
+        assert_eq!(
+            startup_document
+                .get("mixed-port")
+                .and_then(serde_yaml::Value::as_u64),
+            Some(4_568)
+        );
+        assert_eq!(
+            startup_document
+                .get("profile")
+                .and_then(|profile| profile.get("store-selected"))
+                .and_then(serde_yaml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(startup_summary.entry.port, 4_568);
     }
 }

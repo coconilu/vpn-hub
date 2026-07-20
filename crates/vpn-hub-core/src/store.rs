@@ -5,8 +5,10 @@ use thiserror::Error;
 
 use crate::{
     HealthStatus, LatencySample, OutletSummary, ProbeOutletConfig, ProbeResult, RouteSwitchEvent,
-    StateEvent,
+    StateEvent, UdpCapabilityEvidence, UdpCapabilityStatus,
 };
+
+const CURRENT_DATABASE_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -16,6 +18,12 @@ pub enum StoreError {
     Database(#[from] rusqlite::Error),
     #[error("invalid stored status: {0}")]
     InvalidStatus(String),
+    #[error("invalid stored UDP capability: {0}")]
+    InvalidUdpCapability(String),
+    #[error("UDP configuration generation is outside the supported SQLite integer range")]
+    InvalidUdpGeneration,
+    #[error("database version {0} is newer than this application supports")]
+    UnsupportedDatabaseVersion(i64),
 }
 
 pub struct GuardianStore {
@@ -49,10 +57,15 @@ impl GuardianStore {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, StoreError> {
+    fn from_connection(mut connection: Connection) -> Result<Self, StoreError> {
+        let user_version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if user_version > CURRENT_DATABASE_VERSION {
+            return Err(StoreError::UnsupportedDatabaseVersion(user_version));
+        }
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
             r"
             CREATE TABLE IF NOT EXISTS outlets (
                 id TEXT PRIMARY KEY,
@@ -101,17 +114,36 @@ impl GuardianStore {
             );
             CREATE INDEX IF NOT EXISTS idx_route_switches_time
                 ON route_switches(occurred_at DESC);
+            CREATE TABLE IF NOT EXISTS udp_capability_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                outlet_id TEXT NOT NULL REFERENCES outlets(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                evidence_version INTEGER NOT NULL,
+                probe_version TEXT NOT NULL,
+                model_version INTEGER NOT NULL,
+                configuration_fingerprint TEXT NOT NULL,
+                configuration_generation INTEGER NOT NULL,
+                reason_code TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_udp_capability_history_outlet_time
+                ON udp_capability_history(outlet_id, observed_at DESC);
+            CREATE TABLE IF NOT EXISTS udp_capability_current (
+                outlet_id TEXT PRIMARY KEY REFERENCES outlets(id) ON DELETE CASCADE,
+                history_id INTEGER NOT NULL REFERENCES udp_capability_history(id) ON DELETE CASCADE
+            );
             ",
         )?;
-        ensure_probe_column(&connection, "port_reachable", "INTEGER NOT NULL DEFAULT 0")?;
-        ensure_probe_column(&connection, "http_status", "INTEGER")?;
+        ensure_probe_column(&transaction, "port_reachable", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_probe_column(&transaction, "http_status", "INTEGER")?;
         ensure_probe_column(
-            &connection,
+            &transaction,
             "successful_targets",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
-        ensure_probe_column(&connection, "total_targets", "INTEGER NOT NULL DEFAULT 1")?;
-        connection.pragma_update(None, "user_version", 2_i64)?;
+        ensure_probe_column(&transaction, "total_targets", "INTEGER NOT NULL DEFAULT 1")?;
+        transaction.pragma_update(None, "user_version", CURRENT_DATABASE_VERSION)?;
+        transaction.commit()?;
         Ok(Self { connection })
     }
 
@@ -416,10 +448,161 @@ impl GuardianStore {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
+
+    /// Persists a sanitized, versioned UDP capability conclusion and updates
+    /// the current summary without changing the independent TCP health state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the evidence transaction cannot be committed.
+    pub fn record_udp_capability(
+        &mut self,
+        outlet_id: &str,
+        label: &str,
+        evidence: &UdpCapabilityEvidence,
+    ) -> Result<(), StoreError> {
+        let configuration_generation = i64::try_from(evidence.configuration_generation)
+            .ok()
+            .filter(|generation| *generation != i64::MAX)
+            .ok_or(StoreError::InvalidUdpGeneration)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            r"INSERT INTO outlets(id, label, updated_at) VALUES (?1, ?2, ?3)
+               ON CONFLICT(id) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at",
+            params![outlet_id, label, evidence.observed_at],
+        )?;
+        transaction.execute(
+            "INSERT INTO udp_capability_history(outlet_id, status, observed_at, evidence_version, probe_version, model_version, configuration_fingerprint, configuration_generation, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                outlet_id,
+                evidence.status.as_str(),
+                evidence.observed_at,
+                evidence.evidence_version,
+                evidence.probe_version,
+                evidence.model_version,
+                evidence.configuration_fingerprint,
+                configuration_generation,
+                evidence.reason_code,
+            ],
+        )?;
+        let history_id = transaction.last_insert_rowid();
+        transaction.execute(
+            r"INSERT INTO udp_capability_current(outlet_id, history_id) VALUES (?1, ?2)
+               ON CONFLICT(outlet_id) DO UPDATE SET history_id=excluded.history_id",
+            params![outlet_id, history_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Creates the initial auditable unknown conclusion when an outlet has no
+    /// UDP evidence yet. Existing conclusions and history are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current summary cannot be checked or written.
+    pub fn ensure_udp_capability(
+        &mut self,
+        outlet_id: &str,
+        label: &str,
+        evidence: &UdpCapabilityEvidence,
+    ) -> Result<(), StoreError> {
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM udp_capability_current WHERE outlet_id=?1)",
+            [outlet_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            self.record_udp_capability(outlet_id, label, evidence)?;
+        }
+        Ok(())
+    }
+
+    /// Returns the newest UDP conclusion for every outlet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored evidence cannot be queried or decoded.
+    pub fn udp_capabilities(&self) -> Result<Vec<UdpCapabilityEvidence>, StoreError> {
+        let mut statement = self.connection.prepare(
+            r"SELECT h.outlet_id, h.status, h.observed_at, h.evidence_version,
+                     h.probe_version, h.model_version, h.configuration_fingerprint,
+                     h.configuration_generation, h.reason_code
+              FROM udp_capability_current c
+              JOIN udp_capability_history h ON h.id = c.history_id
+              ORDER BY h.outlet_id",
+        )?;
+        let rows = statement.query_map([], read_udp_capability_row)?;
+        rows.map(|row| decode_udp_capability(row?)).collect()
+    }
+
+    /// Returns append-only UDP evidence for one outlet, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored evidence cannot be queried or decoded.
+    pub fn udp_capability_history(
+        &self,
+        outlet_id: &str,
+        limit: u32,
+    ) -> Result<Vec<UdpCapabilityEvidence>, StoreError> {
+        let mut statement = self.connection.prepare(
+            r"SELECT outlet_id, status, observed_at, evidence_version,
+                     probe_version, model_version, configuration_fingerprint,
+                     configuration_generation, reason_code
+              FROM udp_capability_history
+              WHERE outlet_id=?1
+              ORDER BY id DESC
+              LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![outlet_id, limit], read_udp_capability_row)?;
+        rows.map(|row| decode_udp_capability(row?)).collect()
+    }
+}
+
+type StoredUdpCapability = (
+    String,
+    String,
+    String,
+    u32,
+    String,
+    u32,
+    String,
+    i64,
+    String,
+);
+
+fn read_udp_capability_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredUdpCapability> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+    ))
+}
+
+fn decode_udp_capability(row: StoredUdpCapability) -> Result<UdpCapabilityEvidence, StoreError> {
+    Ok(UdpCapabilityEvidence {
+        outlet_id: row.0,
+        status: UdpCapabilityStatus::try_from(row.1.as_str())
+            .map_err(StoreError::InvalidUdpCapability)?,
+        observed_at: row.2,
+        evidence_version: row.3,
+        probe_version: row.4,
+        model_version: row.5,
+        configuration_fingerprint: row.6,
+        configuration_generation: u64::try_from(row.7).unwrap_or(u64::MAX),
+        reason_code: row.8,
+    })
 }
 
 fn ensure_probe_column(
-    connection: &Connection,
+    connection: &rusqlite::Transaction<'_>,
     column_name: &str,
     definition: &str,
 ) -> Result<(), rusqlite::Error> {
@@ -472,6 +655,7 @@ fn next_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     fn outlet() -> ProbeOutletConfig {
         ProbeOutletConfig {
@@ -586,5 +770,321 @@ mod tests {
             store.recent_route_switches(1).expect("list")[0].reason,
             "priority_policy"
         );
+    }
+
+    #[test]
+    fn udp_current_summary_updates_without_losing_audit_history_or_tcp_state() {
+        let mut store = GuardianStore::open_in_memory().expect("store");
+        let outlet = outlet();
+        store
+            .record_probe(
+                &outlet,
+                &result(HealthStatus::Healthy, "2026-01-01T00:00:00Z"),
+                2,
+                3,
+            )
+            .expect("TCP probe");
+        for (status, observed_at, reason_code) in [
+            (
+                UdpCapabilityStatus::Unknown,
+                "2026-01-01T00:00:01Z",
+                "not_yet_validated",
+            ),
+            (
+                UdpCapabilityStatus::TcpOnly,
+                "2026-01-01T00:00:02Z",
+                "socks5_udp_associate_rejected",
+            ),
+            (
+                UdpCapabilityStatus::Supported,
+                "2026-01-01T00:00:03Z",
+                "controlled_udp_echo_succeeded",
+            ),
+        ] {
+            store
+                .record_udp_capability(
+                    "a",
+                    "A",
+                    &UdpCapabilityEvidence {
+                        outlet_id: "a".into(),
+                        status,
+                        observed_at: observed_at.into(),
+                        evidence_version: 1,
+                        probe_version: "test-probe-v1".into(),
+                        model_version: 1,
+                        configuration_fingerprint: "test-fingerprint".into(),
+                        configuration_generation: 1,
+                        reason_code: reason_code.into(),
+                    },
+                )
+                .expect("record UDP evidence");
+        }
+
+        let current = store.udp_capabilities().expect("current");
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].status, UdpCapabilityStatus::Supported);
+        let history = store.udp_capability_history("a", 10).expect("history");
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].status, UdpCapabilityStatus::Supported);
+        assert_eq!(history[2].status, UdpCapabilityStatus::Unknown);
+        assert_eq!(
+            store.summaries().expect("TCP summary")[0].last_status,
+            HealthStatus::Healthy,
+            "UDP evidence must not alter Guardian TCP health"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn high_bit_configuration_survives_restart_for_generator_and_guardian_selector() {
+        let outlet = (10_000..u16::MAX)
+            .map(|port| crate::OutletConfig {
+                id: "high-bit-local".into(),
+                label: "High bit local".into(),
+                enabled: true,
+                kind: crate::OutletKind::LocalProxy {
+                    endpoint: format!("socks5://127.0.0.1:{port}"),
+                },
+            })
+            .find(|candidate| {
+                let digest = Sha256::digest(serde_json::to_vec(candidate).expect("serialize"));
+                digest[0] & 0x80 != 0
+            })
+            .expect("a high-bit SHA-256 fixture");
+        let raw_digest = Sha256::digest(serde_json::to_vec(&outlet).expect("serialize"));
+        assert_ne!(raw_digest[0] & 0x80, 0, "fixture must exercise high bit");
+
+        let mut evidence = crate::unknown_udp_evidence(&outlet, "test");
+        evidence.status = UdpCapabilityStatus::Supported;
+        assert!(i64::try_from(evidence.configuration_generation).is_ok());
+        assert_ne!(evidence.configuration_generation, i64::MAX as u64);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("guardian.db");
+        {
+            let mut store = GuardianStore::open(&path).expect("create store");
+            store
+                .record_udp_capability(&outlet.id, &outlet.label, &evidence)
+                .expect("persist supported evidence");
+        }
+
+        let store = GuardianStore::open(&path).expect("restart store");
+        let restored = store.udp_capabilities().expect("restored evidence");
+        assert_eq!(
+            restored[0].configuration_generation,
+            evidence.configuration_generation
+        );
+        assert_eq!(
+            crate::current_udp_status(&outlet, restored.first()),
+            UdpCapabilityStatus::Supported
+        );
+        let mut config = crate::PrivateRoutingConfig::default();
+        config.entry = crate::EntryConfig {
+            host: "127.0.0.1".into(),
+            port: 45_123,
+        };
+        config.controller_port = 45_124;
+        config.outlets = vec![outlet.clone()];
+        let capabilities = restored
+            .iter()
+            .map(|item| (item.outlet_id.clone(), item.clone()))
+            .collect();
+        let (yaml, _) = crate::generate_mihomo_config_with_udp_capabilities(
+            &config,
+            &crate::ResolvedSubscriptionUrls::new(),
+            "test-secret",
+            &capabilities,
+        )
+        .expect("generate after restart");
+        let document = serde_yaml::from_str::<serde_yaml::Value>(&yaml).expect("runtime yaml");
+        let udp_candidates = document
+            .get("proxy-groups")
+            .and_then(serde_yaml::Value::as_sequence)
+            .and_then(|groups| {
+                groups.iter().find(|group| {
+                    group.get("name").and_then(serde_yaml::Value::as_str)
+                        == Some(crate::UDP_SELECTOR)
+                })
+            })
+            .and_then(|group| group.get("proxies"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .expect("UDP selector candidates")
+            .iter()
+            .filter_map(serde_yaml::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            udp_candidates,
+            [
+                crate::outlet_proxy_name(&outlet.id),
+                crate::FAIL_CLOSED_PROXY.into()
+            ]
+        );
+        assert_eq!(
+            crate::guardian_cycle::udp_selector_target(&config, Some(&outlet.id), &restored),
+            crate::outlet_proxy_name(&outlet.id)
+        );
+        drop(store);
+
+        let connection = Connection::open(&path).expect("open legacy-clamped evidence");
+        connection
+            .execute(
+                "UPDATE udp_capability_history SET configuration_generation=?1",
+                [i64::MAX],
+            )
+            .expect("seed previously clamped generation");
+        drop(connection);
+        let store = GuardianStore::open(&path).expect("restart legacy-clamped store");
+        let clamped = store.udp_capabilities().expect("clamped evidence");
+        assert_eq!(clamped[0].configuration_generation, i64::MAX as u64);
+        assert_eq!(
+            crate::current_udp_status(&outlet, clamped.first()),
+            UdpCapabilityStatus::Unknown
+        );
+        assert_eq!(
+            crate::guardian_cycle::udp_selector_target(&config, Some(&outlet.id), &clamped),
+            crate::FAIL_CLOSED_PROXY
+        );
+    }
+
+    #[test]
+    fn migrates_v2_to_v3_transactionally_without_losing_existing_probe_data() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("guardian.db");
+        {
+            let connection = Connection::open(&path).expect("v2 database");
+            connection
+                .execute_batch(
+                    r"
+                    CREATE TABLE outlets (id TEXT PRIMARY KEY, label TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE probe_samples (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        outlet_id TEXT NOT NULL,
+                        observed_at TEXT NOT NULL,
+                        port_reachable INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL,
+                        http_status INTEGER,
+                        latency_ms INTEGER,
+                        error_code TEXT,
+                        successful_targets INTEGER NOT NULL DEFAULT 0,
+                        total_targets INTEGER NOT NULL DEFAULT 1
+                    );
+                    CREATE TABLE outlet_state (
+                        outlet_id TEXT PRIMARY KEY,
+                        status TEXT NOT NULL,
+                        consecutive_successes INTEGER NOT NULL,
+                        consecutive_failures INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO outlets VALUES ('legacy-a', 'Legacy A', '2026-01-01T00:00:00Z');
+                    INSERT INTO probe_samples(outlet_id, observed_at, port_reachable, status, latency_ms, successful_targets, total_targets)
+                    VALUES ('legacy-a', '2026-01-01T00:00:00Z', 1, 'healthy', 42, 2, 2);
+                    INSERT INTO outlet_state VALUES ('legacy-a', 'healthy', 1, 0, '2026-01-01T00:00:00Z');
+                    PRAGMA user_version=2;
+                    ",
+                )
+                .expect("seed v2");
+        }
+
+        let store = GuardianStore::open(&path).expect("migrate v2");
+        assert_eq!(
+            store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("version"),
+            3
+        );
+        let summaries = store.summaries().expect("preserved summaries");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].outlet_id, "legacy-a");
+        assert_eq!(summaries[0].samples, 1);
+        assert_eq!(summaries[0].average_latency_ms, Some(42.0));
+    }
+
+    #[test]
+    fn failed_v2_migration_rolls_back_schema_and_user_version() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("guardian.db");
+        {
+            let connection = Connection::open(&path).expect("v2 database");
+            connection
+                .execute_batch(
+                    r"
+                    CREATE TABLE sentinel(value TEXT NOT NULL);
+                    INSERT INTO sentinel VALUES ('preserve-me');
+                    CREATE VIEW udp_capability_history AS SELECT value FROM sentinel;
+                    PRAGMA user_version=2;
+                    ",
+                )
+                .expect("seed broken v2");
+        }
+        assert!(matches!(
+            GuardianStore::open(&path),
+            Err(StoreError::Database(_))
+        ));
+        let connection = Connection::open(&path).expect("reopen rolled back database");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("version"),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM sentinel", [], |row| row
+                    .get::<_, String>(0))
+                .expect("sentinel"),
+            "preserve-me"
+        );
+        let current_exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='udp_capability_current')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("schema check");
+        assert!(!current_exists);
+    }
+
+    #[test]
+    fn future_database_version_is_rejected_without_any_mutation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("guardian.db");
+        {
+            let connection = Connection::open(&path).expect("future database");
+            connection
+                .execute_batch(
+                    r"
+                    CREATE TABLE sentinel(value TEXT NOT NULL);
+                    INSERT INTO sentinel VALUES ('future-data');
+                    PRAGMA user_version=99;
+                    ",
+                )
+                .expect("seed future database");
+        }
+        assert!(matches!(
+            GuardianStore::open(&path),
+            Err(StoreError::UnsupportedDatabaseVersion(99))
+        ));
+        let connection = Connection::open(&path).expect("reopen future database");
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("version"),
+            99
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM sentinel", [], |row| row
+                    .get::<_, String>(0))
+                .expect("sentinel"),
+            "future-data"
+        );
+        let outlets_exists = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='outlets')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("schema check");
+        assert!(!outlets_exists);
     }
 }

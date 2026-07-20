@@ -9,7 +9,8 @@ use thiserror::Error;
 use crate::{
     ControllerClient, ControllerError, GuardianStore, HealthStatus, MonitorConfig, OutletConfig,
     OutletHealth, OutletKind, PrivateRoutingConfig, ProbeOutletConfig, ProbeResult, RouteDecision,
-    RouteSwitchEvent, RoutingEngine, RoutingPolicy, StoreError, outlet_proxy_name,
+    RouteSwitchEvent, RoutingEngine, RoutingPolicy, StoreError, UDP_SELECTOR, UdpCapabilityStatus,
+    current_udp_status, outlet_proxy_name, unknown_udp_evidence,
 };
 
 #[derive(Debug, Error)]
@@ -19,6 +20,13 @@ pub enum RoutingStateError {
 }
 
 pub trait RoutingSession {
+    /// Returns the currently applied outlet, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session state cannot be read.
+    fn current_outlet(&self) -> Result<Option<String>, RoutingStateError>;
+
     /// Evaluates the next route without mutating session state.
     ///
     /// # Errors
@@ -40,6 +48,12 @@ pub trait RoutingSession {
 }
 
 impl RoutingSession for std::sync::Mutex<RoutingEngine> {
+    fn current_outlet(&self) -> Result<Option<String>, RoutingStateError> {
+        self.lock()
+            .map_err(|_| RoutingStateError::Unavailable)
+            .map(|engine| engine.current_outlet().map(str::to_owned))
+    }
+
     fn evaluate_route(
         &self,
         now_ms: u64,
@@ -85,6 +99,7 @@ pub struct GuardianCycleOutcome {
 /// # Errors
 ///
 /// Returns sanitized Controller, `SQLite`, or routing-state failures.
+#[allow(clippy::too_many_lines)]
 pub async fn run_controller_guardian_cycle(
     controller: &ControllerClient,
     private: &PrivateRoutingConfig,
@@ -94,6 +109,13 @@ pub async fn run_controller_guardian_cycle(
     routing: &impl RoutingSession,
     now_ms: u64,
 ) -> Result<GuardianCycleOutcome, GuardianCycleError> {
+    for outlet in private.enabled_outlets() {
+        store.ensure_udp_capability(
+            &outlet.id,
+            &outlet.label,
+            &unknown_udp_evidence(outlet, "not_yet_validated"),
+        )?;
+    }
     let observed =
         probe_configured_outlets(controller, private, resolved, monitor.request_timeout_ms).await;
 
@@ -138,14 +160,28 @@ pub async fn run_controller_guardian_cycle(
         minimum_improvement_ms: private.minimum_improvement_ms,
     };
     let decision = routing.evaluate_route(now_ms, &health, &policy)?;
+    let started = Instant::now();
     if let Some(decision) = &decision {
-        let started = Instant::now();
         controller
             .select(
                 crate::MASTER_SELECTOR,
                 &outlet_proxy_name(&decision.to_outlet),
             )
             .await?;
+    }
+    let selected_outlet = decision
+        .as_ref()
+        .map(|decision| decision.to_outlet.clone())
+        .or(routing.current_outlet()?);
+    let udp_capabilities = store.udp_capabilities()?;
+    let udp_target = udp_selector_target(private, selected_outlet.as_deref(), &udp_capabilities);
+    if let Err(error) = controller.select(UDP_SELECTOR, &udp_target).await {
+        let _ = controller
+            .select(UDP_SELECTOR, crate::FAIL_CLOSED_PROXY)
+            .await;
+        return Err(error.into());
+    }
+    if let Some(decision) = &decision {
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         routing.apply_route(decision, now_ms)?;
         store.record_route_switch(&RouteSwitchEvent {
@@ -162,6 +198,33 @@ pub async fn run_controller_guardian_cycle(
         observed: observed.into_iter().map(|(_, result)| result).collect(),
         decision,
     })
+}
+
+pub(crate) fn udp_selector_target(
+    private: &PrivateRoutingConfig,
+    selected_outlet: Option<&str>,
+    udp_capabilities: &[crate::UdpCapabilityEvidence],
+) -> String {
+    let Some(selected_outlet) = selected_outlet else {
+        return crate::FAIL_CLOSED_PROXY.to_string();
+    };
+    let supported = private
+        .outlets
+        .iter()
+        .find(|outlet| outlet.id == selected_outlet)
+        .is_some_and(|outlet| {
+            current_udp_status(
+                outlet,
+                udp_capabilities
+                    .iter()
+                    .find(|evidence| evidence.outlet_id == selected_outlet),
+            ) == UdpCapabilityStatus::Supported
+        });
+    if supported {
+        outlet_proxy_name(selected_outlet)
+    } else {
+        crate::FAIL_CLOSED_PROXY.to_string()
+    }
 }
 
 async fn probe_configured_outlets(
@@ -199,21 +262,7 @@ async fn probe_controller_outlet(
     let proxy_name = outlet_proxy_name(&outlet.id);
     let mut delays = Vec::new();
     for target in targets {
-        let delay = match &outlet.kind {
-            OutletKind::Subscription { .. } => {
-                controller
-                    .delay_selected_provider_member(
-                        &proxy_name,
-                        &format!("vpn-hub-provider-{}", outlet.id),
-                        target,
-                        timeout_ms,
-                    )
-                    .await
-            }
-            OutletKind::LocalProxy { .. } => {
-                controller.delay(&proxy_name, target, timeout_ms).await
-            }
-        };
+        let delay = controller.delay(&proxy_name, target, timeout_ms).await;
         if let Ok(delay) = delay {
             delays.push(delay);
         }

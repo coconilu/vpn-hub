@@ -20,6 +20,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_dashboard_snapshot,
             commands::refresh_guardian,
+            commands::revalidate_udp_capabilities,
             commands::set_route_mode,
             commands::list_subscription_credentials,
             commands::set_subscription_credential,

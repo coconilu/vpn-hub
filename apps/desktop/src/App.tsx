@@ -5,6 +5,7 @@ import { Sidebar, type ViewId } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
 import {
   getDashboardSnapshot,
+  revalidateUdpCapabilities,
   refreshGuardian,
   setRouteMode,
   startDevelopmentCore,
@@ -54,6 +55,13 @@ export default function App() {
     setNotice("多目标检测已完成；状态、延迟和真实切换已写入本机历史。");
   });
 
+  const handleUdpRevalidate = (authorizedSubscriptionTargets: string[]) => runBusy(async () => {
+    setSnapshot(await revalidateUdpCapabilities(authorizedSubscriptionTargets));
+    setNotice(authorizedSubscriptionTargets.length >= 2
+      ? "UDP 能力已重新验证；订阅目标仅用于本次端到端探测，不会写入配置、数据库或摘要。"
+      : "本地客户端 UDP 能力已重新验证；订阅出口因缺少至少两个获准目标而保持未知。");
+  });
+
   const handleCoreToggle = () => runBusy(async () => {
     if (!snapshot) return;
     if (snapshot.mihomo.state === "running") {
@@ -87,6 +95,7 @@ export default function App() {
             notice={notice}
             onModeChange={handleModeChange}
             onRefresh={handleRefresh}
+            onUdpRevalidate={handleUdpRevalidate}
             onCoreToggle={handleCoreToggle}
           />
         ) : (
