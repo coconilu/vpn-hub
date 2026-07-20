@@ -44,6 +44,10 @@ pub enum ConfigError {
     Read(#[from] std::io::Error),
     #[error("failed to parse config: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("failed to serialize config")]
+    Serialize,
+    #[error("failed to write config")]
+    Write,
     #[error("invalid config: {0}")]
     Invalid(String),
 }
@@ -65,6 +69,34 @@ impl GuardianConfig {
             config.database_path = parent.join(&config.database_path);
         }
         Ok(config)
+    }
+
+    /// Atomically saves an already validated Guardian configuration while
+    /// retaining an adjacent last-known-good copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized validation, serialization, or write failure.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
+        self.save_with_operations(path, &crate::SystemDurableFileOps)
+    }
+
+    /// Saves through an injectable durable I/O boundary. This is public so a
+    /// multi-file transaction can prove crash behavior at every persistence
+    /// barrier without changing the serialized format.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized validation, serialization, or write failure.
+    pub fn save_with_operations<O: crate::DurableFileOps + ?Sized>(
+        &self,
+        path: impl AsRef<Path>,
+        operations: &O,
+    ) -> Result<(), ConfigError> {
+        self.validate()?;
+        let content = toml::to_string_pretty(self).map_err(|_| ConfigError::Serialize)?;
+        crate::durable_atomic_save_with_backup(path.as_ref(), content.as_bytes(), operations)
+            .map_err(|_| ConfigError::Write)
     }
 
     /// Loads a standalone Guardian configuration that must contain at least

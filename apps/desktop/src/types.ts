@@ -171,3 +171,98 @@ export interface DashboardSnapshot {
 }
 
 export type RouteMode = "priority" | "fastest" | "manual";
+
+export type CredentialState = "configured" | "missing" | "unavailable" | "corrupted";
+export type LocalProxyProtocol = "http" | "socks5" | "socks5h";
+
+export type SettingsOutlet =
+  | {
+      kind: "subscription";
+      outlet_id: string;
+      label: string;
+      enabled: boolean;
+      provider_update_seconds: number;
+    }
+  | {
+      kind: "local_proxy";
+      outlet_id: string;
+      label: string;
+      enabled: boolean;
+      protocol: LocalProxyProtocol;
+      host: string;
+      port: number;
+    };
+
+export interface SettingsDraft {
+  entry: { host: string; port: number };
+  route_mode: RouteMode;
+  manual_outlet: string | null;
+  cooldown_seconds: number;
+  minimum_improvement_ms: number;
+  probe_targets: string[];
+  refresh_interval_seconds: number;
+  connect_timeout_ms: number;
+  request_timeout_ms: number;
+  failure_threshold: number;
+  recovery_threshold: number;
+  retention_days: number;
+  outlets: SettingsOutlet[];
+}
+
+export interface SafeSettingsView {
+  draft: SettingsDraft;
+  credentials: Array<{ subscription_id: string; state: CredentialState }>;
+}
+
+export interface ValidationIssue {
+  field: string;
+  code: string;
+  message: string;
+}
+
+export interface SettingsDiff {
+  changes: Array<{ code: string; summary: string }>;
+  runtime_changed: boolean;
+  monitor_changed: boolean;
+  retention_changed: boolean;
+}
+
+export interface SettingsPreview {
+  diff: SettingsDiff;
+  issues: ValidationIssue[];
+  can_apply: boolean;
+  request_fingerprint: string;
+}
+
+export interface CredentialMutationIntent {
+  subscription_id: string;
+  action: "set" | "delete";
+}
+
+export interface SettingsPreviewRequest {
+  draft: SettingsDraft;
+  credential_intents: CredentialMutationIntent[];
+  active_outlet_replacement: string | null;
+  fail_closed_on_removed_active: boolean;
+  request_fingerprint: string;
+}
+
+export interface CredentialMutation {
+  subscription_id: string;
+  action: "set" | "delete";
+  credential: string | null;
+}
+
+export interface SettingsApplyRequest {
+  draft: SettingsDraft;
+  credential_mutations: CredentialMutation[];
+  active_outlet_replacement: string | null;
+  fail_closed_on_removed_active: boolean;
+  preview_fingerprint: string;
+}
+
+export interface SettingsApplyResult {
+  settings: SafeSettingsView;
+  diff: SettingsDiff;
+  removed_history_rows: number;
+}

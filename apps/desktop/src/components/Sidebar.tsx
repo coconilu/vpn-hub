@@ -23,6 +23,7 @@ export function Sidebar({ active, onChange }: SidebarProps) {
       <nav aria-label="主导航">
         {items.map(({ id, label, icon: Icon }) => (
           <button
+            aria-label={label}
             className={`nav-item ${active === id ? "is-active" : ""}`}
             key={id}
             onClick={() => onChange(id)}
