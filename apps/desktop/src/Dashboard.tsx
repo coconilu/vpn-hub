@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { LoaderCircle, Play, RefreshCw, Square } from "lucide-react";
+import { LoaderCircle, Play, Radio, RefreshCw, Square, Waypoints } from "lucide-react";
 import { EventTimeline } from "./components/EventTimeline";
 import { LatencyChart } from "./components/LatencyChart";
 import { OutletTable } from "./components/OutletTable";
@@ -53,64 +53,88 @@ export function Dashboard({ snapshot, busy, notice, onModeChange, onRefresh, onU
       </header>
       {notice && <div className="notice" role="status">{notice}</div>}
       <ProtectedBanner entry={snapshot.entry} />
-      <section className="udp-validation-setup" aria-label="UDP 能力验证">
-        <div>
-          <strong>订阅 UDP 端到端验证</strong>
-          <small>可留空；订阅出口会保持未知。本地客户端仍使用应用自持回环目标验证。</small>
+      <section className="panel-card udp-card" aria-label="UDP 能力验证">
+        <div className="panel-head">
+          <div className="panel-title">
+            <Radio aria-hidden="true" />
+            <div>
+              <h2>订阅 UDP 端到端验证</h2>
+              <p>可留空；订阅出口会保持未知。本地客户端仍使用应用自持回环目标验证。</p>
+            </div>
+          </div>
         </div>
-        <input
-          aria-label="受控 UDP 目标"
-          value={udpTargetsText}
-          onChange={(event) => {
-            setUdpTargetsText(event.target.value);
-            setUdpTargetsAuthorized(false);
-          }}
-          placeholder="两个或更多 IP:端口，以逗号分隔"
-          autoComplete="off"
-          spellCheck={false}
-        />
-        <label>
-          <input
-            type="checkbox"
-            checked={udpTargetsAuthorized}
-            disabled={!requiresAuthorization}
-            onChange={(event) => setUdpTargetsAuthorized(event.target.checked)}
-          />
-          <span>我确认有权测试这些目标</span>
-        </label>
-        <button
-          className="secondary-button"
-          onClick={() => onUdpRevalidate(udpTargetsAuthorized ? udpTargets : [])}
-          disabled={busy || coreRunning || (requiresAuthorization && !udpTargetsAuthorized)}
-          type="button"
-          title="目标只发送给后端执行本次探测，不保存探测目标或结果包"
-        >
-          验证 UDP
-        </button>
+        <div className="udp-form">
+          <label className="udp-target-field">
+            <span>受控 UDP 目标</span>
+            <input
+              aria-label="受控 UDP 目标"
+              value={udpTargetsText}
+              onChange={(event) => {
+                setUdpTargetsText(event.target.value);
+                setUdpTargetsAuthorized(false);
+              }}
+              placeholder="两个或更多 IP:端口，以逗号分隔"
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </label>
+          <label className="udp-auth">
+            <input
+              type="checkbox"
+              checked={udpTargetsAuthorized}
+              disabled={!requiresAuthorization}
+              onChange={(event) => setUdpTargetsAuthorized(event.target.checked)}
+            />
+            <span>我确认有权测试这些目标</span>
+          </label>
+          <button
+            className="secondary-button"
+            onClick={() => onUdpRevalidate(udpTargetsAuthorized ? udpTargets : [])}
+            disabled={busy || coreRunning || (requiresAuthorization && !udpTargetsAuthorized)}
+            type="button"
+            title="目标只发送给后端执行本次探测，不保存探测目标或结果包"
+          >
+            验证 UDP
+          </button>
+        </div>
       </section>
 
-      <div className="mode-row">
-        <h2>路由模式</h2>
-        {([ ["priority", "优先级"], ["fastest", "最低延迟"], ["manual", "手动"] ] as const).map(([value, label]) => (
-          <label key={value}>
-            <input
-              type="radio"
-              name="mode"
-              value={value}
-              checked={mode === value}
-              disabled={busy || !snapshot.routing.controller_ready || (value === "manual" && selectableOutlets.length === 0)}
-              onChange={() => onModeChange(value, value === "manual" ? manualOutlet || null : null)}
-            />
-            <span>{label}</span>
-          </label>
-        ))}
-        {mode === "manual" && (
-          <select value={manualOutlet} disabled={busy || selectableOutlets.length === 0} onChange={(event) => onModeChange("manual", event.target.value)}>
-            {selectableOutlets.map((outlet) => <option key={outlet.outlet_id} value={outlet.outlet_id}>{outlet.label}</option>)}
-          </select>
-        )}
-        <small>{snapshot.routing.message}</small>
-      </div>
+      <section className="panel-card mode-card" aria-labelledby="mode-title">
+        <div className="panel-head">
+          <div className="panel-title">
+            <Waypoints aria-hidden="true" />
+            <div>
+              <h2 id="mode-title">路由模式</h2>
+              <p>{snapshot.routing.message}</p>
+            </div>
+          </div>
+        </div>
+        <div className="mode-controls">
+          <div className="mode-segment" role="radiogroup" aria-label="路由模式">
+            {([ ["priority", "优先级"], ["fastest", "最低延迟"], ["manual", "手动"] ] as const).map(([value, label]) => (
+              <label key={value} className={mode === value ? "is-active" : ""}>
+                <input
+                  type="radio"
+                  name="mode"
+                  value={value}
+                  checked={mode === value}
+                  disabled={busy || !snapshot.routing.controller_ready || (value === "manual" && selectableOutlets.length === 0)}
+                  onChange={() => onModeChange(value, value === "manual" ? manualOutlet || null : null)}
+                />
+                <span>{label}</span>
+              </label>
+            ))}
+          </div>
+          {mode === "manual" && (
+            <label className="manual-outlet">
+              <span>手动出口</span>
+              <select value={manualOutlet} disabled={busy || selectableOutlets.length === 0} onChange={(event) => onModeChange("manual", event.target.value)}>
+                {selectableOutlets.map((outlet) => <option key={outlet.outlet_id} value={outlet.outlet_id}>{outlet.label}</option>)}
+              </select>
+            </label>
+          )}
+        </div>
+      </section>
       <RouteRail snapshot={snapshot} />
       <OutletTable snapshot={snapshot} />
       <div className="lower-grid"><LatencyChart samples={snapshot.samples} /><EventTimeline events={snapshot.events} switches={snapshot.route_switches} /></div>
