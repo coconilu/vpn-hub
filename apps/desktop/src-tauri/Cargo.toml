@@ -17,7 +17,8 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
-tauri = { version = "2.11.5", features = [] }
+tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri-plugin-notification = "2.3.3"
 tempfile = "3.23.0"
 tokio.workspace = true
 vpn-hub-core = { path = "../../../crates/vpn-hub-core" }

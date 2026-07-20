@@ -19,9 +19,12 @@ use vpn_hub_core::{
     probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle, unknown_udp_evidence,
 };
 
-use crate::runtime::{
-    AppState, CoreStatus, PortSnapshot, RoutingStatus, SettingsApplyRequest, SettingsApplyResult,
-    SettingsPreview, SettingsPreviewRequest,
+use crate::{
+    lifecycle::{self, LifecycleEvent},
+    runtime::{
+        AppState, CoreStatus, PortSnapshot, RoutingStatus, SettingsApplyRequest,
+        SettingsApplyResult, SettingsPreview, SettingsPreviewRequest,
+    },
 };
 
 #[derive(Debug, Serialize)]
@@ -210,11 +213,31 @@ pub async fn preview_settings(
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn apply_settings(
+    app: AppHandle,
     state: State<'_, AppState>,
     request: SettingsApplyRequest,
 ) -> Result<SettingsApplyResult, String> {
     let _transaction = state.lock_routing_transaction().await;
-    state.apply_settings(request)
+    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    let result = after_successful_settings_commit(state.apply_settings(request), || {
+        coordinator.prepare_config_reload();
+    })?;
+    lifecycle::dispatch(
+        &app,
+        LifecycleEvent::ConfigReload {
+            now_ms: unix_time_ms(),
+        },
+    );
+    Ok(result)
+}
+
+fn after_successful_settings_commit<T>(
+    result: Result<T, String>,
+    on_commit: impl FnOnce(),
+) -> Result<T, String> {
+    let committed = result?;
+    on_commit();
+    Ok(committed)
 }
 
 async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
@@ -266,17 +289,27 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
     Ok(guardian.monitor.interval_seconds)
 }
 
-async fn record_routing_cycle(state: &AppState) -> Result<u64, String> {
-    let _transaction = state.lock_routing_transaction().await;
-    record_routing_cycle_locked(state).await
+pub(crate) async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
+    record_routing_cycle_locked_with_mode(state, true).await
 }
 
-async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
+async fn record_owned_controller_cycle_locked(state: &AppState) -> Result<u64, String> {
+    record_routing_cycle_locked_with_mode(state, false).await
+}
+
+async fn record_routing_cycle_locked_with_mode(
+    state: &AppState,
+    allow_direct_fallback: bool,
+) -> Result<u64, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
     let private = state.private_config()?;
     let Some(controller) = state.controller_client()? else {
-        return record_direct_guardian_cycle(state).await;
+        return if allow_direct_fallback {
+            record_direct_guardian_cycle(state).await
+        } else {
+            Err("应用自管核心未提供可验证 Controller；不会把直连探测降级当作启动成功".into())
+        };
     };
     let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
@@ -358,22 +391,6 @@ fn unix_time_ms() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
-}
-
-pub(crate) async fn monitor_guardian(app: AppHandle) {
-    loop {
-        let interval = {
-            let state = app.state::<AppState>();
-            match record_routing_cycle(&state).await {
-                Ok(interval) => interval,
-                Err(error) => {
-                    eprintln!("Guardian background cycle failed: {error}");
-                    180
-                }
-            }
-        };
-        tokio::time::sleep(Duration::from_secs(interval)).await;
-    }
 }
 
 #[tauri::command]
@@ -512,6 +529,7 @@ impl Drop for OwnedUdpEcho {
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn set_route_mode(
+    app: AppHandle,
     state: State<'_, AppState>,
     mode: RouteMode,
     manual_outlet: Option<String>,
@@ -522,6 +540,7 @@ pub async fn set_route_mode(
     }
     state.set_route_mode(mode, manual_outlet)?;
     record_routing_cycle_locked(&state).await?;
+    lifecycle::dispatch(&app, LifecycleEvent::RouteChanged);
     load_dashboard(&state)
 }
 
@@ -554,14 +573,52 @@ pub fn delete_subscription_credential(
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn start_development_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
+pub async fn start_development_core(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CoreStatus, String> {
+    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let start_epoch = coordinator.prepare_manual_start(&cancel)?;
     let _transaction = state.lock_routing_transaction().await;
-    let mut status = state.start_development_core().await?;
-    if let Err(error) = record_routing_cycle_locked(&state).await {
-        let _ = state.stop_development_core();
-        return Err(format!(
-            "开发核心首次健康决策失败，已停止并保持 Fail Closed：{error}"
-        ));
+    let mut status = match state.start_development_core_cancellable(&cancel).await {
+        Ok(status) => status,
+        Err(error) => {
+            if state
+                .core_status()
+                .is_ok_and(|status| status.state == "external")
+            {
+                lifecycle::dispatch(&app, LifecycleEvent::PortConflictObserved);
+            }
+            coordinator.complete_manual_start_failure(start_epoch);
+            return Err(error);
+        }
+    };
+    let Some(pid) = status.pid else {
+        coordinator.complete_manual_start_failure(start_epoch);
+        return Err("应用自管核心未发布可验证 PID；已保持 Fail Closed".into());
+    };
+    if !coordinator.manual_start_allowed(start_epoch)
+        || !state.owned_core_controller_is_running(pid)
+    {
+        let _ = state.stop_owned_core_if_pid(pid);
+        coordinator.complete_manual_start_failure(start_epoch);
+        return Err("应用自管核心在首次 Guardian 前失去 PID 或 Controller ownership；已停止并保持 Fail Closed".into());
+    }
+    let guardian_result = record_owned_controller_cycle_locked(&state).await;
+    if guardian_result.is_err()
+        || !coordinator.manual_start_allowed(start_epoch)
+        || !state.owned_core_controller_is_running(pid)
+    {
+        let _ = state.stop_owned_core_if_pid(pid);
+        coordinator.complete_manual_start_failure(start_epoch);
+        return Err("应用自管核心未通过首次 Guardian 的 PID 与 Controller ownership 复核；已停止并保持 Fail Closed".into());
+    }
+    if !coordinator.complete_manual_start(pid, start_epoch)
+        || !state.owned_core_controller_is_running(pid)
+    {
+        let _ = state.stop_owned_core_if_pid(pid);
+        return Err("停止请求已优先于迟到的启动结果；应用自管核心已清理".into());
     }
     status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();
     Ok(status)
@@ -569,14 +626,55 @@ pub async fn start_development_core(state: State<'_, AppState>) -> Result<CoreSt
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn stop_development_core(state: State<'_, AppState>) -> Result<CoreStatus, String> {
-    let _transaction = state.lock_routing_transaction().await;
-    state.stop_development_core()
+pub async fn stop_development_core(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CoreStatus, String> {
+    let resolution = app
+        .state::<lifecycle::DesktopCoordinator>()
+        .request_stop()
+        .await;
+    Ok(match resolution {
+        lifecycle::StopRequestResult::Stopped => CoreStatus {
+            state: "stopped".into(),
+            managed: false,
+            pid: None,
+            started_at: None,
+            message: "应用自管核心与待恢复任务已停止".into(),
+        },
+        lifecycle::StopRequestResult::Pending => {
+            let pid = state.owned_core_pid();
+            CoreStatus {
+                state: "stopping".into(),
+                managed: pid.is_some(),
+                pid,
+                started_at: None,
+                message: "停止请求处理中；不会报告为已停止，后台将继续有界清理".into(),
+            }
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_settings_apply_does_not_cancel_scheduled_recovery() {
+        let coordinator = lifecycle::DesktopCoordinator::new();
+        let recovery_epoch = coordinator.recovery_epoch();
+        let result = after_successful_settings_commit::<()>(Err("stale preview".into()), || {
+            coordinator.prepare_config_reload();
+        });
+        assert!(result.is_err());
+        assert_eq!(coordinator.recovery_epoch(), recovery_epoch);
+
+        after_successful_settings_commit(Ok(()), || {
+            coordinator.prepare_config_reload();
+        })
+        .expect("successful commit");
+        assert_eq!(coordinator.recovery_epoch(), recovery_epoch + 1);
+    }
 
     fn subscription() -> OutletConfig {
         OutletConfig {
@@ -656,6 +754,10 @@ mod tests {
             .await
             .expect("clean refresh");
         assert_eq!(interval, 180);
+        let strict_error = record_owned_controller_cycle_locked(&state)
+            .await
+            .expect_err("manual startup must reject the direct Guardian fallback");
+        assert!(strict_error.contains("Controller"));
         let refreshed = load_dashboard(&state).expect("refreshed dashboard");
         assert!(refreshed.routing.outlets.is_empty());
         assert!(refreshed.summaries.is_empty());

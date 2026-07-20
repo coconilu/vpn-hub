@@ -3,8 +3,11 @@ use std::{
     env, fs,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::Mutex,
+    process::{Child, Command, ExitStatus, Stdio},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -437,6 +440,40 @@ struct ManagedCore {
     entry_port: u16,
     controller_port: u16,
     controller_secret: String,
+}
+
+struct PendingChild(Option<Child>);
+
+impl PendingChild {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn publish(mut self) -> Child {
+        self.0.take().expect("pending child already published")
+    }
+}
+
+impl std::ops::Deref for PendingChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("pending child missing")
+    }
+}
+
+impl std::ops::DerefMut for PendingChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().expect("pending child missing")
+    }
+}
+
+impl Drop for PendingChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            terminate_child(child);
+        }
+    }
 }
 
 struct ProbePortLease {
@@ -1808,7 +1845,18 @@ impl AppState {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[cfg(test)]
     pub async fn start_development_core(&self) -> Result<CoreStatus, String> {
+        self.start_development_core_cancellable(&AtomicBool::new(false))
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn start_development_core_cancellable(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<CoreStatus, String> {
+        ensure_core_start_not_cancelled(cancel)?;
         self.ensure_runtime_ready()?;
         let private_config = self.private_config()?;
         let configured_entry_address =
@@ -1859,22 +1907,27 @@ impl AppState {
         harden_private_path(&config_path)?;
 
         let executable = self.find_mihomo_executable()?;
-        let validation = hidden_command(&executable)
+        ensure_core_start_not_cancelled(cancel)?;
+        let mut validation_command = hidden_command(&executable);
+        validation_command
             .arg("-t")
             .arg("-d")
             .arg(&self.runtime_directory)
             .arg("-f")
             .arg(&config_path)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::null());
+        let validation = run_owned_command_cancellable(validation_command, cancel)
+            .await
             .map_err(|error| format!("无法验证 Mihomo 配置：{error}"))?;
         if !validation.success() {
             return Err(core_diagnostic(CoreDiagnostic::ValidationFailed).into());
         }
+        ensure_core_start_not_cancelled(cancel)?;
 
         drop(startup_entry);
-        let mut child = hidden_command(&executable)
+        let child = hidden_command(&executable)
             .arg("-d")
             .arg(&self.runtime_directory)
             .arg("-f")
@@ -1884,9 +1937,11 @@ impl AppState {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|error| format!("无法启动 Mihomo：{error}"))?;
+        let mut child = PendingChild::new(child);
 
         let pid = child.id();
         for _ in 0..50 {
+            ensure_core_start_not_cancelled(cancel)?;
             if owns_loopback_listeners(pid, &[startup_entry_address, controller_address]) {
                 break;
             }
@@ -1919,6 +1974,7 @@ impl AppState {
             }
         };
         for selector in [MASTER_SELECTOR, UDP_SELECTOR] {
+            ensure_core_start_not_cancelled(cancel)?;
             if let Err(error) = controller.select(selector, FAIL_CLOSED_PROXY).await {
                 terminate_child(&mut child);
                 return Err(format!("无法锁定 {selector} Fail Closed 选择器：{error}"));
@@ -1929,6 +1985,7 @@ impl AppState {
                 .enabled_outlets()
                 .filter(|outlet| matches!(outlet.kind, OutletKind::Subscription { .. }))
             {
+                ensure_core_start_not_cancelled(cancel)?;
                 let group = outlet_proxy_name(&outlet.id);
                 if controller.select(MASTER_SELECTOR, &group).await.is_ok() {
                     let _ = probe_https_through_entry(startup_entry_port, target, 1_500).await;
@@ -1939,6 +1996,7 @@ impl AppState {
                 return Err(format!("无法恢复主 Fail Closed 选择器：{error}"));
             }
         }
+        ensure_core_start_not_cancelled(cancel)?;
         #[cfg(test)]
         if let Some(hook) = self
             .entry_switch_hook
@@ -1948,6 +2006,7 @@ impl AppState {
         {
             hook();
         }
+        ensure_core_start_not_cancelled(cancel)?;
         if let Err(error) = fs::write(&config_path, full_yaml) {
             terminate_child(&mut child);
             return Err(format!("无法写入完整 Mihomo 运行配置：{error}"));
@@ -1961,6 +2020,7 @@ impl AppState {
             return Err(format!("无法加载完整 Mihomo 配置：{error}"));
         }
         for _ in 0..20 {
+            ensure_core_start_not_cancelled(cancel)?;
             if listening_owner_pid(configured_entry_address) == Some(pid)
                 && listening_owner_pid(controller_address) == Some(pid)
                 && listening_owner_pid(startup_entry_address).is_none()
@@ -1990,6 +2050,7 @@ impl AppState {
                 return Err(format!("无法确认 UDP Fail Closed 初始状态：{error}"));
             }
         }
+        ensure_core_start_not_cancelled(cancel)?;
         match controller
             .is_selected(MASTER_SELECTOR, FAIL_CLOSED_PROXY)
             .await
@@ -2004,6 +2065,7 @@ impl AppState {
                 return Err(format!("无法确认主选择器 Fail Closed 初始状态：{error}"));
             }
         }
+        ensure_core_start_not_cancelled(cancel)?;
 
         let started_at = chrono::Utc::now().to_rfc3339();
         if let Err(error) = self.reset_routing_session() {
@@ -2018,8 +2080,9 @@ impl AppState {
             terminate_child(&mut child);
             return Err("本应用已经持有一个 Mihomo 开发进程".into());
         }
+        ensure_core_start_not_cancelled(cancel)?;
         *guard = Some(ManagedCore {
-            child,
+            child: child.publish(),
             started_at: started_at.clone(),
             entry_host: private_config.entry.host.clone(),
             entry_port: private_config.entry.port,
@@ -2038,6 +2101,7 @@ impl AppState {
         })
     }
 
+    #[cfg(test)]
     pub fn stop_development_core(&self) -> Result<CoreStatus, String> {
         let mut guard = self
             .managed_core
@@ -2055,6 +2119,79 @@ impl AppState {
             started_at: None,
             message: "开发核心已停止；未修改系统代理或第三方客户端".into(),
         })
+    }
+
+    pub fn owned_core_pid(&self) -> Option<u32> {
+        let mut guard = self.managed_core.lock().ok()?;
+        let core = guard.as_mut()?;
+        if let Ok(None) = core.child.try_wait() {
+            Some(core.child.id())
+        } else {
+            *guard = None;
+            drop(guard);
+            let _ = self.reset_routing_session();
+            None
+        }
+    }
+
+    pub fn owned_core_is_running(&self, expected_pid: u32) -> bool {
+        self.owned_core_pid() == Some(expected_pid)
+    }
+
+    pub fn owned_core_controller_is_running(&self, expected_pid: u32) -> bool {
+        let addresses = {
+            let Ok(mut guard) = self.managed_core.lock() else {
+                return false;
+            };
+            let Some(core) = guard.as_mut() else {
+                return false;
+            };
+            if core.child.id() != expected_pid || core.child.try_wait().ok().flatten().is_some() {
+                *guard = None;
+                drop(guard);
+                let _ = self.reset_routing_session();
+                return false;
+            }
+            let Some(entry) = loopback_socket_address(&core.entry_host, core.entry_port) else {
+                return false;
+            };
+            let controller = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), core.controller_port);
+            [entry, controller]
+        };
+        owns_loopback_listeners(expected_pid, &addresses)
+            && self.owned_core_is_running(expected_pid)
+    }
+
+    pub fn stop_owned_core_if_pid(&self, expected_pid: u32) -> Result<bool, String> {
+        let mut guard = self
+            .managed_core
+            .lock()
+            .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?;
+        if guard
+            .as_ref()
+            .is_none_or(|core| core.child.id() != expected_pid)
+        {
+            return Ok(false);
+        }
+        let mut core = guard.take().expect("owned core checked above");
+        terminate_child(&mut core.child);
+        drop(guard);
+        self.reset_routing_session()?;
+        Ok(true)
+    }
+
+    pub fn stop_development_core_if_owned(&self) -> Result<bool, String> {
+        let mut guard = self
+            .managed_core
+            .lock()
+            .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?;
+        let Some(mut core) = guard.take() else {
+            return Ok(false);
+        };
+        terminate_child(&mut core.child);
+        drop(guard);
+        self.reset_routing_session()?;
+        Ok(true)
     }
 
     fn find_mihomo_executable(&self) -> Result<PathBuf, String> {
@@ -2544,6 +2681,35 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+async fn run_owned_command_cancellable(
+    mut command: Command,
+    cancel: &AtomicBool,
+) -> Result<ExitStatus, String> {
+    ensure_core_start_not_cancelled(cancel)?;
+    let child = command
+        .spawn()
+        .map_err(|error| format!("无法启动应用自管校验进程：{error}"))?;
+    let mut child = PendingChild::new(child);
+    loop {
+        ensure_core_start_not_cancelled(cancel)?;
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("无法读取应用自管校验进程状态：{error}"))?
+        {
+            return Ok(status);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn ensure_core_start_not_cancelled(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Acquire) {
+        Err("应用自管核心启动已取消；不会发布迟到进程".into())
+    } else {
+        Ok(())
+    }
+}
+
 fn is_endpoint_reachable(host: &str, port: u16) -> bool {
     let Some(ip) = normalize_loopback_host(host) else {
         return false;
@@ -2669,13 +2835,15 @@ fn remove_proxy_environment(command: &mut Command) {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+    use crate::lifecycle::{DesktopCoordinator, LifecycleEvent};
     use std::{
         collections::BTreeMap,
         io,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        time::Instant,
     };
     use vpn_hub_core::{
         HealthStatus, LocalProxyProtocol, MASTER_SELECTOR, MonitorConfig, OutletConfig,
@@ -2703,6 +2871,50 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    fn install_fake_owned_controller(state: &AppState, lifetime_ms: u64) -> u32 {
+        let entry = ProbePortLease::reserve().expect("fake entry lease");
+        let entry_port = entry.port();
+        let controller =
+            ProbePortLease::reserve_excluding(&[entry_port]).expect("fake controller lease");
+        let controller_port = controller.port();
+        drop(entry);
+        drop(controller);
+
+        let script = format!(
+            "$entry=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,{entry_port}); \
+             $controller=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,{controller_port}); \
+             $entry.Start(); $controller.Start(); Start-Sleep -Milliseconds {lifetime_ms}"
+        );
+        let child = hidden_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .spawn()
+            .expect("owned fake controller child");
+        let pid = child.id();
+        *state.managed_core.lock().expect("managed core") = Some(ManagedCore {
+            child,
+            started_at: "test".into(),
+            entry_host: "127.0.0.1".into(),
+            entry_port,
+            controller_port,
+            controller_secret: "test-only".into(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !state.owned_core_controller_is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            state.owned_core_controller_is_running(pid),
+            "fake child must own both entry and Controller listeners"
+        );
+        pid
     }
 
     impl DurableFileOps for FailingDurableOps {
@@ -3999,5 +4211,239 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             .expect("curl");
         assert!(!response.success());
         state.stop_development_core().expect("stop core");
+    }
+
+    #[test]
+    fn owned_core_observer_tracks_exact_pid_and_never_stops_mismatch() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let child = hidden_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .spawn()
+            .expect("owned fake child");
+        let pid = child.id();
+        *state.managed_core.lock().expect("managed core") = Some(ManagedCore {
+            child,
+            started_at: "test".into(),
+            entry_host: "127.0.0.9".into(),
+            entry_port: 45_901,
+            controller_port: 45_902,
+            controller_secret: "test-only".into(),
+        });
+        assert_eq!(state.owned_core_pid(), Some(pid));
+        assert!(!state.owned_core_is_running(pid.saturating_add(1)));
+        assert!(
+            !state
+                .stop_owned_core_if_pid(pid.saturating_add(1))
+                .expect("mismatched stop")
+        );
+        assert!(state.owned_core_is_running(pid));
+        assert!(state.stop_owned_core_if_pid(pid).expect("exact stop"));
+        assert!(state.owned_core_pid().is_none());
+    }
+
+    #[test]
+    fn controller_ownership_rejects_child_that_exits_before_guardian() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let child = hidden_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "exit 0",
+            ])
+            .spawn()
+            .expect("short owned fake child");
+        let pid = child.id();
+        *state.managed_core.lock().expect("managed core") = Some(ManagedCore {
+            child,
+            started_at: "test".into(),
+            entry_host: "127.0.0.9".into(),
+            entry_port: 45_903,
+            controller_port: 45_904,
+            controller_secret: "test-only".into(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while state.owned_core_is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!state.owned_core_is_running(pid));
+        assert!(!state.owned_core_controller_is_running(pid));
+        assert!(state.managed_core.lock().expect("managed core").is_none());
+    }
+
+    #[test]
+    fn controller_ownership_detects_child_exit_during_guardian_window() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let pid = install_fake_owned_controller(&state, 2_000);
+
+        assert!(state.owned_core_controller_is_running(pid));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while state.owned_core_controller_is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!state.owned_core_controller_is_running(pid));
+        assert!(state.managed_core.lock().expect("managed core").is_none());
+    }
+
+    #[test]
+    fn stop_epoch_cancels_manual_start_and_late_pid_is_cleaned_exactly() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let coordinator = DesktopCoordinator::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let epoch = coordinator
+            .prepare_manual_start(&cancel)
+            .expect("manual start epoch");
+        let pid = install_fake_owned_controller(&state, 30_000);
+
+        coordinator.dispatch(LifecycleEvent::StopCore);
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(!coordinator.manual_start_allowed(epoch));
+        assert!(
+            state
+                .stop_owned_core_if_pid(pid)
+                .expect("exact late cleanup")
+        );
+        assert!(!coordinator.complete_manual_start(pid, epoch));
+        assert!(state.owned_core_pid().is_none());
+    }
+
+    #[tokio::test]
+    async fn routing_transaction_serializes_real_app_state_mutations() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(AppState::new_for_test(workspace_root, directory.path()));
+        let first = state.lock_routing_transaction().await;
+        let acquired = Arc::new(AtomicBool::new(false));
+        let task_state = Arc::clone(&state);
+        let task_acquired = Arc::clone(&acquired);
+        let contender = tokio::spawn(async move {
+            let _second = task_state.lock_routing_transaction().await;
+            task_acquired.store(true, Ordering::Release);
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!acquired.load(Ordering::Acquire));
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), contender)
+            .await
+            .expect("contender must acquire after commit boundary")
+            .expect("contender task");
+        assert!(acquired.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancelled_start_never_publishes_an_owned_child() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let cancel = AtomicBool::new(true);
+
+        assert!(
+            state
+                .start_development_core_cancellable(&cancel)
+                .await
+                .is_err()
+        );
+        assert!(state.owned_core_pid().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellable_owned_command_kills_and_reaps_its_child() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pid_path = directory.path().join("validation-pid.txt");
+        let escaped_path = pid_path.to_string_lossy().replace('\'', "''");
+        let mut command = hidden_command("powershell.exe");
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "Set-Content -LiteralPath '{escaped_path}' -Value $PID; Start-Sleep -Seconds 30"
+            ),
+        ]);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task_cancel = Arc::clone(&cancel);
+        let task =
+            tokio::spawn(async move { run_owned_command_cancellable(command, &task_cancel).await });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_path.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let pid = fs::read_to_string(&pid_path)
+            .expect("owned validation pid")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric pid");
+
+        cancel.store(true, Ordering::Release);
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellation must be bounded")
+            .expect("validation task");
+        assert!(result.is_err());
+        let still_running = hidden_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ])
+            .status()
+            .expect("process ownership check")
+            .success();
+        assert!(
+            !still_running,
+            "cancelled validation child must not survive"
+        );
+    }
+
+    #[test]
+    fn unpublished_pending_child_is_terminated_and_reaped_on_drop() {
+        let child = hidden_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ])
+            .spawn()
+            .expect("pending fake child");
+        let pid = child.id();
+        drop(PendingChild::new(child));
+
+        let still_running = hidden_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!(
+                    "if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 0 }} else {{ exit 1 }}"
+                ),
+            ])
+            .status()
+            .expect("process ownership check")
+            .success();
+        assert!(!still_running, "dropped pending child must not survive");
     }
 }
