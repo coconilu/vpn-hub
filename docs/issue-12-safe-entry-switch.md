@@ -21,7 +21,7 @@
 | HMAC key | 只从当前用户 Windows protected store 读取；类型不实现 `Debug`、`Clone` 或序列化，内存退出时 zeroize |
 | Recovery journal | 完整 payload 先做 installation-bound HMAC，再用当前用户 DPAPI 加密；DPAPI 禁止 UI 且不使用 machine scope |
 | UI / audit DTO | 只包含入口、布尔值、指纹、generation 和 token id；不包含 manual proxy、PAC URL 或 bypass 内容 |
-| 存储路径 | 只能从已校验的 `InstallationReference` 派生固定路径；校验 root、目录、authority、journal 的 owner/DACL、reparse point 和文件 identity |
+| 存储路径 | 只能从 trusted loader 返回的不可伪造 `InstallationReference` 派生固定路径；entry-switch 目录、authority、journal、backup 的 DACL 必须恰好为当前交互用户 + SYSTEM，并校验 owner、reparse point 和文件 identity |
 
 消费记录与恢复记录位于同一份加密状态中，并在同一个 OS authority lock 下原子更新。清理只删除已过期 token id，不通过容量滚动淘汰未过期记录。
 
@@ -49,7 +49,7 @@ flowchart LR
 
 `StagePending` 必须在启动 effect 前落盘，且包含可定位的 exact-owned identity 声明。即使进程在启动后、保存 PID 前崩溃，恢复也只能按预声明 ownership token 停止本事务创建的对象。
 
-恢复时会重新验证 journal HMAC、完整 plan、phase invariants、generation、installation 和 user authority scope。authority guard 从 load/consume 一直持有到 clear，不能用普通数据结构伪造。
+恢复时会重新验证 journal HMAC、完整 plan、phase invariants、原始/已提交 generation、installation 和 user authority scope。恢复写入前会直接从 backend 读取当前 generation 与入口：每个 phase 只接受精确的原始态或已提交态组合；第三种入口、外部 generation 变化或不可能的 phase/state 组合都会保留 journal 并拒绝写回。authority guard 从 load/consume 一直持有到 clear，且锁定、校验、truncate/write 使用同一个 no-follow handle，不能用普通数据结构或伪造路径引用绕过。
 
 ## WinINet 并发限制
 

@@ -706,9 +706,17 @@ fn select_supervisor_route_with_program_data(
     let Ok(reference) = InstallationReference::load(&reference_path, program_data) else {
         return SupervisorRoute::FailClosed;
     };
-    if !reference.helper_enabled {
-        return AuthorityFileGuard::acquire_existing(
-            &reference.authority_path(),
+    if !reference.helper_enabled() {
+        let Ok(account) = env::var("USERNAME") else {
+            return SupervisorRoute::FailClosed;
+        };
+        let Ok(interactive_user_sid) = vpn_hub_windows_security::lookup_local_account_sid(&account)
+        else {
+            return SupervisorRoute::FailClosed;
+        };
+        return AuthorityFileGuard::acquire_protected_shared(
+            &reference,
+            &interactive_user_sid,
             SupervisorAuthority::Desktop,
             1,
         )
@@ -719,7 +727,7 @@ fn select_supervisor_route_with_program_data(
     let Some(store) = secret_store else {
         return SupervisorRoute::FailClosed;
     };
-    let Ok(Some(key_hex)) = store.get(&reference.client_secret_ref) else {
+    let Ok(Some(key_hex)) = store.get(reference.client_secret_ref()) else {
         return SupervisorRoute::FailClosed;
     };
     let key_hex = zeroize::Zeroizing::new(key_hex);
@@ -727,7 +735,7 @@ fn select_supervisor_route_with_program_data(
         return SupervisorRoute::FailClosed;
     };
     SupervisorRoute::HelperOwned {
-        client: NamedPipeClient::new(reference.install_id, Arc::new(key)),
+        client: NamedPipeClient::new(reference.install_id().to_owned(), Arc::new(key)),
         last_status: Box::new(Mutex::new(None)),
     }
 }
@@ -3256,16 +3264,16 @@ mod tests {
         ));
         drop(default_route);
 
-        let reference = InstallationReference {
-            schema_version: 1,
-            install_id: "install-a".into(),
-            helper_enabled: true,
-            program_data_root: install_root,
-            client_secret_ref: "helper.install-a.protocol".into(),
-        };
         fs::write(
             data.join("helper-installation.json"),
-            serde_json::to_vec(&reference).expect("reference json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "install_id": "install-a",
+                "helper_enabled": true,
+                "program_data_root": install_root,
+                "client_secret_ref": "helper.install-a.protocol",
+            }))
+            .expect("reference json"),
         )
         .expect("reference");
         let store = TestSecretStore::default();

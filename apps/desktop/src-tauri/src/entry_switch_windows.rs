@@ -5,7 +5,10 @@
 //! for a service, RAS/VPN, named connection, or multi-connection context.
 #![allow(dead_code)] // Compiled now; wiring stays disabled until isolated acceptance.
 
-use std::{fs, path::PathBuf};
+use std::{
+    io::{Read as _, Seek as _},
+    path::PathBuf,
+};
 
 use vpn_hub_core::{
     ConfidentialProtector, ConsentKey, EntrySwitchAuthorityGuard, EntrySwitchContext,
@@ -15,9 +18,10 @@ use vpn_hub_core::{
 };
 use vpn_hub_helper::{AuthorityFileGuard, InstallationReference, SupervisorAuthority};
 use vpn_hub_windows_security::{
-    ProtectedPathPolicy, WinInetLanProxySnapshot, open_verified_file, protect_current_user_data,
+    ProtectedPathPolicy, WinInetLanProxySnapshot, open_current_user_mutable_directory,
+    open_current_user_mutable_file, protect_current_user_data,
     query_current_user_default_lan_proxy, set_current_user_default_lan_proxy,
-    unprotect_current_user_data, validate_protected_installation, verified_file_identity,
+    unprotect_current_user_data, validate_protected_installation,
 };
 
 const PROXY_TYPE_DIRECT: u32 = 1;
@@ -50,18 +54,20 @@ impl EntrySwitchDesktopAuthorityGuard {
     /// opens the installer-preprovisioned lease without creating it.
     pub(crate) fn acquire(
         installation: &InstallationReference,
+        interactive_user_sid: &str,
         user_scope_id: String,
         generation: u64,
         _fencing_token: u64,
     ) -> Result<Self, EntrySwitchError> {
-        let file_guard = AuthorityFileGuard::acquire_existing(
-            &installation.entry_switch_authority_path(),
+        let file_guard = AuthorityFileGuard::acquire_protected_entry_switch(
+            installation,
+            interactive_user_sid,
             SupervisorAuthority::Desktop,
             generation,
         )
         .map_err(|_| EntrySwitchError::Unauthorized)?;
         let context = EntrySwitchContext {
-            install_id: installation.install_id.clone(),
+            install_id: installation.install_id().to_owned(),
             user_scope_id,
         };
         Ok(Self {
@@ -118,7 +124,7 @@ impl<'a> ProtectedFileEntrySwitchJournal<'a> {
             installation: installation.clone(),
             interactive_user_sid,
             context: EntrySwitchContext {
-                install_id: installation.install_id.clone(),
+                install_id: installation.install_id().to_owned(),
                 user_scope_id,
             },
             key,
@@ -135,21 +141,21 @@ impl<'a> ProtectedFileEntrySwitchJournal<'a> {
     fn validate_fixed_storage(&self) -> Result<(), EntrySwitchError> {
         let mut paths = vec![
             (
-                self.installation.program_data_root.join("entry-switch"),
-                ProtectedPathPolicy::MutableDirectory,
+                self.installation.program_data_root().join("entry-switch"),
+                ProtectedPathPolicy::CurrentUserMutableDirectory,
             ),
             (
                 self.installation.entry_switch_authority_path(),
-                ProtectedPathPolicy::Mutable,
+                ProtectedPathPolicy::CurrentUserMutableFile,
             ),
-            (self.path(), ProtectedPathPolicy::Mutable),
+            (self.path(), ProtectedPathPolicy::CurrentUserMutableFile),
         ];
         let backup = self.path().with_extension("json.bak");
         if backup.exists() {
-            paths.push((backup, ProtectedPathPolicy::Mutable));
+            paths.push((backup, ProtectedPathPolicy::CurrentUserMutableFile));
         }
         validate_protected_installation(
-            &self.installation.program_data_root,
+            self.installation.program_data_root(),
             &paths,
             &self.interactive_user_sid,
         )
@@ -165,14 +171,20 @@ impl<'a> ProtectedFileEntrySwitchJournal<'a> {
             return Ok(None);
         }
         self.validate_fixed_storage()?;
-        let (guard, identity) = open_verified_file(path).map_err(|_| EntrySwitchError::Journal)?;
-        let bytes = fs::read(path).map_err(|_| EntrySwitchError::Journal)?;
-        if bytes.len() > 1024 * 1024
-            || verified_file_identity(path).map_err(|_| EntrySwitchError::Journal)? != identity
-        {
+        let (mut file, _) = open_current_user_mutable_file(
+            self.installation.program_data_root(),
+            path,
+            &self.interactive_user_sid,
+        )
+        .map_err(|_| EntrySwitchError::Journal)?;
+        file.rewind().map_err(|_| EntrySwitchError::Journal)?;
+        let mut bytes = Vec::new();
+        file.take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| EntrySwitchError::Journal)?;
+        if bytes.len() > 1024 * 1024 {
             return Err(EntrySwitchError::Journal);
         }
-        drop(guard);
         Ok(Some(bytes))
     }
 
@@ -194,12 +206,23 @@ impl<'a> ProtectedFileEntrySwitchJournal<'a> {
 
     fn save_state(&self, state: &ProtectedJournalState) -> Result<(), EntrySwitchError> {
         self.validate_fixed_storage()?;
+        let _directory_guard = open_current_user_mutable_directory(
+            self.installation.program_data_root(),
+            &self.installation.program_data_root().join("entry-switch"),
+            &self.interactive_user_sid,
+        )
+        .map_err(|_| EntrySwitchError::Journal)?;
         let codec = ProtectedJournalCodec::new(self.context.clone(), self.key, &self.protector);
         let bytes = codec.seal(state)?;
         durable_atomic_save_with_backup(&self.path(), &bytes, &SystemDurableFileOps)
             .map_err(|_| EntrySwitchError::Journal)?;
         self.validate_fixed_storage()?;
-        let _ = open_verified_file(&self.path()).map_err(|_| EntrySwitchError::Journal)?;
+        let _ = open_current_user_mutable_file(
+            self.installation.program_data_root(),
+            &self.path(),
+            &self.interactive_user_sid,
+        )
+        .map_err(|_| EntrySwitchError::Journal)?;
         Ok(())
     }
 }

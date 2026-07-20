@@ -35,6 +35,12 @@ mod windows {
         Executable,
         Mutable,
         SecretMaterial,
+        /// Mutable state owned by the current interactive user boundary. The
+        /// DACL must contain exactly that SID and SYSTEM.
+        CurrentUserMutableFile,
+        /// Mutable directory for current-user atomic state replacement. The
+        /// DACL must contain exactly that SID and SYSTEM.
+        CurrentUserMutableDirectory,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -491,6 +497,139 @@ mod windows {
         Ok((file, identity))
     }
 
+    /// Opens and validates a current-user mutable file under a protected
+    /// `ProgramData` root. The exact returned handle is the handle whose
+    /// containment, owner, DACL, reparse status, and identity were checked.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe containment, ACLs, links, identity, or access.
+    pub fn open_current_user_mutable_file(
+        root: &Path,
+        path: &Path,
+        interactive_user_sid: &str,
+    ) -> io::Result<(std::fs::File, FileIdentity)> {
+        let mut handles = open_current_user_chain(root, path, interactive_user_sid, false)?;
+        let file = handles
+            .pop()
+            .ok_or_else(|| io::Error::other("verified file missing"))?;
+        let identity = file_identity(&file)?;
+        Ok((file, identity))
+    }
+
+    /// Opens and validates the exact current-user mutable directory handle.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe containment, ACLs, links, identity, or access.
+    pub fn open_current_user_mutable_directory(
+        root: &Path,
+        path: &Path,
+        interactive_user_sid: &str,
+    ) -> io::Result<std::fs::File> {
+        let mut handles = open_current_user_chain(root, path, interactive_user_sid, true)?;
+        handles
+            .pop()
+            .ok_or_else(|| io::Error::other("verified directory missing"))
+    }
+
+    /// Opens the shared desktop/LocalService authority file through one
+    /// validated no-follow handle. The shared DACL policy intentionally differs
+    /// from current-user-only entry-switch state.
+    ///
+    /// # Errors
+    /// Returns an error for unsafe containment, ACLs, links, identity, or access.
+    pub fn open_shared_authority_file(
+        root: &Path,
+        path: &Path,
+        interactive_user_sid: &str,
+    ) -> io::Result<(std::fs::File, FileIdentity)> {
+        validate_sid(interactive_user_sid)?;
+        let relative = safe_relative_path(root, path)?;
+        if relative.components().count() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authority path is not fixed",
+            ));
+        }
+        let root_file = open_no_follow(root)?;
+        let expected_root = normalize_final_path(&root_file)?;
+        validate_secure_handle(&root_file, interactive_user_sid, ProtectedPathPolicy::Root)?;
+        let file = open_no_follow_mutable(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "authority is not a file",
+            ));
+        }
+        let final_path = normalize_final_path(&file)?;
+        if !final_path.starts_with(&expected_root) || final_path == expected_root {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authority escapes root",
+            ));
+        }
+        validate_secure_handle(&file, interactive_user_sid, ProtectedPathPolicy::Mutable)?;
+        let identity = file_identity(&file)?;
+        Ok((file, identity))
+    }
+
+    fn open_current_user_chain(
+        root: &Path,
+        path: &Path,
+        interactive_user_sid: &str,
+        target_is_directory: bool,
+    ) -> io::Result<Vec<std::fs::File>> {
+        validate_sid(interactive_user_sid)?;
+        let relative = safe_relative_path(root, path)?;
+        let root_file = open_no_follow(root)?;
+        let expected_root = normalize_final_path(&root_file)?;
+        validate_secure_handle(&root_file, interactive_user_sid, ProtectedPathPolicy::Root)?;
+        let components = relative.components().collect::<Vec<_>>();
+        let mut current = root.to_path_buf();
+        let mut handles = vec![root_file];
+        for (index, component) in components.iter().enumerate() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unsafe component",
+                ));
+            };
+            current.push(name);
+            let final_component = index + 1 == components.len();
+            let file = if final_component && !target_is_directory {
+                open_no_follow_mutable(&current)?
+            } else {
+                open_no_follow(&current)?
+            };
+            let metadata = file.metadata()?;
+            let type_matches = if final_component && !target_is_directory {
+                metadata.is_file()
+            } else {
+                metadata.is_dir()
+            };
+            if !type_matches {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "protected path type mismatch",
+                ));
+            }
+            let final_path = normalize_final_path(&file)?;
+            if !final_path.starts_with(&expected_root) || final_path == expected_root {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "path escapes root",
+                ));
+            }
+            let policy = if final_component && !target_is_directory {
+                ProtectedPathPolicy::CurrentUserMutableFile
+            } else {
+                ProtectedPathPolicy::CurrentUserMutableDirectory
+            };
+            validate_secure_handle(&file, interactive_user_sid, policy)?;
+            handles.push(file);
+        }
+        Ok(handles)
+    }
+
     /// Reopens a file under the same no-follow/share contract and reads its identity.
     ///
     /// # Errors
@@ -504,6 +643,22 @@ mod windows {
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)?;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "reparse points are forbidden",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn open_no_follow_mutable(path: &Path) -> io::Result<std::fs::File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .share_mode(FILE_SHARE_READ)
             .open(path)?;
         if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
@@ -593,6 +748,10 @@ mod windows {
             | ProtectedPathPolicy::SecretMaterial => {
                 matches!(owner, "S-1-5-18" | "S-1-5-19" | "S-1-5-32-544")
             }
+            ProtectedPathPolicy::CurrentUserMutableFile
+            | ProtectedPathPolicy::CurrentUserMutableDirectory => {
+                matches!(owner, "S-1-5-18" | "S-1-5-32-544") || owner == interactive_user_sid
+            }
         };
         if !allowed_owner {
             return Err(io::Error::new(
@@ -635,9 +794,18 @@ mod windows {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "trustee missing"))?
                 .to_string();
             let trustee = trustee.trim_end_matches('\0');
-            if !matches!(trustee, "S-1-5-18" | "S-1-5-19" | "S-1-5-32-544")
-                && trustee != interactive_user_sid
-            {
+            let current_user_only = matches!(
+                policy,
+                ProtectedPathPolicy::CurrentUserMutableFile
+                    | ProtectedPathPolicy::CurrentUserMutableDirectory
+            );
+            let allowed = if current_user_only {
+                trustee == "S-1-5-18" || trustee == interactive_user_sid
+            } else {
+                matches!(trustee, "S-1-5-18" | "S-1-5-19" | "S-1-5-32-544")
+                    || trustee == interactive_user_sid
+            };
+            if !allowed {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "broad or unexpected DACL trustee",
@@ -656,10 +824,25 @@ mod windows {
                 validate_user_mask(ace.mask(), policy)?;
             }
         }
-        if !has_system
-            || (policy != ProtectedPathPolicy::Root && !has_local_service)
-            || (policy != ProtectedPathPolicy::SecretMaterial && !has_user)
-        {
+        let current_user_only = matches!(
+            policy,
+            ProtectedPathPolicy::CurrentUserMutableFile
+                | ProtectedPathPolicy::CurrentUserMutableDirectory
+        );
+        if current_user_only && dacl.len() != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "current-user mutable DACL must contain exactly two ACEs",
+            ));
+        }
+        let required_missing = if current_user_only {
+            !has_system || !has_user || has_local_service
+        } else {
+            !has_system
+                || (policy != ProtectedPathPolicy::Root && !has_local_service)
+                || (policy != ProtectedPathPolicy::SecretMaterial && !has_user)
+        };
+        if required_missing {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "required installation principal missing",
@@ -680,7 +863,10 @@ mod windows {
             | AccessRights::Bit8;
         let mutable = matches!(
             policy,
-            ProtectedPathPolicy::Mutable | ProtectedPathPolicy::MutableDirectory
+            ProtectedPathPolicy::Mutable
+                | ProtectedPathPolicy::MutableDirectory
+                | ProtectedPathPolicy::CurrentUserMutableFile
+                | ProtectedPathPolicy::CurrentUserMutableDirectory
         );
         if mask.intersects(administration)
             || (!mutable && mask.intersects(file_write | AccessRights::Bit6))
@@ -697,6 +883,7 @@ mod windows {
             ProtectedPathPolicy::Root
                 | ProtectedPathPolicy::StrictDirectory
                 | ProtectedPathPolicy::MutableDirectory
+                | ProtectedPathPolicy::CurrentUserMutableDirectory
                 | ProtectedPathPolicy::Executable
         );
         if !readable || (requires_execute && !executable) {
@@ -1032,6 +1219,49 @@ mod windows {
         }
 
         #[test]
+        fn current_user_mutable_acl_accepts_exact_user_and_system() {
+            let sid = lookup_local_account_sid(&std::env::var("USERNAME").unwrap()).unwrap();
+            let file: LocalBox<SecurityDescriptor> =
+                format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{sid})").parse().unwrap();
+            validate_dacl(
+                file.dacl().unwrap(),
+                &sid,
+                ProtectedPathPolicy::CurrentUserMutableFile,
+            )
+            .unwrap();
+            let directory: LocalBox<SecurityDescriptor> =
+                format!("D:P(A;;GA;;;SY)(A;;GRGWGX;;;{sid})")
+                    .parse()
+                    .unwrap();
+            validate_dacl(
+                directory.dacl().unwrap(),
+                &sid,
+                ProtectedPathPolicy::CurrentUserMutableDirectory,
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn current_user_mutable_acl_rejects_service_admin_extra_and_user_admin_rights() {
+            let sid = lookup_local_account_sid(&std::env::var("USERNAME").unwrap()).unwrap();
+            for sddl in [
+                format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{sid})(A;;GR;;;LS)"),
+                format!("D:P(A;;GA;;;SY)(A;;GRGW;;;{sid})(A;;GR;;;BA)"),
+                format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})"),
+            ] {
+                let descriptor: LocalBox<SecurityDescriptor> = sddl.parse().unwrap();
+                assert!(
+                    validate_dacl(
+                        descriptor.dacl().unwrap(),
+                        &sid,
+                        ProtectedPathPolicy::CurrentUserMutableFile,
+                    )
+                    .is_err()
+                );
+            }
+        }
+
+        #[test]
         fn user_writable_intermediate_directory_is_rejected() {
             let sid = lookup_local_account_sid(&std::env::var("USERNAME").unwrap()).unwrap();
             let temp = tempfile::tempdir().unwrap();
@@ -1087,14 +1317,27 @@ mod windows {
             drop(guard);
             std::fs::rename(&executable, &replacement).unwrap();
         }
+
+        #[test]
+        fn mutable_no_follow_handle_blocks_replacement_until_released() {
+            let temp = tempfile::tempdir().unwrap();
+            let authority = temp.path().join("authority.lease");
+            let replacement = temp.path().join("replacement.lease");
+            std::fs::write(&authority, b"sentinel").unwrap();
+            let guard = open_no_follow_mutable(&authority).unwrap();
+            assert!(std::fs::rename(&authority, &replacement).is_err());
+            drop(guard);
+            std::fs::rename(&authority, &replacement).unwrap();
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
 pub use windows::{
     FileIdentity, ProtectedPathPolicy, WinInetLanProxySnapshot, create_restricted_named_pipe,
-    lookup_local_account_sid, network_state_records, open_verified_file, process_creation_identity,
-    protect_current_user_data, query_current_user_default_lan_proxy,
+    lookup_local_account_sid, network_state_records, open_current_user_mutable_directory,
+    open_current_user_mutable_file, open_shared_authority_file, open_verified_file,
+    process_creation_identity, protect_current_user_data, query_current_user_default_lan_proxy,
     set_current_user_default_lan_proxy, unprotect_current_user_data,
     validate_protected_installation, verified_file_identity,
 };

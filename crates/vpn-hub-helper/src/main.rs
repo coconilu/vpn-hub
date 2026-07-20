@@ -53,15 +53,8 @@ fn provisioned_service(signals: Arc<vpn_hub_helper::ServiceSignals>) -> Result<(
     let program_data = std::env::var_os("ProgramData")
         .map(std::path::PathBuf::from)
         .ok_or("ProgramData is unavailable")?;
-    vpn_hub_helper::InstallationReference {
-        schema_version: 1,
-        install_id: install_id.clone(),
-        helper_enabled: true,
-        program_data_root: root.clone(),
-        client_secret_ref: "runtime-validation-only".into(),
-    }
-    .validate(&program_data)
-    .map_err(|_| "helper installation root invalid")?;
+    vpn_hub_helper::validate_installation_location(&install_id, &root, &program_data)
+        .map_err(|_| "helper installation root invalid")?;
     if executable.parent() != Some(root.join("bin").as_path()) {
         return Err("helper executable location invalid".into());
     }
@@ -102,7 +95,8 @@ fn provisioned_service(signals: Arc<vpn_hub_helper::ServiceSignals>) -> Result<(
     let runtime = HelperRuntime::acquire_helper_with_authority_file(
         WindowsJobCoreBackend::new(root.clone()),
         provider,
-        &root.join("authority.lease"),
+        &root,
+        &interactive_user_sid,
         now_ms,
     )
     .map_err(|_| "helper runtime failed closed")?;

@@ -200,11 +200,27 @@ pub enum PortOwnership {
     ThirdPartyOccupied,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StageDeclaration {
     pub transaction_id: String,
     pub ownership_token: String,
     pub generation: u64,
+}
+
+impl fmt::Debug for StageDeclaration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StageDeclaration")
+            .field(
+                "transaction_id_configured",
+                &!self.transaction_id.is_empty(),
+            )
+            .field(
+                "ownership_token_configured",
+                &!self.ownership_token.is_empty(),
+            )
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 impl StageDeclaration {
@@ -215,13 +231,31 @@ impl StageDeclaration {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OwnedCoreIdentity {
     pub pid: u32,
     pub creation_identity: u64,
     pub generation: u64,
     pub transaction_id: String,
     pub ownership_token: String,
+}
+
+impl fmt::Debug for OwnedCoreIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedCoreIdentity")
+            .field("pid", &self.pid)
+            .field("creation_identity", &self.creation_identity)
+            .field("generation", &self.generation)
+            .field(
+                "transaction_id_configured",
+                &!self.transaction_id.is_empty(),
+            )
+            .field(
+                "ownership_token_configured",
+                &!self.ownership_token.is_empty(),
+            )
+            .finish()
+    }
 }
 
 impl OwnedCoreIdentity {
@@ -252,7 +286,7 @@ pub struct EntrySwitchConsent {
 impl fmt::Debug for EntrySwitchConsent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EntrySwitchConsent")
-            .field("token_id", &self.token_id())
+            .field("token_configured", &!self.token.is_empty())
             .field("issued_at_unix_ms", &self.issued_at_unix_ms)
             .field("expires_at_unix_ms", &self.expires_at_unix_ms)
             .finish_non_exhaustive()
@@ -274,7 +308,8 @@ impl EntrySwitchConsent {
 pub struct EntrySwitchPlan {
     pub schema_version: u16,
     pub context: EntrySwitchContext,
-    pub config_generation: u64,
+    pub original_generation: u64,
+    pub committed_generation: u64,
     pub current: EntryConfig,
     pub target: EntryConfig,
     pub apply_system_proxy: bool,
@@ -288,7 +323,8 @@ impl fmt::Debug for EntrySwitchPlan {
         f.debug_struct("EntrySwitchPlan")
             .field("schema_version", &self.schema_version)
             .field("context", &self.context)
-            .field("config_generation", &self.config_generation)
+            .field("original_generation", &self.original_generation)
+            .field("committed_generation", &self.committed_generation)
             .field("current", &self.current)
             .field("target", &self.target)
             .field("apply_system_proxy", &self.apply_system_proxy)
@@ -326,7 +362,9 @@ impl EntrySwitchPlan {
             .ok_or(EntrySwitchError::InvalidConsent)?;
         if self.schema_version != SCHEMA_VERSION
             || self.current == self.target
-            || self.config_generation == 0
+            || self.original_generation == 0
+            || self.committed_generation == 0
+            || self.committed_generation == self.original_generation
             || self.consent.issued_at_unix_ms < 0
             || lifetime != CONSENT_LIFETIME_MS
             || self.apply_system_proxy != self.original_proxy.is_some()
@@ -362,7 +400,8 @@ impl EntrySwitchPlan {
             schema_version: self.schema_version,
             install_id: self.context.install_id.clone(),
             user_scope_id: self.context.user_scope_id.clone(),
-            config_generation: self.config_generation,
+            original_generation: self.original_generation,
+            committed_generation: self.committed_generation,
             current: self.current.clone(),
             target: self.target.clone(),
             apply_system_proxy: self.apply_system_proxy,
@@ -385,7 +424,8 @@ pub struct EntrySwitchAudit {
     pub schema_version: u16,
     pub install_id: String,
     pub user_scope_id: String,
-    pub config_generation: u64,
+    pub original_generation: u64,
+    pub committed_generation: u64,
     pub current: EntryConfig,
     pub target: EntryConfig,
     pub apply_system_proxy: bool,
@@ -409,13 +449,26 @@ pub enum EntrySwitchPhase {
     Restored,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EntrySwitchJournalRecord {
     pub schema_version: u16,
     pub phase: EntrySwitchPhase,
     pub plan: EntrySwitchPlan,
     pub stage_declaration: Option<StageDeclaration>,
     pub staged_core: Option<OwnedCoreIdentity>,
+}
+
+impl fmt::Debug for EntrySwitchJournalRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EntrySwitchJournalRecord")
+            .field("schema_version", &self.schema_version)
+            .field("phase", &self.phase)
+            .field("original_generation", &self.plan.original_generation)
+            .field("committed_generation", &self.plan.committed_generation)
+            .field("stage_declared", &self.stage_declaration.is_some())
+            .field("staged_core_recorded", &self.staged_core.is_some())
+            .finish()
+    }
 }
 
 impl EntrySwitchJournalRecord {
@@ -431,7 +484,7 @@ impl EntrySwitchJournalRecord {
         self.plan.validate_integrity(key)?;
         if self.schema_version != SCHEMA_VERSION
             || authority.context() != &self.plan.context
-            || authority.generation() != self.plan.config_generation
+            || authority.generation() != self.plan.original_generation
         {
             return Err(EntrySwitchError::Unauthorized);
         }
@@ -442,7 +495,7 @@ impl EntrySwitchJournalRecord {
             EntrySwitchPhase::StagePending => {
                 self.stage_declaration
                     .as_ref()
-                    .is_some_and(|d| d.valid(self.plan.config_generation))
+                    .is_some_and(|d| d.valid(self.plan.original_generation))
                     && self.staged_core.is_none()
             }
             EntrySwitchPhase::RollbackRequired | EntrySwitchPhase::Restored => {
@@ -451,7 +504,7 @@ impl EntrySwitchJournalRecord {
             _ => {
                 self.stage_declaration
                     .as_ref()
-                    .is_some_and(|d| d.valid(self.plan.config_generation))
+                    .is_some_and(|d| d.valid(self.plan.original_generation))
                     && self
                         .staged_core
                         .as_ref()
@@ -473,7 +526,7 @@ impl EntrySwitchJournalRecord {
             EntrySwitchPhase::StagePending => {
                 self.stage_declaration
                     .as_ref()
-                    .is_some_and(|d| d.valid(self.plan.config_generation))
+                    .is_some_and(|d| d.valid(self.plan.original_generation))
                     && self.staged_core.is_none()
             }
             EntrySwitchPhase::RollbackRequired | EntrySwitchPhase::Restored => {
@@ -482,7 +535,7 @@ impl EntrySwitchJournalRecord {
             _ => {
                 self.stage_declaration
                     .as_ref()
-                    .is_some_and(|d| d.valid(self.plan.config_generation))
+                    .is_some_and(|d| d.valid(self.plan.original_generation))
                     && self
                         .staged_core
                         .as_ref()
@@ -496,14 +549,50 @@ impl EntrySwitchJournalRecord {
             Err(EntrySwitchError::Journal)
         }
     }
+
+    fn observed_state(
+        &self,
+        generation: u64,
+        entry: &EntryConfig,
+    ) -> Result<ObservedEntryState, EntrySwitchError> {
+        let state = if generation == self.plan.original_generation && entry == &self.plan.current {
+            ObservedEntryState::Original
+        } else if generation == self.plan.committed_generation && entry == &self.plan.target {
+            ObservedEntryState::Committed
+        } else {
+            return Err(EntrySwitchError::StaleGeneration);
+        };
+        let accepted = match self.phase {
+            EntrySwitchPhase::Prepared
+            | EntrySwitchPhase::StagePending
+            | EntrySwitchPhase::Staged
+            | EntrySwitchPhase::Verified
+            | EntrySwitchPhase::Restored => state == ObservedEntryState::Original,
+            EntrySwitchPhase::EntryCommitPending | EntrySwitchPhase::RollbackRequired => true,
+            EntrySwitchPhase::EntryCommitted
+            | EntrySwitchPhase::ProxyApplyPending
+            | EntrySwitchPhase::ProxyApplied => state == ObservedEntryState::Committed,
+        };
+        if accepted {
+            Ok(state)
+        } else {
+            Err(EntrySwitchError::StaleGeneration)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObservedEntryState {
+    Original,
+    Committed,
 }
 
 fn recovery_identity_shape(record: &EntrySwitchJournalRecord) -> bool {
     match (&record.stage_declaration, &record.staged_core) {
         (None, None) => true,
-        (Some(declaration), None) => declaration.valid(record.plan.config_generation),
+        (Some(declaration), None) => declaration.valid(record.plan.original_generation),
         (Some(declaration), Some(core)) => {
-            declaration.valid(record.plan.config_generation) && core.matches(declaration)
+            declaration.valid(record.plan.original_generation) && core.matches(declaration)
         }
         (None, Some(_)) => false,
     }
@@ -554,6 +643,7 @@ pub enum EntrySwitchError {
 #[allow(clippy::missing_errors_doc)]
 pub trait EntryBackend {
     fn config_generation(&self) -> Result<u64, EntrySwitchError>;
+    fn planned_config_generation(&self, target: &EntryConfig) -> Result<u64, EntrySwitchError>;
     fn current_entry(&self) -> Result<EntryConfig, EntrySwitchError>;
     fn inspect_port(&mut self, target: &EntryConfig) -> Result<PortOwnership, EntrySwitchError>;
     fn declare_stage(
@@ -567,7 +657,11 @@ pub trait EntryBackend {
     ) -> Result<OwnedCoreIdentity, EntrySwitchError>;
     fn verify(&mut self, core: &OwnedCoreIdentity) -> Result<SwitchVerification, EntrySwitchError>;
     fn commit_entry(&mut self, plan: &EntrySwitchPlan) -> Result<(), EntrySwitchError>;
-    fn restore_entry(&mut self, entry: &EntryConfig) -> Result<(), EntrySwitchError>;
+    fn restore_entry(
+        &mut self,
+        entry: &EntryConfig,
+        generation: u64,
+    ) -> Result<(), EntrySwitchError>;
     fn stop_declared_if_owned(
         &mut self,
         declaration: &StageDeclaration,
@@ -795,7 +889,8 @@ struct RecordWire {
 struct PlanWire {
     schema_version: u16,
     context: EntrySwitchContext,
-    config_generation: u64,
+    original_generation: u64,
+    committed_generation: u64,
     current: EntryConfig,
     target: EntryConfig,
     apply_system_proxy: bool,
@@ -861,7 +956,8 @@ impl From<&EntrySwitchPlan> for PlanWire {
         Self {
             schema_version: v.schema_version,
             context: v.context.clone(),
-            config_generation: v.config_generation,
+            original_generation: v.original_generation,
+            committed_generation: v.committed_generation,
             current: v.current.clone(),
             target: v.target.clone(),
             apply_system_proxy: v.apply_system_proxy,
@@ -879,7 +975,8 @@ impl TryFrom<PlanWire> for EntrySwitchPlan {
         Ok(Self {
             schema_version: v.schema_version,
             context: v.context,
-            config_generation: v.config_generation,
+            original_generation: v.original_generation,
+            committed_generation: v.committed_generation,
             current: v.current,
             target: v.target,
             apply_system_proxy: v.apply_system_proxy,
@@ -1029,6 +1126,10 @@ impl EntrySwitchPlanner {
         if generation == 0 || generation != request.expected_config_generation {
             return Err(EntrySwitchError::StaleGeneration);
         }
+        let committed_generation = entry.planned_config_generation(&request.target)?;
+        if committed_generation == 0 || committed_generation == generation {
+            return Err(EntrySwitchError::StaleGeneration);
+        }
         let current = entry.current_entry()?;
         validate_entry(&current)?;
         if current == request.target {
@@ -1065,7 +1166,8 @@ impl EntrySwitchPlanner {
         let mut plan = EntrySwitchPlan {
             schema_version: SCHEMA_VERSION,
             context,
-            config_generation: generation,
+            original_generation: generation,
+            committed_generation,
             current,
             target: request.target.clone(),
             apply_system_proxy: request.apply_system_proxy,
@@ -1131,7 +1233,7 @@ where
         if self.journal.load()?.is_some() {
             return Err(EntrySwitchError::RecoveryPending);
         }
-        if self.entry.config_generation()? != plan.config_generation
+        if self.entry.config_generation()? != plan.original_generation
             || self.entry.current_entry()? != plan.current
         {
             return Err(EntrySwitchError::StaleGeneration);
@@ -1167,9 +1269,10 @@ where
         self.journal.save(&record)?;
         let result = self.apply_inner(&mut record);
         if result.is_err() {
+            let source_phase = record.phase;
             record.phase = EntrySwitchPhase::RollbackRequired;
             let _ = self.journal.save(&record);
-            if self.restore_record(&mut record).is_err() {
+            if self.restore_record(&mut record, source_phase).is_err() {
                 return Err(EntrySwitchError::RecoveryPending);
             }
         }
@@ -1181,7 +1284,7 @@ where
         record: &mut EntrySwitchJournalRecord,
     ) -> Result<(), EntrySwitchError> {
         let declaration = self.entry.declare_stage(&record.plan)?;
-        if !declaration.valid(record.plan.config_generation) {
+        if !declaration.valid(record.plan.original_generation) {
             return Err(EntrySwitchError::Backend);
         }
         record.stage_declaration = Some(declaration.clone());
@@ -1197,7 +1300,7 @@ where
         if !self
             .entry
             .verify(&core)?
-            .validates(record.plan.config_generation)
+            .validates(record.plan.original_generation)
         {
             return Err(EntrySwitchError::VerificationFailed);
         }
@@ -1206,6 +1309,11 @@ where
         record.phase = EntrySwitchPhase::EntryCommitPending;
         self.journal.save(record)?;
         self.entry.commit_entry(&record.plan)?;
+        if self.entry.config_generation()? != record.plan.committed_generation
+            || self.entry.current_entry()? != record.plan.target
+        {
+            return Err(EntrySwitchError::StaleGeneration);
+        }
         record.phase = EntrySwitchPhase::EntryCommitted;
         self.journal.save(record)?;
         if let (Some(original), Some(desired)) =
@@ -1239,17 +1347,30 @@ where
             return Ok(false);
         };
         record.validate_recovery(self.key, self.authority)?;
-        self.restore_record(&mut record)?;
+        record.observed_state(
+            self.entry.config_generation()?,
+            &self.entry.current_entry()?,
+        )?;
+        let source_phase = record.phase;
+        if !matches!(
+            record.phase,
+            EntrySwitchPhase::RollbackRequired | EntrySwitchPhase::Restored
+        ) {
+            record.phase = EntrySwitchPhase::RollbackRequired;
+            self.journal.save(&record)?;
+        }
+        self.restore_record(&mut record, source_phase)?;
         Ok(true)
     }
 
     fn restore_record(
         &mut self,
         record: &mut EntrySwitchJournalRecord,
+        source_phase: EntrySwitchPhase,
     ) -> Result<(), EntrySwitchError> {
         self.authority.ensure_held()?;
         if matches!(
-            record.phase,
+            source_phase,
             EntrySwitchPhase::ProxyApplyPending
                 | EntrySwitchPhase::ProxyApplied
                 | EntrySwitchPhase::RollbackRequired
@@ -1270,14 +1391,26 @@ where
             }
         }
         if matches!(
-            record.phase,
+            source_phase,
             EntrySwitchPhase::EntryCommitPending
                 | EntrySwitchPhase::EntryCommitted
                 | EntrySwitchPhase::ProxyApplyPending
                 | EntrySwitchPhase::ProxyApplied
                 | EntrySwitchPhase::RollbackRequired
         ) {
-            self.entry.restore_entry(&record.plan.current)?;
+            let state = record.observed_state(
+                self.entry.config_generation()?,
+                &self.entry.current_entry()?,
+            )?;
+            if state == ObservedEntryState::Committed {
+                self.entry
+                    .restore_entry(&record.plan.current, record.plan.original_generation)?;
+            }
+        }
+        if self.entry.config_generation()? != record.plan.original_generation
+            || self.entry.current_entry()? != record.plan.current
+        {
+            return Err(EntrySwitchError::RecoveryPending);
         }
         if let Some(core) = &record.staged_core {
             self.entry.stop_if_owned(core)?;
@@ -1292,7 +1425,7 @@ where
 
     fn validate_authority(&self, plan: &EntrySwitchPlan) -> Result<(), EntrySwitchError> {
         if self.authority.context() != &plan.context
-            || self.authority.generation() != plan.config_generation
+            || self.authority.generation() != plan.original_generation
         {
             return Err(EntrySwitchError::Unauthorized);
         }
@@ -1367,7 +1500,8 @@ fn canonical_plan(plan: &EntrySwitchPlan, id: &str) -> Vec<u8> {
     b.extend_from_slice(&plan.schema_version.to_be_bytes());
     put_str(&mut b, &plan.context.install_id);
     put_str(&mut b, &plan.context.user_scope_id);
-    b.extend_from_slice(&plan.config_generation.to_be_bytes());
+    b.extend_from_slice(&plan.original_generation.to_be_bytes());
+    b.extend_from_slice(&plan.committed_generation.to_be_bytes());
     put_str(&mut b, &plan.current.host);
     b.extend_from_slice(&plan.current.port.to_be_bytes());
     put_str(&mut b, &plan.target.host);
@@ -1484,6 +1618,9 @@ mod tests {
         fn config_generation(&self) -> Result<u64, EntrySwitchError> {
             Ok(self.generation)
         }
+        fn planned_config_generation(&self, _: &EntryConfig) -> Result<u64, EntrySwitchError> {
+            Ok(self.generation + 1)
+        }
         fn current_entry(&self) -> Result<EntryConfig, EntrySwitchError> {
             Ok(self.current.clone())
         }
@@ -1516,11 +1653,17 @@ mod tests {
         fn commit_entry(&mut self, p: &EntrySwitchPlan) -> Result<(), EntrySwitchError> {
             self.events.push("commit");
             self.current = p.target.clone();
+            self.generation = p.committed_generation;
             Ok(())
         }
-        fn restore_entry(&mut self, e: &EntryConfig) -> Result<(), EntrySwitchError> {
+        fn restore_entry(
+            &mut self,
+            e: &EntryConfig,
+            generation: u64,
+        ) -> Result<(), EntrySwitchError> {
             self.events.push("restore");
             self.current = e.clone();
+            self.generation = generation;
             Ok(())
         }
         fn stop_declared_if_owned(&mut self, _: &StageDeclaration) -> Result<(), EntrySwitchError> {
@@ -1679,7 +1822,10 @@ mod tests {
         v.desired_proxy.as_mut().unwrap().proxy_bypass = Some("attacker".into());
         cases.push(v);
         let mut v = plan.clone();
-        v.config_generation += 1;
+        v.original_generation += 1;
+        cases.push(v);
+        let mut v = plan.clone();
+        v.committed_generation += 1;
         cases.push(v);
         for v in cases {
             assert_eq!(
@@ -1781,6 +1927,102 @@ mod tests {
             valid.validate_recovery(&key, &bad),
             Err(EntrySwitchError::Unauthorized)
         );
+    }
+    #[test]
+    fn recovery_rejects_external_generation_or_entry_change_and_retains_journal() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let clock = Clock(1_000);
+        for change_generation in [false, true] {
+            let (mut e, mut p, plan) = plan(false, &key, &clock);
+            if change_generation {
+                e.generation = 99;
+            } else {
+                e.current.port = 49_999;
+            }
+            let mut j = MemoryEntrySwitchJournal {
+                record: Some(EntrySwitchJournalRecord {
+                    schema_version: SCHEMA_VERSION,
+                    phase: EntrySwitchPhase::StagePending,
+                    plan,
+                    stage_declaration: Some(declaration()),
+                    staged_core: None,
+                }),
+                ..Default::default()
+            };
+            let mut a = guard();
+            assert_eq!(
+                EntrySwitchTransaction::new(&mut e, &mut p, &mut j, &mut a, &key, &clock).recover(),
+                Err(EntrySwitchError::StaleGeneration)
+            );
+            assert!(j.load().unwrap().is_some());
+            assert!(!e.events.contains(&"restore"));
+            assert!(!e.events.contains(&"stop_declared"));
+        }
+    }
+
+    #[test]
+    fn entry_commit_pending_recovers_only_exact_original_or_committed_state() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let clock = Clock(1_000);
+        for effect_happened in [false, true] {
+            let (mut e, mut p, plan) = plan(false, &key, &clock);
+            if effect_happened {
+                e.current = plan.target.clone();
+                e.generation = plan.committed_generation;
+            }
+            let mut j = MemoryEntrySwitchJournal {
+                record: Some(EntrySwitchJournalRecord {
+                    schema_version: SCHEMA_VERSION,
+                    phase: EntrySwitchPhase::EntryCommitPending,
+                    plan: plan.clone(),
+                    stage_declaration: Some(declaration()),
+                    staged_core: Some(identity()),
+                }),
+                ..Default::default()
+            };
+            let mut a = guard();
+            EntrySwitchTransaction::new(&mut e, &mut p, &mut j, &mut a, &key, &clock)
+                .recover()
+                .unwrap();
+            assert_eq!(e.generation, plan.original_generation);
+            assert_eq!(e.current, plan.current);
+            assert_eq!(e.events.contains(&"restore"), effect_happened);
+            assert!(j.load().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn recovery_debug_views_never_render_credential_shaped_ownership_values() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let clock = Clock(1_000);
+        let (_, _, mut plan) = plan(false, &key, &clock);
+        let transaction_secret = ["ghp", "transaction", "secret"].join("_");
+        let ownership_secret = ["password", "ownership-secret"].join("=");
+        let consent_secret = ["token-secret", "signature-secret"].join(".");
+        plan.consent.replace_token(consent_secret.clone());
+        let declaration = StageDeclaration {
+            transaction_id: transaction_secret.clone(),
+            ownership_token: ownership_secret.clone(),
+            generation: 7,
+        };
+        let core = OwnedCoreIdentity {
+            pid: 42,
+            creation_identity: 88,
+            generation: 7,
+            transaction_id: transaction_secret.clone(),
+            ownership_token: ownership_secret.clone(),
+        };
+        let record = EntrySwitchJournalRecord {
+            schema_version: SCHEMA_VERSION,
+            phase: EntrySwitchPhase::Staged,
+            plan: plan.clone(),
+            stage_declaration: Some(declaration.clone()),
+            staged_core: Some(core.clone()),
+        };
+        let rendered = format!("{declaration:?} {core:?} {record:?} {plan:?}");
+        for secret in [&transaction_secret, &ownership_secret, &consent_secret] {
+            assert!(!rendered.contains(secret));
+        }
     }
     #[test]
     fn failed_verification_rolls_back_and_consumes_once() {
