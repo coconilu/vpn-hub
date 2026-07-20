@@ -64,12 +64,22 @@ pub fn unknown_udp_evidence(outlet: &OutletConfig, reason_code: &str) -> UdpCapa
 pub fn is_current_udp_evidence(outlet: &OutletConfig, evidence: &UdpCapabilityEvidence) -> bool {
     let (fingerprint, generation) = outlet_udp_configuration(outlet);
     evidence.outlet_id == outlet.id
+        && chrono::DateTime::parse_from_rfc3339(&evidence.observed_at).is_ok()
         && evidence.evidence_version == UDP_EVIDENCE_VERSION
         && evidence.probe_version == UDP_PROBE_VERSION
         && evidence.model_version == UDP_MODEL_VERSION
         && evidence.configuration_fingerprint == fingerprint
         && evidence.configuration_generation != i64::MAX as u64
         && evidence.configuration_generation == generation
+        && valid_reason_code(&evidence.reason_code)
+}
+
+fn valid_reason_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 #[must_use]

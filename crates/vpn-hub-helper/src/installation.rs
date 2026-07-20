@@ -119,6 +119,11 @@ impl InstallationReference {
             .program_data_root
             .join("entry-switch/entry-switch.json")
     }
+
+    #[must_use]
+    pub fn tun_authority_path(&self) -> PathBuf {
+        self.document.program_data_root.join("tun-authority.lease")
+    }
 }
 
 /// Validates installer-owned root metadata without constructing the
@@ -198,6 +203,10 @@ mod tests {
         assert_eq!(
             reference.entry_switch_journal_path(),
             program_data.join("VPN Hub/install-a/entry-switch/entry-switch.json")
+        );
+        assert_eq!(
+            reference.tun_authority_path(),
+            program_data.join("VPN Hub/install-a/tun-authority.lease")
         );
     }
 

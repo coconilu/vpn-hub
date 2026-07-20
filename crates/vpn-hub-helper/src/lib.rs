@@ -12,11 +12,13 @@ mod installation;
 mod manifest;
 mod ownership;
 mod protocol;
+mod release;
 mod runtime;
 mod service_shell;
 mod status;
 mod supervisor;
 mod transport;
+mod tun;
 
 pub use authority::{
     AuthorityError, AuthorityFileGuard, AuthorityLease, AuthorityRegistry, SupervisorAuthority,
@@ -40,6 +42,13 @@ pub use protocol::{
     ReplayCache, SignedRequest, SignedResponse, UnsignedRequest, UnsignedResponse,
     authenticate_challenged_frame, authenticate_response_frame, pipe_name,
 };
+pub use release::{
+    ArtifactKind, DataDisposition, EvidenceStatus, MigrationComponent, MigrationExecutionError,
+    PromotionEvidence, ReleaseArtifact, ReleaseChannel, ReleaseError, ReleaseLifecycleAction,
+    ReleaseManifest, ReleaseMigrationBackend, ReleaseMigrationPlan, ReleaseOperation,
+    ReleasePolicy, ReleaseToolchain, SignedReleaseManifest, VerifiedRelease,
+    execute_release_migration,
+};
 pub use runtime::{CoreBackend, HelperRuntime, ManifestProvider, RuntimeError, RuntimeReply};
 #[cfg(target_os = "windows")]
 pub use runtime::{ProgramDataManifestProvider, WindowsJobCoreBackend, run_windows_helper_loop};
@@ -54,6 +63,14 @@ pub use supervisor::{
 };
 #[cfg(target_os = "windows")]
 pub use transport::{NamedPipeClient, TransportError, serve_one_named_pipe_request};
+pub use tun::{
+    AddressFamily, ExecutableIdentity, ExecutableRole, ExpectedDisposition, FileTunJournalStore,
+    LeakCheck, NetworkSnapshot, OutletDeclaration, OutletTransport, PlatformCapability,
+    ProcessExclusionCapability, ProcessNetworkPolicy, ProcessRule, RegisteredOutlet, TrafficClass,
+    TransportProtocol, TunAuthorityGuard, TunBackend, TunConsent, TunError, TunJournal,
+    TunJournalPhase, TunJournalStore, TunPlan, TunPlanAction, TunPlanBuilder, TunTransaction,
+    WindowsPlanOnlyTunBackend,
+};
 
 /// Current helper protocol major version.
 pub const PROTOCOL_VERSION: u16 = 1;

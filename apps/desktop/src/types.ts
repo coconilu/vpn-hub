@@ -232,6 +232,23 @@ export interface SettingsPreview {
   issues: ValidationIssue[];
   can_apply: boolean;
   request_fingerprint: string;
+  tun_plan: SafeTunPlanPreview;
+}
+
+export interface SafeTunPlanPreview {
+  requested_enabled: boolean;
+  active: boolean;
+  supported: boolean;
+  consent_required: boolean;
+  reason_code: string;
+  generation: string;
+  subscription_outlet_ids: string[];
+  local_outlet_ids: string[];
+  missing_executable_identity_outlet_ids: string[];
+  control_plane_policy: string;
+  core_policy: string;
+  local_outlet_policy: string;
+  leak_matrix_disposition: string;
 }
 
 export interface CredentialMutationIntent {

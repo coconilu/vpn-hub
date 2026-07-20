@@ -102,3 +102,11 @@ test("settings component has no controlled or React-state credential plaintext",
   assert.equal(/type="password"[^>]*\bvalue=/.test(source), false);
   assert.equal(source.includes("dispatchOneShotSettingsApply"), true);
 });
+
+test("unsupported TUN stays visibly off and cannot record consent", () => {
+  const source = fs.readFileSync(new URL("../SettingsPage.tsx", import.meta.url), "utf8");
+  assert.equal(source.includes("checked={false} disabled />启用 TUN"), true);
+  assert.equal(source.includes("checked={false} disabled />我已理解"), true);
+  assert.equal(source.includes("windows_verified_application_identity_exclusion_unavailable"), true);
+  assert.equal(source.includes("missing_executable_identity_outlet_ids"), true);
+});

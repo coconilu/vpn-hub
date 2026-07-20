@@ -13,16 +13,21 @@ name = "vpn-hub-helper"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
 fs2.workspace = true
 hmac.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+url.workspace = true
 tokio = { workspace = true, features = ["io-util", "process"] }
 zeroize.workspace = true
+vpn-hub-core = { path = "../vpn-hub-core" }
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { workspace = true, features = ["job-object", "kill-on-drop"] }

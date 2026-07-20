@@ -141,6 +141,21 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
       {([ ["刷新周期（秒）", "refresh_interval_seconds", 5, 86400], ["连接超时（毫秒）", "connect_timeout_ms", 1, 120000], ["请求超时（毫秒）", "request_timeout_ms", 1, 120000], ["失败阈值", "failure_threshold", 1, 100], ["恢复阈值", "recovery_threshold", 1, 100], ["历史保留（天）", "retention_days", 1, 3650] ] as const).map(([label, field, min, max]) => <label key={field}>{label}<input type="number" min={min} max={max} value={draft[field]} onChange={(event) => changeDraft((current) => ({ ...current, [field]: Number(event.target.value) }))} /></label>)}
     </div></section>
 
+    <section className="settings-card" aria-label="TUN 能力与风险确认">
+      <h2>可选 TUN（当前不可用）</h2>
+      <p>默认关闭。当前 Windows 后端尚不能证明按可执行文件身份排除，因此不会启用 TUN、修改路由/DNS/适配器，也不会记录风险确认。</p>
+      <div className="settings-grid compact">
+        <label className="check-field"><input type="checkbox" checked={false} disabled />启用 TUN</label>
+        <label className="check-field"><input type="checkbox" checked={false} disabled />我已理解断网、DNS 泄漏与递归代理风险</label>
+      </div>
+      <p><code>{preview?.tun_plan.reason_code ?? "windows_verified_application_identity_exclusion_unavailable"}</code></p>
+      {preview && <div role="status" aria-live="polite">
+        <p>计划 generation：<code>{preview.tun_plan.generation}</code>；订阅出口 {preview.tun_plan.subscription_outlet_ids.length} 个，本地客户端出口 {preview.tun_plan.local_outlet_ids.length} 个。</p>
+        {preview.tun_plan.missing_executable_identity_outlet_ids.length > 0 && <p>缺少经校验的本地客户端可执行身份：<code>{preview.tun_plan.missing_executable_identity_outlet_ids.join(", ")}</code>。能力就绪前保持 Fail Closed。</p>}
+        <p>GUI/Helper 仅允许 loopback 控制面且外网拒绝；Core 仅限自有上游；登记的本地客户端仅允许最小基础设施 bypass。IPv4/IPv6 × TCP/UDP/DNS 当前全部拒绝直连。</p>
+      </div>}
+    </section>
+
     <section className="settings-card outlets-card"><div className="outlets-heading"><div><h2>出口</h2><p>排序即优先级。重命名、启用和排序不会改变稳定 ID。</p></div><div><button type="button" className="secondary-button" onClick={addSubscription}><Plus />订阅</button><button type="button" className="secondary-button" onClick={addLocal}><Plus />本地出口</button></div></div>
       <div className="settings-outlets">{draft.outlets.map((outlet, index) => <article className="settings-outlet" key={outlet.outlet_id}>
         <div className="outlet-order"><span>{index + 1}</span><button type="button" aria-label={`上移 ${outlet.label}`} disabled={index === 0} onClick={() => changeDraft((current) => ({ ...current, outlets: moveItem(current.outlets, index, -1) }))}><ArrowUp /></button><button type="button" aria-label={`下移 ${outlet.label}`} disabled={index === draft.outlets.length - 1} onClick={() => changeDraft((current) => ({ ...current, outlets: moveItem(current.outlets, index, 1) }))}><ArrowDown /></button></div>

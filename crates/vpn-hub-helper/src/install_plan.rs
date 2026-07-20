@@ -53,6 +53,7 @@ pub enum PlanOperation {
     RecoverInteractiveUserEntrySwitchIfPresent {
         journal_relative_path: String,
     },
+    ProvisionTunAuthorityLeaseFile,
     RegisterService {
         account: AccountContract,
         start_automatically: bool,
@@ -66,7 +67,9 @@ pub enum PlanOperation {
         reference_name: String,
         side: ProtectedMaterialSide,
     },
+    EnterFailClosed,
     StopOwnedJob,
+    RestoreTunSnapshot,
     RemoveServiceRegistration,
     RemoveProtectedReference {
         reference_name: String,
@@ -75,6 +78,7 @@ pub enum PlanOperation {
     VerifyNoOwnedJob,
     VerifyNoServiceRegistration,
     VerifyNoProtectedReferences,
+    VerifyNoTunState,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -85,6 +89,9 @@ pub struct InstallPlan {
     pub dry_run: bool,
     pub requires_elevation_by_signed_installer: bool,
     pub helper_self_elevation: bool,
+    /// The signed installer must execute this sequence in order and abort on
+    /// the first failure. Later cleanup/removal operations must never run
+    /// after fail-closed entry, owned-job stop, or TUN restoration fails.
     pub operations: Vec<PlanOperation>,
 }
 
@@ -105,6 +112,7 @@ impl From<AuthError> for InstallPlanError {
 }
 
 impl InstallPlan {
+    #[allow(clippy::too_many_lines)]
     pub fn build(
         action: InstallAction,
         install_id: &str,
@@ -129,6 +137,15 @@ impl InstallPlan {
                     ],
                 },
                 entry_switch_state_operation(&entry_switch_reference),
+                PlanOperation::ProvisionTunAuthorityLeaseFile,
+                PlanOperation::ApplyProgramDataAcl {
+                    relative_path: "tun-authority.lease".into(),
+                    principals: vec![
+                        "NT AUTHORITY\\LOCAL SERVICE".into(),
+                        "SYSTEM".into(),
+                        "BUILTIN\\Administrators".into(),
+                    ],
+                },
                 PlanOperation::ProvisionAuthorityLeaseFile,
                 PlanOperation::ApplyProgramDataAcl {
                     relative_path: "authority.lease".into(),
@@ -164,8 +181,10 @@ impl InstallPlan {
                 PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent {
                     journal_relative_path: "entry-switch/entry-switch.json".into(),
                 },
-                entry_switch_state_operation(&entry_switch_reference),
+                PlanOperation::EnterFailClosed,
                 PlanOperation::StopOwnedJob,
+                PlanOperation::RestoreTunSnapshot,
+                entry_switch_state_operation(&entry_switch_reference),
                 PlanOperation::VerifySignedArtifact {
                     relative_path: "bin/vpn-hub-helper.exe".into(),
                     sha256: helper_sha256.into(),
@@ -184,7 +203,9 @@ impl InstallPlan {
                 PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent {
                     journal_relative_path: "entry-switch/entry-switch.json".into(),
                 },
+                PlanOperation::EnterFailClosed,
                 PlanOperation::StopOwnedJob,
+                PlanOperation::RestoreTunSnapshot,
                 PlanOperation::RemoveServiceRegistration,
                 PlanOperation::RemoveProtectedReference {
                     reference_name: format!("{protected_reference}/service"),
@@ -199,6 +220,7 @@ impl InstallPlan {
                 PlanOperation::VerifyNoOwnedJob,
                 PlanOperation::VerifyNoServiceRegistration,
                 PlanOperation::VerifyNoProtectedReferences,
+                PlanOperation::VerifyNoTunState,
             ],
         };
         Ok(Self {
@@ -346,13 +368,32 @@ mod tests {
                 start_automatically: false
             }
         )));
+        assert!(matches!(
+            plan.operations.as_slice(),
+            [
+                PlanOperation::VerifySignedArtifact { .. },
+                PlanOperation::ApplyProgramDataAcl { .. },
+                PlanOperation::ProvisionEntrySwitchState { .. },
+                PlanOperation::ProvisionTunAuthorityLeaseFile,
+                PlanOperation::ApplyProgramDataAcl {
+                    relative_path,
+                    principals,
+                },
+                ..
+            ] if relative_path == "tun-authority.lease"
+                && principals == &[
+                    "NT AUTHORITY\\LOCAL SERVICE",
+                    "SYSTEM",
+                    "BUILTIN\\Administrators",
+                ]
+        ));
         let rendered = serde_json::to_string(&plan).unwrap();
         assert!(!rendered.contains("LocalSystem"));
         assert!(!rendered.contains("protocol-key\":"));
     }
 
     #[test]
-    fn upgrade_recovers_then_provisions_before_stopping_owned_job() {
+    fn upgrade_recovers_then_runs_tun_safety_prefix_before_provisioning() {
         let plan =
             InstallPlan::build(InstallAction::Upgrade, "install-a", &"b".repeat(64)).unwrap();
         assert!(matches!(
@@ -360,17 +401,21 @@ mod tests {
             Some(PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent { .. })
         ));
         assert!(matches!(
-            plan.operations.get(1),
+            &plan.operations[1..4],
+            [
+                PlanOperation::EnterFailClosed,
+                PlanOperation::StopOwnedJob,
+                PlanOperation::RestoreTunSnapshot
+            ]
+        ));
+        assert!(matches!(
+            plan.operations.get(4),
             Some(PlanOperation::ProvisionEntrySwitchState {
                 hmac_key_side: ProtectedMaterialSide::ClientWindowsProtectedStore,
                 existing_artifact_mode: ExistingArtifactMode::CreateIfMissingPreserveExisting,
                 rollback_new_artifacts_on_failure: true,
                 ..
             })
-        ));
-        assert!(matches!(
-            plan.operations.get(2),
-            Some(PlanOperation::StopOwnedJob)
         ));
         assert!(matches!(
             plan.operations.last(),
@@ -395,6 +440,15 @@ mod tests {
             plan.operations.first(),
             Some(PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent { .. })
         ));
+        assert!(matches!(
+            &plan.operations[1..4],
+            [
+                PlanOperation::EnterFailClosed,
+                PlanOperation::StopOwnedJob,
+                PlanOperation::RestoreTunSnapshot
+            ]
+        ));
+        assert!(plan.operations.contains(&PlanOperation::VerifyNoTunState));
     }
 
     #[test]

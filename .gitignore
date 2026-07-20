@@ -17,6 +17,8 @@ data/
 !apps/desktop/src/data/
 !apps/desktop/src/data/mock.ts
 .tools/
+isolated/
+release-out/
 
 # Build output
 target/
