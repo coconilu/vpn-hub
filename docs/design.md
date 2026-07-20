@@ -2,6 +2,8 @@
 
 > 公开版说明：本文中的客户端名称和进程名来自单台测试机器，仅作为兼容性研究样本，不代表其厂商提供或支持第三方控制接口。仓库不包含任何真实订阅地址、账号或节点。
 
+> 架构状态：早期章节保留固定三出口和 `6666` 接管方案作为设计历史；当前实现以 [Issue #7 动态出口模型](issue-7-dynamic-outlets.md) 为准，即入口和本地出口端口均可配置、默认入口为 `127.0.0.1:3666`。当前历史 schema 与统计口径见第 10 节和 [Issue #8 历史分析](issue-8-history-analytics.md)。
+
 > 状态：已 Review，进入 Phase 0
 > 目标平台：Windows 10/11
 > 文档日期：2026-07-18
@@ -336,13 +338,12 @@ stateDiagram-v2
 
 | 表 | 关键字段 | 用途 |
 |---|---|---|
-| `outbounds` | `id,name,type,priority,enabled` | 出口定义 |
-| `health_samples` | `time,outbound_id,state,latency_ms,target,error_code` | 延迟和健康样本 |
-| `incidents` | `started_at,ended_at,duration,reason,outbound_id` | 断线事件 |
-| `switch_events` | `time,from_id,to_id,trigger,mode` | 自动/手动切换记录 |
-| `process_events` | `time,process,event,pid,exit_code` | 两个客户端进程历史 |
-| `daily_stats` | `date,outbound_id,uptime,p50,p95,incident_count` | 长期统计 |
-| `app_settings` | 非敏感 UI 和策略设置 | 本地设置 |
+| `outlets` | `id,label,kind,enabled,deleted_at` | 稳定出口目录；删除使用墓碑 |
+| `probe_samples` | `observed_at,outlet_id,status,latency_ms,label/kind snapshot` | 脱敏延迟和健康样本 |
+| `state_events` | `occurred_at,outlet_id,from_status,to_status,reason` | 故障与恢复边界 |
+| `route_switches` | `occurred_at,from_outlet,to_outlet,mode,reason` | Controller 已确认的真实切换 |
+| `udp_capability_history/current` | 版本化结论和 current 引用 | 与 TCP 健康独立的 UDP 证据 |
+| `history_settings` | `retention_days` | 本机历史保留期 |
 
 订阅 URL、密码、令牌不进入 SQLite。
 
@@ -350,13 +351,12 @@ stateDiagram-v2
 
 | 数据 | 保存时间 |
 |---|---:|
-| 原始健康样本 | 30 天 |
-| 故障事件 | 1 年或由用户设置 |
-| 切换事件 | 1 年或由用户设置 |
-| 日统计 | 长期保存 |
-| Mihomo 实时日志 | 内存滚动或最多 7 天 |
+| 原始健康样本 | 默认 30 天，可设置 1–3650 天 |
+| 故障事件 | 同一保留期；进行中故障的最新边界不清理 |
+| 切换事件 | 同一保留期 |
+| UDP 证据 | 同一保留期；current 引用永不被清理 |
 
-三条出口每分钟采样一次，一个月约 129,600 条记录，SQLite 足够处理。
+三个出口每 180 秒采样一次，一个月约 43,200 条记录；索引、后端分页和流式 CSV 的规模测试覆盖该体量。
 
 ## 11. UI 规划
 
@@ -370,10 +370,9 @@ stateDiagram-v2
 
 首页同时显示：
 
-- `127.0.0.1:6666` 入口状态。
-- 当前出口和当前订阅节点。
-- 当前公网出口 IP。
-- 三个出口状态卡。
+- 用户配置的本机入口状态（未配置时默认 `127.0.0.1:3666`）。
+- 当前稳定出口 ID 和脱敏显示名称，不显示订阅节点。
+- 动态出口状态表，不记录或展示历史公网出口 IP。
 - 当前策略：优先级/最快/手动。
 - 24 小时延迟折线图。
 - 最近故障和最近切换。
@@ -384,18 +383,18 @@ stateDiagram-v2
 - 可用率对比表。
 - 故障时间线。
 - 切换事件表。
-- 按出口、状态、时间范围筛选。
-- CSV 导出。
+- 按稳定出口、kind、状态、事件类型和时间范围筛选。
+- 防公式注入的脱敏流式 CSV 导出。
+- 已删除出口标识和 1–3650 天保留策略。
 
 ### 11.3 设置页
 
-- 订阅管理。
-- 三出口优先级拖拽。
+- 多订阅管理。
+- 动态出口优先级拖拽。
 - 检测 URL 和周期。
 - 自动回切/保持当前。
 - 全部失败时“阻断”或“允许直连”。
-- 两个独立客户端 EXE 路径和内部端口。
-- 是否自动启动/重启两个客户端。
+- 本地黑盒客户端出口及其 loopback 端口。
 - 系统代理和 TUN。
 - 数据保存周期。
 
@@ -579,5 +578,3 @@ sequenceDiagram
 - [Mihomo SOCKS5 出站](https://wiki.metacubex.one/en/config/proxies/socks/)
 - [FlClash 项目](https://github.com/chen08209/FlClash)
 - [Tauri Sidecar](https://v2.tauri.app/develop/sidecar/)
-
-

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { mockSnapshot } from "../data/mock";
-import type { CoreStatus, DashboardSnapshot, RouteMode } from "../types";
+import type { CoreStatus, DashboardSnapshot, HistoryExport, HistoryFilter, HistoryResponse, RouteMode } from "../types";
 
 declare global {
   interface Window {
@@ -83,4 +83,32 @@ export async function revalidateUdpCapabilities(authorizedSubscriptionTargets: s
     return structuredClone(browserSnapshot);
   }
   return invoke<DashboardSnapshot>("revalidate_udp_capabilities", { authorizedSubscriptionTargets });
+}
+
+export async function getHistory(filter: HistoryFilter): Promise<HistoryResponse> {
+  if (!isTauriRuntime()) {
+    return {
+      window_start: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      window_end: new Date().toISOString(),
+      metrics: [],
+      outlets: [],
+      records: [],
+      total_count: 0,
+      page: 0,
+      total_pages: 0,
+      next_page: null,
+      retention_days: 30,
+    };
+  }
+  return invoke<HistoryResponse>("get_history", { filter });
+}
+
+export async function exportHistory(filter: HistoryFilter): Promise<HistoryExport> {
+  if (!isTauriRuntime()) return { path: "浏览器预览不写入文件", rows: 0 };
+  return invoke<HistoryExport>("export_history", { filter });
+}
+
+export async function setHistoryRetention(days: number): Promise<number> {
+  if (!isTauriRuntime()) return 0;
+  return invoke<number>("set_history_retention", { days });
 }

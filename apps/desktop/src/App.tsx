@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Construction } from "lucide-react";
 import { Dashboard } from "./Dashboard";
+import { HistoryPage } from "./HistoryPage";
 import { Sidebar, type ViewId } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
 import {
@@ -98,11 +99,13 @@ export default function App() {
             onUdpRevalidate={handleUdpRevalidate}
             onCoreToggle={handleCoreToggle}
           />
+        ) : view === "history" ? (
+          <HistoryPage onNotice={setNotice} />
         ) : (
           <main className="placeholder-view">
             <Construction />
-            <h1>{view === "history" ? "历史" : "设置"}</h1>
-            <p>完整页面仍在后续范围内；当前总览已经显示真实健康状态和路由切换。</p>
+            <h1>设置</h1>
+            <p>通用设置页面仍在后续范围内；历史保留策略已放在历史页就近管理。</p>
             <button type="button" onClick={() => setView("overview")}>返回总览</button>
           </main>
         )}

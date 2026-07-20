@@ -19,6 +19,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_dashboard_snapshot,
+            commands::get_history,
+            commands::export_history,
+            commands::set_history_retention,
             commands::refresh_guardian,
             commands::revalidate_udp_capabilities,
             commands::set_route_mode,
