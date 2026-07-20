@@ -1,0 +1,36 @@
+[package]
+name = "vpn-hub-helper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "vpn_hub_helper"
+
+[[bin]]
+name = "vpn-hub-helper"
+path = "src/main.rs"
+
+[dependencies]
+fs2.workspace = true
+hmac.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "process"] }
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+process-wrap = { workspace = true, features = ["job-object", "kill-on-drop"] }
+windows-service.workspace = true
+vpn-hub-windows-security = { path = "../vpn-hub-windows-security" }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

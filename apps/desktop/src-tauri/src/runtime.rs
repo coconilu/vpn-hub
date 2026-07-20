@@ -5,10 +5,14 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
+};
+use vpn_hub_helper::{
+    AuthorityFileGuard, Command as HelperCommand, InstallationReference, NamedPipeClient,
+    ProtocolKey, RuntimeReply, SupervisorAuthority,
 };
 
 use serde::{Deserialize, Serialize};
@@ -413,10 +417,22 @@ pub struct AppState {
     settings_preview_ticket: Mutex<Option<String>>,
     routing_transaction: RoutingTransaction,
     initialization_error: Option<String>,
+    supervisor_route: SupervisorRoute,
     #[cfg(test)]
     entry_switch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     settings_validation_hook: Mutex<Option<SettingsValidationHook>>,
+}
+
+enum SupervisorRoute {
+    DesktopOwned {
+        _guard: AuthorityFileGuard,
+    },
+    HelperOwned {
+        client: NamedPipeClient,
+        last_status: Box<Mutex<Option<RuntimeReply>>>,
+    },
+    FailClosed,
 }
 
 #[cfg(test)]
@@ -661,6 +677,63 @@ struct MihomoLock {
     version: String,
 }
 
+fn select_supervisor_route(
+    data_directory: &Path,
+    secret_store: Option<&SystemSecretStore>,
+) -> SupervisorRoute {
+    let program_data = env::var_os("ProgramData").map_or_else(PathBuf::new, PathBuf::from);
+    select_supervisor_route_with_program_data(
+        data_directory,
+        secret_store.map(|store| store as &dyn SecretStore),
+        &program_data,
+    )
+}
+
+fn select_supervisor_route_with_program_data(
+    data_directory: &Path,
+    secret_store: Option<&dyn SecretStore>,
+    program_data: &Path,
+) -> SupervisorRoute {
+    let reference_path = data_directory.join("helper-installation.json");
+    if !reference_path.exists() {
+        return AuthorityFileGuard::acquire(
+            &data_directory.join("authority.lease"),
+            SupervisorAuthority::Desktop,
+            1,
+        )
+        .map_or(SupervisorRoute::FailClosed, |guard| {
+            SupervisorRoute::DesktopOwned { _guard: guard }
+        });
+    }
+    let Ok(reference) = InstallationReference::load(&reference_path, program_data) else {
+        return SupervisorRoute::FailClosed;
+    };
+    if !reference.helper_enabled {
+        return AuthorityFileGuard::acquire_existing(
+            &reference.authority_path(),
+            SupervisorAuthority::Desktop,
+            1,
+        )
+        .map_or(SupervisorRoute::FailClosed, |guard| {
+            SupervisorRoute::DesktopOwned { _guard: guard }
+        });
+    }
+    let Some(store) = secret_store else {
+        return SupervisorRoute::FailClosed;
+    };
+    let Ok(Some(key_hex)) = store.get(&reference.client_secret_ref) else {
+        return SupervisorRoute::FailClosed;
+    };
+    let key_hex = zeroize::Zeroizing::new(key_hex);
+    let Ok(key) = ProtocolKey::from_hex(&key_hex) else {
+        return SupervisorRoute::FailClosed;
+    };
+    SupervisorRoute::HelperOwned {
+        client: NamedPipeClient::new(reference.install_id, Arc::new(key)),
+        last_status: Box::new(Mutex::new(None)),
+    }
+}
+
 impl AppState {
     #[must_use]
     pub fn new() -> Self {
@@ -722,6 +795,12 @@ impl AppState {
             None
         };
         let _ = harden_private_config_files(&private_config_path);
+        let supervisor_route = select_supervisor_route(data_directory, secret_store.as_ref());
+        if matches!(supervisor_route, SupervisorRoute::FailClosed) {
+            initialization_error.get_or_insert_with(|| {
+                "监督 authority 配置不可用；桌面与 Helper 均保持 Fail Closed".into()
+            });
+        }
         let private_config = PrivateRoutingConfig::load(&private_config_path).unwrap_or_default();
         let mut routing_engine = RoutingEngine::new(
             private_config.route_mode,
@@ -743,6 +822,7 @@ impl AppState {
             settings_preview_ticket: Mutex::new(None),
             routing_transaction: RoutingTransaction::default(),
             initialization_error,
+            supervisor_route,
             #[cfg(test)]
             entry_switch_hook: Mutex::new(None),
             #[cfg(test)]
@@ -1776,6 +1856,9 @@ impl AppState {
     }
 
     pub fn controller_client(&self) -> Result<Option<ControllerClient>, String> {
+        if !matches!(self.supervisor_route, SupervisorRoute::DesktopOwned { .. }) {
+            return Ok(None);
+        }
         let mut guard = self
             .managed_core
             .lock()
@@ -1804,6 +1887,34 @@ impl AppState {
     }
 
     pub fn core_status(&self) -> Result<CoreStatus, String> {
+        match &self.supervisor_route {
+            SupervisorRoute::HelperOwned { last_status, .. } => {
+                let status = last_status
+                    .lock()
+                    .map_err(|_| "Helper 状态锁不可用".to_owned())?
+                    .clone();
+                return Ok(status.map_or(
+                    CoreStatus {
+                        state: "helper-stale".into(),
+                        managed: false,
+                        pid: None,
+                        started_at: None,
+                        message: "Helper authority 已启用；缓存不是权威状态".into(),
+                    },
+                    |reply| {
+                        let mut status = helper_core_status(reply);
+                        status.state = "helper-stale".into();
+                        status.managed = false;
+                        status.message.push_str("（非权威缓存）");
+                        status
+                    },
+                ));
+            }
+            SupervisorRoute::FailClosed => {
+                return Err("监督 authority 不可用；核心保持 Fail Closed".into());
+            }
+            SupervisorRoute::DesktopOwned { .. } => {}
+        }
         if let Some(client) = self.controller_client()? {
             drop(client);
             let guard = self
@@ -1844,6 +1955,16 @@ impl AppState {
         })
     }
 
+    pub async fn core_status_authoritative(&self) -> Result<CoreStatus, String> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return self
+                .helper_command(HelperCommand::Status)
+                .await
+                .map(helper_core_status);
+        }
+        self.core_status()
+    }
+
     #[allow(clippy::too_many_lines)]
     #[cfg(test)]
     pub async fn start_development_core(&self) -> Result<CoreStatus, String> {
@@ -1857,6 +1978,18 @@ impl AppState {
         cancel: &AtomicBool,
     ) -> Result<CoreStatus, String> {
         ensure_core_start_not_cancelled(cancel)?;
+        match &self.supervisor_route {
+            SupervisorRoute::HelperOwned { .. } => {
+                return self
+                    .helper_command(HelperCommand::Start)
+                    .await
+                    .map(helper_core_status);
+            }
+            SupervisorRoute::FailClosed => {
+                return Err("监督 authority 不可用；拒绝启动核心".into());
+            }
+            SupervisorRoute::DesktopOwned { .. } => {}
+        }
         self.ensure_runtime_ready()?;
         let private_config = self.private_config()?;
         let configured_entry_address =
@@ -2122,6 +2255,9 @@ impl AppState {
     }
 
     pub fn owned_core_pid(&self) -> Option<u32> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return None;
+        }
         let mut guard = self.managed_core.lock().ok()?;
         let core = guard.as_mut()?;
         if let Ok(None) = core.child.try_wait() {
@@ -2134,11 +2270,24 @@ impl AppState {
         }
     }
 
+    pub async fn owned_core_pid_authoritative(&self) -> Result<Option<u32>, String> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return self
+                .helper_command(HelperCommand::Status)
+                .await
+                .map(|status| status.owned_pid);
+        }
+        Ok(self.owned_core_pid())
+    }
+
     pub fn owned_core_is_running(&self, expected_pid: u32) -> bool {
         self.owned_core_pid() == Some(expected_pid)
     }
 
     pub fn owned_core_controller_is_running(&self, expected_pid: u32) -> bool {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return false;
+        }
         let addresses = {
             let Ok(mut guard) = self.managed_core.lock() else {
                 return false;
@@ -2162,7 +2311,27 @@ impl AppState {
             && self.owned_core_is_running(expected_pid)
     }
 
+    pub async fn owned_core_controller_is_running_authoritative(
+        &self,
+        expected_pid: u32,
+    ) -> Result<bool, String> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return self
+                .helper_command(HelperCommand::Status)
+                .await
+                .map(|status| {
+                    status.ok && status.state == "running" && status.owned_pid == Some(expected_pid)
+                });
+        }
+        Ok(self.owned_core_controller_is_running(expected_pid))
+    }
+
     pub fn stop_owned_core_if_pid(&self, expected_pid: u32) -> Result<bool, String> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return Err(format!(
+                "Helper authority 持有核心；同步本地停止路径已旁路（pid {expected_pid}）"
+            ));
+        }
         let mut guard = self
             .managed_core
             .lock()
@@ -2181,6 +2350,9 @@ impl AppState {
     }
 
     pub fn stop_development_core_if_owned(&self) -> Result<bool, String> {
+        if matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. }) {
+            return Err("Helper authority 持有核心；同步本地停止路径已旁路".into());
+        }
         let mut guard = self
             .managed_core
             .lock()
@@ -2233,6 +2405,91 @@ impl AppState {
         self.initialization_error
             .as_ref()
             .map_or(Ok(()), |error| Err(error.clone()))
+    }
+
+    pub async fn stop_supervised_core(&self) -> Result<bool, String> {
+        match &self.supervisor_route {
+            SupervisorRoute::HelperOwned { .. } => self
+                .helper_command(HelperCommand::Stop)
+                .await
+                .map(|status| status.owned_pid.is_none()),
+            SupervisorRoute::DesktopOwned { .. } => self.stop_development_core_if_owned(),
+            SupervisorRoute::FailClosed => Err("监督 authority 不可用；保持 Fail Closed".into()),
+        }
+    }
+
+    pub async fn stop_supervised_core_if_pid(&self, expected_pid: u32) -> Result<bool, String> {
+        match &self.supervisor_route {
+            SupervisorRoute::HelperOwned { last_status, .. } => {
+                let expected = last_status
+                    .lock()
+                    .map_err(|_| "Helper 状态锁不可用".to_owned())?
+                    .as_ref()
+                    .and_then(|status| status.ownership)
+                    .filter(|ownership| ownership.pid == expected_pid);
+                let Some(expected) = expected else {
+                    return Ok(false);
+                };
+                self.helper_command(HelperCommand::StopIfOwned(expected))
+                    .await
+                    .map(|status| status.command_applied == Some(true))
+            }
+            SupervisorRoute::DesktopOwned { .. } => self.stop_owned_core_if_pid(expected_pid),
+            SupervisorRoute::FailClosed => Err("监督 authority 不可用；保持 Fail Closed".into()),
+        }
+    }
+
+    #[must_use]
+    pub fn uses_helper_authority(&self) -> bool {
+        matches!(self.supervisor_route, SupervisorRoute::HelperOwned { .. })
+    }
+
+    async fn helper_command(&self, command: HelperCommand) -> Result<RuntimeReply, String> {
+        let SupervisorRoute::HelperOwned {
+            client,
+            last_status,
+        } = &self.supervisor_route
+        else {
+            return Err("Helper authority 未启用".into());
+        };
+        let bytes = client
+            .send(command)
+            .await
+            .map_err(|_| "Helper IPC 不可用；保持 Fail Closed".to_owned())?;
+        let reply: RuntimeReply = serde_json::from_slice(&bytes)
+            .map_err(|_| "Helper 返回无效；保持 Fail Closed".to_owned())?;
+        *last_status
+            .lock()
+            .map_err(|_| "Helper 状态锁不可用".to_owned())? = Some(reply.clone());
+        if !reply.ok {
+            let reason = match reply.reason.as_deref() {
+                Some("corrupt-config") => "配置损坏",
+                Some("corrupt-database") => "数据库损坏",
+                Some("port-conflict") => "动态入口端口冲突",
+                Some("ownership-lost") => "核心所有权丢失",
+                Some("authority-lost") => "监督 authority 丢失",
+                _ => "未知安全原因",
+            };
+            return Err(format!("Helper Fail Closed：{reason}"));
+        }
+        Ok(reply)
+    }
+}
+
+fn helper_core_status(reply: RuntimeReply) -> CoreStatus {
+    let managed = reply.ok && reply.state == "running" && reply.owned_pid.is_some();
+    CoreStatus {
+        state: reply.state,
+        managed,
+        pid: reply.owned_pid,
+        started_at: None,
+        message: format!(
+            "Helper authority：{}:{}，generation {}，{} 个脱敏出口",
+            reply.entry_host,
+            reply.entry_port,
+            reply.generation,
+            reply.outlets.len()
+        ),
     }
 }
 
@@ -2850,6 +3107,7 @@ mod tests {
         OutletHealth, OutletKind, RoutingPolicy, SecretStoreError, SettingsOutletDraft,
         generate_mihomo_config, outlet_proxy_name,
     };
+    use vpn_hub_helper::{ExpectedOwnership, ReplayCache, serve_one_named_pipe_request};
 
     #[derive(Default)]
     struct TestSecretStore {
@@ -2979,6 +3237,229 @@ mod tests {
             self.values.lock().expect("values").remove(secret_ref);
             Ok(())
         }
+    }
+
+    #[test]
+    fn provisioned_helper_reference_selects_helper_and_default_selects_desktop() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let program_data = directory.path().join("ProgramData");
+        let install_root = program_data.join("VPN Hub/install-a");
+        fs::create_dir_all(&install_root).expect("install root");
+        let data = directory.path().join("client-data");
+        fs::create_dir_all(&data).expect("client data");
+        let default_route = select_supervisor_route_with_program_data(&data, None, &program_data);
+        assert!(matches!(
+            default_route,
+            SupervisorRoute::DesktopOwned { .. }
+        ));
+        drop(default_route);
+
+        let reference = InstallationReference {
+            schema_version: 1,
+            install_id: "install-a".into(),
+            helper_enabled: true,
+            program_data_root: install_root,
+            client_secret_ref: "helper.install-a.protocol".into(),
+        };
+        fs::write(
+            data.join("helper-installation.json"),
+            serde_json::to_vec(&reference).expect("reference json"),
+        )
+        .expect("reference");
+        let store = TestSecretStore::default();
+        store
+            .set("helper.install-a.protocol", &"ab".repeat(32))
+            .expect("protected key");
+        let helper_route =
+            select_supervisor_route_with_program_data(&data, Some(&store), &program_data);
+        assert!(matches!(helper_route, SupervisorRoute::HelperOwned { .. }));
+    }
+
+    fn helper_reply(state: &str, owned_pid: Option<u32>) -> RuntimeReply {
+        RuntimeReply {
+            ok: true,
+            state: state.into(),
+            generation: 7,
+            authority: "helper".into(),
+            owned_pid,
+            ownership: owned_pid.map(|pid| ExpectedOwnership {
+                pid,
+                creation_identity: u64::from(pid) + 100,
+                fencing_epoch: 11,
+                generation: 7,
+            }),
+            entry_host: "127.0.0.1".into(),
+            entry_port: 0,
+            outlets: Vec::new(),
+            circuit_open: false,
+            reason: None,
+            command_applied: None,
+        }
+    }
+
+    fn helper_owned_test_state(
+        directory: &tempfile::TempDir,
+        install_id: String,
+        key: Arc<ProtocolKey>,
+        cached: Option<RuntimeReply>,
+    ) -> AppState {
+        let data = directory.path().join("client-data");
+        fs::create_dir_all(&data).expect("client data");
+        let mut state = AppState::new_for_test(directory.path().to_path_buf(), &data);
+        state.supervisor_route = SupervisorRoute::HelperOwned {
+            client: NamedPipeClient::new(install_id, key),
+            last_status: Box::new(Mutex::new(cached)),
+        };
+        state
+    }
+
+    fn current_user_sid() -> String {
+        vpn_hub_windows_security::lookup_local_account_sid(
+            &std::env::var("USERNAME").expect("USERNAME"),
+        )
+        .expect("interactive user SID")
+    }
+
+    #[tokio::test]
+    async fn helper_status_queries_are_live_and_ipc_failure_never_reuses_cache() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let install_id = format!(
+            "desktop-status-{}-{}",
+            std::process::id(),
+            &generate_controller_secret()[..8]
+        );
+        let key = Arc::new(ProtocolKey::from_bytes([83; 32]));
+        let state = helper_owned_test_state(&directory, install_id.clone(), Arc::clone(&key), None);
+        let replies = [
+            helper_reply("running", Some(41_001)),
+            helper_reply("stopped", None),
+            helper_reply("running", Some(41_002)),
+            helper_reply("stopped", None),
+        ];
+        let sid = current_user_sid();
+        let server_install_id = install_id.clone();
+        let server_key = Arc::clone(&key);
+        let server = tokio::spawn(async move {
+            let replay = Arc::new(tokio::sync::Mutex::new(ReplayCache::default()));
+            for reply in replies {
+                serve_one_named_pipe_request(
+                    &server_install_id,
+                    &sid,
+                    Arc::clone(&server_key),
+                    Arc::clone(&replay),
+                    |request| {
+                        assert_eq!(request.command, HelperCommand::Status);
+                        serde_json::to_vec(&reply).expect("runtime reply")
+                    },
+                )
+                .await
+                .expect("serve authenticated status");
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        });
+
+        let dashboard_running = state
+            .core_status_authoritative()
+            .await
+            .expect("live dashboard status");
+        assert_eq!(dashboard_running.pid, Some(41_001));
+        let dashboard_stopped = state
+            .core_status_authoritative()
+            .await
+            .expect("changed dashboard status");
+        assert_eq!(dashboard_stopped.pid, None);
+        assert!(
+            state
+                .owned_core_controller_is_running_authoritative(41_002)
+                .await
+                .expect("live lifecycle status")
+        );
+        assert!(
+            !state
+                .owned_core_controller_is_running_authoritative(41_002)
+                .await
+                .expect("changed lifecycle status")
+        );
+        server.await.expect("status server");
+
+        let stale_before_failure = state.core_status().expect("stale cache");
+        assert_eq!(stale_before_failure.state, "helper-stale");
+        assert!(!stale_before_failure.managed);
+
+        let wrong_key_server = tokio::spawn(async move {
+            serve_one_named_pipe_request(
+                &install_id,
+                &current_user_sid(),
+                Arc::new(ProtocolKey::from_bytes([84; 32])),
+                Arc::new(tokio::sync::Mutex::new(ReplayCache::default())),
+                |_| panic!("wrong-key request must not authenticate"),
+            )
+            .await
+        });
+        let failure = state
+            .core_status_authoritative()
+            .await
+            .expect_err("wrong-key response must fail closed");
+        assert!(failure.contains("Fail Closed"));
+        wrong_key_server
+            .await
+            .expect("wrong-key server task")
+            .expect("rejection response");
+        let stale_after_failure = state.core_status().expect("stale cache after failure");
+        assert_eq!(stale_after_failure.state, stale_before_failure.state);
+        assert_eq!(stale_after_failure.pid, stale_before_failure.pid);
+        assert_eq!(stale_after_failure.message, stale_before_failure.message);
+    }
+
+    #[tokio::test]
+    async fn helper_stop_is_one_atomic_authenticated_owned_command() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let install_id = format!(
+            "desktop-stop-{}-{}",
+            std::process::id(),
+            &generate_controller_secret()[..8]
+        );
+        let key = Arc::new(ProtocolKey::from_bytes([91; 32]));
+        let state = helper_owned_test_state(
+            &directory,
+            install_id.clone(),
+            Arc::clone(&key),
+            Some(helper_reply("running", Some(52_001))),
+        );
+        let sid = current_user_sid();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let server_observed = Arc::clone(&observed);
+        let server = tokio::spawn(async move {
+            let replay = Arc::new(tokio::sync::Mutex::new(ReplayCache::default()));
+            let mut response = helper_reply("stopped", None);
+            response.command_applied = Some(true);
+            serve_one_named_pipe_request(&install_id, &sid, key, replay, move |request| {
+                server_observed
+                    .lock()
+                    .expect("observed commands")
+                    .push(request.command);
+                serde_json::to_vec(&response).expect("runtime reply")
+            })
+            .await
+            .expect("serve atomic stop flow");
+        });
+
+        assert!(
+            state
+                .stop_supervised_core_if_pid(52_001)
+                .await
+                .expect("authenticated stop")
+        );
+        server.await.expect("stop server");
+        assert_eq!(
+            *observed.lock().expect("observed commands"),
+            [HelperCommand::StopIfOwned(ExpectedOwnership {
+                pid: 52_001,
+                creation_identity: 52_101,
+                fencing_epoch: 11,
+                generation: 7,
+            })]
+        );
     }
 
     #[test]
@@ -4382,14 +4863,18 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         let task =
             tokio::spawn(async move { run_owned_command_cancellable(command, &task_cancel).await });
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !pid_path.exists() && Instant::now() < deadline {
+        let pid = loop {
+            if let Ok(content) = fs::read_to_string(&pid_path)
+                && let Ok(pid) = content.trim().parse::<u32>()
+            {
+                break pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned validation pid must become readable and complete"
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        let pid = fs::read_to_string(&pid_path)
-            .expect("owned validation pid")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric pid");
+        };
 
         cancel.store(true, Ordering::Release);
         let result = tokio::time::timeout(Duration::from_secs(1), task)

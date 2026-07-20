@@ -1,0 +1,1329 @@
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+
+use crate::{
+    AuthenticatedRequest, AuthorityLease, AuthorityRegistry, Command, ExpectedOwnership,
+    FailClosedReason, OwnedProcessIdentity, SupervisionManifest, SupervisorAuthority,
+    SupervisorEvent, SupervisorMachine,
+};
+
+pub trait ManifestProvider {
+    fn load(&self) -> Result<SupervisionManifest, RuntimeError>;
+}
+
+pub trait CoreBackend {
+    fn start_owned(
+        &mut self,
+        manifest: &SupervisionManifest,
+        fencing_token: u64,
+    ) -> Result<OwnedProcessIdentity, RuntimeError>;
+    fn stop_owned(
+        &mut self,
+        identity: &OwnedProcessIdentity,
+        fencing_token: u64,
+    ) -> Result<(), RuntimeError>;
+    fn owned_child_alive(
+        &mut self,
+        identity: &OwnedProcessIdentity,
+        fencing_token: u64,
+    ) -> Result<bool, RuntimeError>;
+    fn network_fingerprint(&self) -> Result<[u8; 32], RuntimeError>;
+}
+
+#[derive(Debug, Error)]
+pub enum RuntimeError {
+    #[error("helper is not the active supervisor authority")]
+    Authority,
+    #[error("sanitized supervision manifest is invalid")]
+    Manifest,
+    #[error("core artifact verification failed")]
+    Artifact,
+    #[error("configured entry port is unavailable")]
+    PortConflict,
+    #[error("guardian database integrity check failed")]
+    CorruptDatabase,
+    #[error("owned core operation failed")]
+    OwnedCore,
+    #[error("supervisor is fail closed")]
+    FailClosed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct RuntimeReply {
+    pub ok: bool,
+    pub state: String,
+    pub generation: u64,
+    pub authority: String,
+    pub owned_pid: Option<u32>,
+    pub ownership: Option<ExpectedOwnership>,
+    pub entry_host: String,
+    pub entry_port: u16,
+    pub outlets: Vec<crate::OutletSummary>,
+    pub circuit_open: bool,
+    pub reason: Option<String>,
+    pub command_applied: Option<bool>,
+}
+
+pub struct HelperRuntime<B: CoreBackend, P: ManifestProvider> {
+    backend: B,
+    provider: P,
+    manifest: SupervisionManifest,
+    authority: AuthorityRegistry,
+    lease: AuthorityLease,
+    supervisor: SupervisorMachine,
+    owned: Option<OwnedProcessIdentity>,
+    restart_due_ms: Option<i64>,
+    replacement_pending: bool,
+    started_at_ms: Option<i64>,
+    network_fingerprint: [u8; 32],
+    cross_process_guard: Option<crate::AuthorityFileGuard>,
+}
+
+#[cfg(target_os = "windows")]
+pub async fn run_windows_helper_loop<B, P>(
+    runtime: std::sync::Arc<std::sync::Mutex<HelperRuntime<B, P>>>,
+    key: std::sync::Arc<crate::ProtocolKey>,
+    install_id: String,
+    interactive_user_sid: String,
+    signals: std::sync::Arc<crate::ServiceSignals>,
+) -> Result<(), RuntimeError>
+where
+    B: CoreBackend + Send + 'static,
+    P: ManifestProvider + Send + 'static,
+{
+    let replay_cache = std::sync::Arc::new(tokio::sync::Mutex::new(crate::ReplayCache::default()));
+    while !signals.should_stop() {
+        {
+            let mut runtime = runtime.lock().map_err(|_| RuntimeError::FailClosed)?;
+            runtime.tick(unix_ms())?;
+            if signals.take_resume() {
+                runtime.recover_from_service_signal(unix_ms())?;
+            }
+        }
+        let runtime_for_request = std::sync::Arc::clone(&runtime);
+        let result = crate::serve_one_named_pipe_request(
+            &install_id,
+            &interactive_user_sid,
+            std::sync::Arc::clone(&key),
+            std::sync::Arc::clone(&replay_cache),
+            move |request| {
+                let response = runtime_for_request
+                    .lock()
+                    .map_err(|_| RuntimeError::FailClosed)
+                    .and_then(|mut runtime| runtime.handle(&request, unix_ms()));
+                match response {
+                    Ok(response) => serde_json::to_vec(&response).unwrap_or_else(|_| {
+                        br#"{"ok":false,"reason":"serialization-failed"}"#.to_vec()
+                    }),
+                    Err(_) => br#"{"ok":false,"reason":"fail-closed"}"#.to_vec(),
+                }
+            },
+        )
+        .await;
+        if let Err(error) = result {
+            if signals.should_stop() {
+                break;
+            }
+            if matches!(error, crate::TransportError::Fatal) {
+                return Err(RuntimeError::FailClosed);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn unix_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+impl<B: CoreBackend, P: ManifestProvider> HelperRuntime<B, P> {
+    pub fn acquire_helper(backend: B, provider: P, now_ms: i64) -> Result<Self, RuntimeError> {
+        let manifest = provider.load()?;
+        let network_fingerprint = backend.network_fingerprint()?;
+        let mut authority = AuthorityRegistry::default();
+        let lease = authority
+            .acquire(
+                &manifest.install_id,
+                SupervisorAuthority::Helper,
+                manifest.generation,
+                now_ms,
+                30_000,
+            )
+            .map_err(|_| RuntimeError::Authority)?;
+        Ok(Self {
+            supervisor: SupervisorMachine::new(manifest.generation),
+            backend,
+            provider,
+            manifest,
+            authority,
+            lease,
+            owned: None,
+            restart_due_ms: None,
+            replacement_pending: false,
+            started_at_ms: None,
+            network_fingerprint,
+            cross_process_guard: None,
+        })
+    }
+
+    pub fn acquire_helper_with_authority_file(
+        backend: B,
+        provider: P,
+        authority_path: &Path,
+        now_ms: i64,
+    ) -> Result<Self, RuntimeError> {
+        let manifest = provider.load()?;
+        let network_fingerprint = backend.network_fingerprint()?;
+        let cross_process_guard = crate::AuthorityFileGuard::acquire_existing(
+            authority_path,
+            SupervisorAuthority::Helper,
+            manifest.generation,
+        )
+        .map_err(|_| RuntimeError::Authority)?;
+        let mut authority = AuthorityRegistry::default();
+        let lease = authority
+            .acquire(
+                &manifest.install_id,
+                SupervisorAuthority::Helper,
+                manifest.generation,
+                now_ms,
+                30_000,
+            )
+            .map_err(|_| RuntimeError::Authority)?;
+        Ok(Self {
+            supervisor: SupervisorMachine::new(manifest.generation),
+            backend,
+            provider,
+            manifest,
+            authority,
+            lease,
+            owned: None,
+            restart_due_ms: None,
+            replacement_pending: false,
+            started_at_ms: None,
+            network_fingerprint,
+            cross_process_guard: Some(cross_process_guard),
+        })
+    }
+
+    pub fn tick(&mut self, now_ms: i64) -> Result<(), RuntimeError> {
+        self.lease = self
+            .authority
+            .renew(&self.lease, self.manifest.generation, now_ms, 30_000)
+            .map_err(|_| RuntimeError::Authority)?;
+        if let Some(identity) = &self.owned
+            && !self
+                .backend
+                .owned_child_alive(identity, self.lease.fencing_token)?
+        {
+            self.owned = None;
+            self.supervisor.apply(SupervisorEvent::OwnedChildExited);
+            if let crate::SupervisorState::Backoff { delay_ms } = self.supervisor.state() {
+                let delay_ms = i64::try_from(delay_ms).unwrap_or(i64::MAX);
+                self.restart_due_ms = Some(now_ms.saturating_add(delay_ms));
+            }
+        }
+        if let Ok(network_fingerprint) = self.backend.network_fingerprint()
+            && network_fingerprint != self.network_fingerprint
+        {
+            self.network_fingerprint = network_fingerprint;
+            self.supervisor.apply(SupervisorEvent::Recovery(
+                crate::RecoverySignal::NetworkChanged(network_fingerprint),
+            ));
+            self.recover_owned(now_ms)?;
+        }
+        if self.restart_due_ms.is_some_and(|due| now_ms >= due) {
+            self.restart_due_ms = None;
+            self.supervisor.apply(SupervisorEvent::RestartTimer);
+            let result = if self.replacement_pending {
+                self.replace_owned(now_ms)
+            } else {
+                self.start(now_ms)
+            };
+            if let Err(error) = result {
+                self.arm_backoff(now_ms);
+                return match error {
+                    RuntimeError::Authority | RuntimeError::FailClosed => Err(error),
+                    _ => Ok(()),
+                };
+            }
+        }
+        if self.owned.is_some()
+            && self
+                .started_at_ms
+                .is_some_and(|started| now_ms.saturating_sub(started) >= 60_000)
+        {
+            self.supervisor.apply(SupervisorEvent::StableRun);
+            self.started_at_ms = None;
+        }
+        Ok(())
+    }
+
+    pub fn handle(
+        &mut self,
+        request: &AuthenticatedRequest,
+        now_ms: i64,
+    ) -> Result<RuntimeReply, RuntimeError> {
+        if self.cross_process_guard.is_none() && cfg!(not(test)) {
+            return Err(RuntimeError::Authority);
+        }
+        self.authority
+            .validate(&self.lease, now_ms)
+            .map_err(|_| RuntimeError::Authority)?;
+        if request.install_id != self.manifest.install_id {
+            return Err(RuntimeError::Authority);
+        }
+        let mut command_applied = None;
+        let operation = match request.command {
+            Command::Status | Command::Version => Ok(()),
+            Command::Start => self.start(now_ms),
+            Command::Stop => self.stop(),
+            Command::StopIfOwned(expected) => self.stop_if_owned(expected).map(|applied| {
+                command_applied = Some(applied);
+            }),
+            Command::Restart => self.replace_owned(now_ms),
+            Command::Reload => self.reload(now_ms),
+            Command::Resume => {
+                self.supervisor
+                    .apply(SupervisorEvent::Recovery(crate::RecoverySignal::Resume));
+                Ok(())
+            }
+            Command::NetworkChanged => self.backend.network_fingerprint().map(|fingerprint| {
+                self.network_fingerprint = fingerprint;
+                self.supervisor.apply(SupervisorEvent::Recovery(
+                    crate::RecoverySignal::NetworkChanged(fingerprint),
+                ));
+            }),
+            Command::ResetCircuit => {
+                self.supervisor.apply(SupervisorEvent::ExplicitReset);
+                Ok(())
+            }
+        };
+        let operation = operation.and_then(|()| {
+            if matches!(request.command, Command::Resume | Command::NetworkChanged) {
+                self.recover_owned(now_ms)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = operation {
+            if matches!(
+                error,
+                RuntimeError::PortConflict
+                    | RuntimeError::CorruptDatabase
+                    | RuntimeError::Manifest
+                    | RuntimeError::Artifact
+            ) {
+                return Ok(self.reply());
+            }
+            return Err(error);
+        }
+        Ok(self.reply_with_command_applied(command_applied))
+    }
+
+    pub fn recover_from_service_signal(&mut self, now_ms: i64) -> Result<(), RuntimeError> {
+        self.supervisor
+            .apply(SupervisorEvent::Recovery(crate::RecoverySignal::Resume));
+        self.recover_owned(now_ms)
+    }
+
+    fn start(&mut self, now_ms: i64) -> Result<(), RuntimeError> {
+        let current = self.provider.load().inspect_err(|error| {
+            self.record_preflight_failure(error);
+        })?;
+        if current.install_id != self.manifest.install_id
+            || current.generation < self.manifest.generation
+        {
+            self.supervisor.apply(SupervisorEvent::InvalidState(
+                FailClosedReason::CorruptConfig,
+            ));
+            return Err(RuntimeError::Manifest);
+        }
+        if current.generation > self.manifest.generation {
+            self.lease = self
+                .authority
+                .renew(&self.lease, current.generation, now_ms, 30_000)
+                .map_err(|_| RuntimeError::Authority)?;
+            self.manifest = current;
+        }
+        if self.owned.is_some() {
+            return Ok(());
+        }
+        let identity = match self
+            .backend
+            .start_owned(&self.manifest, self.lease.fencing_token)
+        {
+            Ok(identity) => identity,
+            Err(error) => {
+                match &error {
+                    RuntimeError::PortConflict => self.supervisor.apply(
+                        SupervisorEvent::InvalidState(FailClosedReason::PortConflict),
+                    ),
+                    RuntimeError::CorruptDatabase => self.supervisor.apply(
+                        SupervisorEvent::InvalidState(FailClosedReason::CorruptDatabase),
+                    ),
+                    RuntimeError::Manifest | RuntimeError::Artifact => self.supervisor.apply(
+                        SupervisorEvent::InvalidState(FailClosedReason::CorruptConfig),
+                    ),
+                    _ => self.supervisor.apply(SupervisorEvent::StartFailed),
+                }
+                self.arm_backoff(now_ms);
+                return Err(error);
+            }
+        };
+        self.supervisor.apply(SupervisorEvent::StartSucceeded {
+            pid: identity.pid,
+            creation_identity: identity.creation_identity,
+        });
+        self.owned = Some(identity);
+        self.restart_due_ms = None;
+        self.replacement_pending = false;
+        self.started_at_ms = Some(now_ms);
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), RuntimeError> {
+        if let Some(identity) = self.owned.clone() {
+            self.backend
+                .stop_owned(&identity, self.lease.fencing_token)?;
+            self.owned = None;
+        }
+        self.supervisor.apply(SupervisorEvent::ExplicitStop);
+        self.restart_due_ms = None;
+        self.replacement_pending = false;
+        self.started_at_ms = None;
+        Ok(())
+    }
+
+    fn stop_if_owned(&mut self, expected: ExpectedOwnership) -> Result<bool, RuntimeError> {
+        let matches = self.owned.as_ref().is_some_and(|identity| {
+            identity.pid == expected.pid
+                && identity.creation_identity == expected.creation_identity
+                && identity.fencing_token == expected.fencing_epoch
+                && self.manifest.generation == expected.generation
+        });
+        if !matches {
+            return Ok(false);
+        }
+        self.stop()?;
+        Ok(true)
+    }
+
+    fn reload(&mut self, now_ms: i64) -> Result<(), RuntimeError> {
+        let next = self.provider.load().inspect_err(|error| {
+            self.record_preflight_failure(error);
+        })?;
+        if next.install_id != self.manifest.install_id || next.generation < self.manifest.generation
+        {
+            self.supervisor.apply(SupervisorEvent::InvalidState(
+                FailClosedReason::CorruptConfig,
+            ));
+            return Err(RuntimeError::Manifest);
+        }
+        let had_owned = self.owned.is_some();
+        self.lease = self
+            .authority
+            .renew(&self.lease, next.generation, now_ms, 30_000)
+            .map_err(|_| RuntimeError::Authority)?;
+        self.supervisor.apply(SupervisorEvent::Recovery(
+            crate::RecoverySignal::ConfigGeneration(next.generation),
+        ));
+        self.manifest = next;
+        if had_owned {
+            self.replace_owned(now_ms)?;
+        }
+        Ok(())
+    }
+
+    fn record_preflight_failure(&mut self, error: &RuntimeError) {
+        let reason = match error {
+            RuntimeError::CorruptDatabase => FailClosedReason::CorruptDatabase,
+            RuntimeError::PortConflict => FailClosedReason::PortConflict,
+            _ => FailClosedReason::CorruptConfig,
+        };
+        self.supervisor.apply(SupervisorEvent::InvalidState(reason));
+    }
+
+    fn recover_owned(&mut self, now_ms: i64) -> Result<(), RuntimeError> {
+        if self.owned.is_some() {
+            self.replace_owned(now_ms)?;
+        }
+        Ok(())
+    }
+
+    fn replace_owned(&mut self, now_ms: i64) -> Result<(), RuntimeError> {
+        if let Some(previous) = self.owned.clone() {
+            if let Err(error) = self.backend.stop_owned(&previous, self.lease.fencing_token) {
+                self.replacement_pending = true;
+                self.supervisor.apply(SupervisorEvent::StartFailed);
+                self.arm_backoff(now_ms);
+                return match error {
+                    RuntimeError::OwnedCore => Ok(()),
+                    other => Err(other),
+                };
+            }
+            self.owned = None;
+            self.started_at_ms = None;
+        }
+        self.replacement_pending = true;
+        match self.start(now_ms) {
+            Ok(()) | Err(RuntimeError::OwnedCore) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn arm_backoff(&mut self, now_ms: i64) {
+        if let crate::SupervisorState::Backoff { delay_ms } = self.supervisor.state() {
+            let delay_ms = i64::try_from(delay_ms).unwrap_or(i64::MAX);
+            self.restart_due_ms = Some(now_ms.saturating_add(delay_ms));
+        }
+    }
+
+    fn reply(&self) -> RuntimeReply {
+        self.reply_with_command_applied(None)
+    }
+
+    fn reply_with_command_applied(&self, command_applied: Option<bool>) -> RuntimeReply {
+        let reason = match self.supervisor.state() {
+            crate::SupervisorState::FailClosed(FailClosedReason::CorruptConfig) => {
+                Some("corrupt-config".into())
+            }
+            crate::SupervisorState::FailClosed(FailClosedReason::CorruptDatabase) => {
+                Some("corrupt-database".into())
+            }
+            crate::SupervisorState::FailClosed(FailClosedReason::PortConflict) => {
+                Some("port-conflict".into())
+            }
+            crate::SupervisorState::FailClosed(FailClosedReason::OwnershipLost) => {
+                Some("ownership-lost".into())
+            }
+            crate::SupervisorState::FailClosed(FailClosedReason::AuthorityLost) => {
+                Some("authority-lost".into())
+            }
+            _ => None,
+        };
+        RuntimeReply {
+            ok: reason.is_none(),
+            state: if self.owned.is_some() {
+                "running".into()
+            } else {
+                "stopped".into()
+            },
+            generation: self.manifest.generation,
+            authority: "helper".into(),
+            owned_pid: self.owned.as_ref().map(|identity| identity.pid),
+            ownership: self.owned.as_ref().map(|identity| ExpectedOwnership {
+                pid: identity.pid,
+                creation_identity: identity.creation_identity,
+                fencing_epoch: identity.fencing_token,
+                generation: self.manifest.generation,
+            }),
+            entry_host: self.manifest.entry.host.clone(),
+            entry_port: self.manifest.entry.port,
+            outlets: self.manifest.outlets.clone(),
+            circuit_open: self.supervisor.circuit() == crate::CircuitState::Open,
+            reason,
+            command_applied,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub struct ProgramDataManifestProvider {
+    pub root: PathBuf,
+    pub manifest_path: PathBuf,
+    pub install_id: String,
+}
+
+#[cfg(target_os = "windows")]
+impl ManifestProvider for ProgramDataManifestProvider {
+    fn load(&self) -> Result<SupervisionManifest, RuntimeError> {
+        let manifest = crate::load_manifest(&self.root, &self.manifest_path, &self.install_id)
+            .map_err(|_| RuntimeError::Manifest)?;
+        validate_database(&manifest.guardian_database_path(&self.root))?;
+        Ok(manifest)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn validate_database(path: &Path) -> Result<(), RuntimeError> {
+    use rusqlite::{Connection, OpenFlags};
+
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| RuntimeError::CorruptDatabase)?;
+    let result: String = connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .map_err(|_| RuntimeError::CorruptDatabase)?;
+    if result != "ok" {
+        return Err(RuntimeError::CorruptDatabase);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+pub struct WindowsJobCoreBackend {
+    program_data_root: PathBuf,
+    child: Option<Box<dyn process_wrap::tokio::ChildWrapper>>,
+    identity: Option<OwnedProcessIdentity>,
+}
+
+#[cfg(target_os = "windows")]
+trait StoppableChild {
+    fn child_id(&self) -> Option<u32>;
+    fn creation_identity(&self) -> Result<u64, RuntimeError>;
+    fn start_kill(&mut self) -> Result<(), RuntimeError>;
+    fn has_exited(&mut self) -> Result<bool, RuntimeError>;
+}
+
+#[cfg(target_os = "windows")]
+impl StoppableChild for Box<dyn process_wrap::tokio::ChildWrapper> {
+    fn child_id(&self) -> Option<u32> {
+        self.id()
+    }
+
+    fn creation_identity(&self) -> Result<u64, RuntimeError> {
+        vpn_hub_windows_security::process_creation_identity(
+            self.inner_child()
+                .raw_handle()
+                .ok_or(RuntimeError::OwnedCore)? as usize,
+        )
+        .map_err(|_| RuntimeError::OwnedCore)
+    }
+
+    fn start_kill(&mut self) -> Result<(), RuntimeError> {
+        process_wrap::tokio::ChildWrapper::start_kill(self.as_mut())
+            .map_err(|_| RuntimeError::OwnedCore)
+    }
+
+    fn has_exited(&mut self) -> Result<bool, RuntimeError> {
+        self.try_wait()
+            .map(|status| status.is_some())
+            .map_err(|_| RuntimeError::OwnedCore)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_held_child<C, H, E, S>(
+    slot: &mut Option<C>,
+    identity: &OwnedProcessIdentity,
+    fencing_token: u64,
+    mut observed_hash: H,
+    mut deadline_expired: E,
+    mut sleep_before_retry: S,
+) -> Result<(), RuntimeError>
+where
+    C: StoppableChild,
+    H: FnMut() -> Result<String, RuntimeError>,
+    E: FnMut() -> bool,
+    S: FnMut(),
+{
+    if identity.fencing_token != fencing_token {
+        return Err(RuntimeError::OwnedCore);
+    }
+    let mut child = slot.take().ok_or(RuntimeError::OwnedCore)?;
+    let result = (|| {
+        let observed_creation = child.creation_identity()?;
+        let executable_sha256 = observed_hash()?;
+        if child.child_id() != Some(identity.pid)
+            || observed_creation != identity.creation_identity
+            || executable_sha256 != identity.executable_sha256
+        {
+            return Err(RuntimeError::OwnedCore);
+        }
+        if child.has_exited()? {
+            return Ok(());
+        }
+        child.start_kill()?;
+        loop {
+            if child.has_exited()? {
+                return Ok(());
+            }
+            if deadline_expired() {
+                return Err(RuntimeError::OwnedCore);
+            }
+            sleep_before_retry();
+        }
+    })();
+    if result.is_err() {
+        *slot = Some(child);
+    }
+    result
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsJobCoreBackend {
+    #[must_use]
+    pub fn new(program_data_root: PathBuf) -> Self {
+        Self {
+            program_data_root,
+            child: None,
+            identity: None,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl CoreBackend for WindowsJobCoreBackend {
+    fn start_owned(
+        &mut self,
+        manifest: &SupervisionManifest,
+        fencing_token: u64,
+    ) -> Result<OwnedProcessIdentity, RuntimeError> {
+        use process_wrap::tokio::{CommandWrap, JobObject, KillOnDrop};
+
+        if self.child.is_some() {
+            return Err(RuntimeError::OwnedCore);
+        }
+        manifest
+            .validate(&manifest.install_id)
+            .map_err(|_| RuntimeError::Manifest)?;
+        let executable = manifest.core_path(&self.program_data_root);
+        let (mut executable_guard, executable_identity) =
+            vpn_hub_windows_security::open_verified_file(&executable)
+                .map_err(|_| RuntimeError::Artifact)?;
+        if hash_open_file(&mut executable_guard)? != manifest.core.sha256 {
+            return Err(RuntimeError::Artifact);
+        }
+        let runtime_config = manifest.runtime_config_path(&self.program_data_root);
+        if !runtime_config.is_file() {
+            return Err(RuntimeError::Manifest);
+        }
+        let listener =
+            std::net::TcpListener::bind((manifest.entry.host.as_str(), manifest.entry.port))
+                .map_err(|_| RuntimeError::PortConflict)?;
+        drop(listener);
+        if vpn_hub_windows_security::verified_file_identity(&executable)
+            .map_err(|_| RuntimeError::Artifact)?
+            != executable_identity
+        {
+            return Err(RuntimeError::Artifact);
+        }
+        let mut command = CommandWrap::with_new(&executable, |command| {
+            command
+                .arg("-f")
+                .arg(&runtime_config)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        });
+        command.wrap(KillOnDrop);
+        command.wrap(JobObject);
+        let child = command.spawn().map_err(|_| RuntimeError::OwnedCore)?;
+        if vpn_hub_windows_security::verified_file_identity(&executable)
+            .map_err(|_| RuntimeError::Artifact)?
+            != executable_identity
+        {
+            drop(child);
+            return Err(RuntimeError::Artifact);
+        }
+        drop(executable_guard);
+        let identity = OwnedProcessIdentity {
+            pid: child.id().ok_or(RuntimeError::OwnedCore)?,
+            creation_identity: vpn_hub_windows_security::process_creation_identity(
+                child
+                    .inner_child()
+                    .raw_handle()
+                    .ok_or(RuntimeError::OwnedCore)? as usize,
+            )
+            .map_err(|_| RuntimeError::OwnedCore)?,
+            executable_sha256: manifest.core.sha256.clone(),
+            fencing_token,
+        };
+        self.identity = Some(identity.clone());
+        self.child = Some(child);
+        Ok(identity)
+    }
+
+    fn stop_owned(
+        &mut self,
+        identity: &OwnedProcessIdentity,
+        fencing_token: u64,
+    ) -> Result<(), RuntimeError> {
+        if self.identity.as_ref() != Some(identity) || identity.fencing_token != fencing_token {
+            return Err(RuntimeError::OwnedCore);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let executable = self.program_data_root.join("bin/mihomo.exe");
+        stop_held_child(
+            &mut self.child,
+            identity,
+            fencing_token,
+            || hash_file(&executable).map_err(|_| RuntimeError::OwnedCore),
+            || std::time::Instant::now() >= deadline,
+            || std::thread::sleep(std::time::Duration::from_millis(10)),
+        )?;
+        self.identity = None;
+        Ok(())
+    }
+
+    fn owned_child_alive(
+        &mut self,
+        identity: &OwnedProcessIdentity,
+        fencing_token: u64,
+    ) -> Result<bool, RuntimeError> {
+        if self.identity.as_ref() != Some(identity) || identity.fencing_token != fencing_token {
+            return Err(RuntimeError::OwnedCore);
+        }
+        Ok(self
+            .child
+            .as_mut()
+            .ok_or(RuntimeError::OwnedCore)?
+            .try_wait()
+            .map_err(|_| RuntimeError::OwnedCore)?
+            .is_none())
+    }
+
+    fn network_fingerprint(&self) -> Result<[u8; 32], RuntimeError> {
+        let records = vpn_hub_windows_security::network_state_records()
+            .map_err(|_| RuntimeError::OwnedCore)?;
+        let slices = records.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        Ok(SupervisorMachine::network_fingerprint(&slices))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn hash_file(path: &Path) -> Result<String, RuntimeError> {
+    let (mut file, _) =
+        vpn_hub_windows_security::open_verified_file(path).map_err(|_| RuntimeError::Artifact)?;
+    hash_open_file(&mut file)
+}
+
+#[cfg(target_os = "windows")]
+fn hash_open_file(file: &mut std::fs::File) -> Result<String, RuntimeError> {
+    use std::io::Read as _;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| RuntimeError::Artifact)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        CoreArtifact, EntrySummary, OutletHealthSummary, OutletKindSummary, OutletSummary,
+    };
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Clone)]
+    struct FakeProvider(Arc<Mutex<SupervisionManifest>>);
+
+    impl ManifestProvider for FakeProvider {
+        fn load(&self) -> Result<SupervisionManifest, RuntimeError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    #[allow(clippy::struct_excessive_bools)]
+    #[derive(Default)]
+    struct FakeBackend {
+        stopped: Vec<u32>,
+        next_pid: u32,
+        alive: bool,
+        fail_start: bool,
+        check_port: bool,
+        fingerprint: [u8; 32],
+        network_fail: bool,
+        fail_stop_once: bool,
+        stop_attempts: u32,
+    }
+
+    #[cfg(target_os = "windows")]
+    struct FakeStoppableChild {
+        handle_id: u64,
+        pid: u32,
+        creation_identity: u64,
+        creation_fails: bool,
+        start_kill_fails: bool,
+        waits: std::collections::VecDeque<Result<bool, ()>>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    #[cfg(target_os = "windows")]
+    impl Drop for FakeStoppableChild {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    impl StoppableChild for FakeStoppableChild {
+        fn child_id(&self) -> Option<u32> {
+            Some(self.pid)
+        }
+
+        fn creation_identity(&self) -> Result<u64, RuntimeError> {
+            if self.creation_fails {
+                Err(RuntimeError::OwnedCore)
+            } else {
+                Ok(self.creation_identity)
+            }
+        }
+
+        fn start_kill(&mut self) -> Result<(), RuntimeError> {
+            if self.start_kill_fails {
+                Err(RuntimeError::OwnedCore)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn has_exited(&mut self) -> Result<bool, RuntimeError> {
+            self.waits
+                .pop_front()
+                .unwrap_or(Ok(true))
+                .map_err(|()| RuntimeError::OwnedCore)
+        }
+    }
+
+    impl CoreBackend for FakeBackend {
+        fn start_owned(
+            &mut self,
+            manifest: &SupervisionManifest,
+            fencing_token: u64,
+        ) -> Result<OwnedProcessIdentity, RuntimeError> {
+            if self.fail_start {
+                return Err(RuntimeError::OwnedCore);
+            }
+            if self.check_port
+                && std::net::TcpListener::bind((manifest.entry.host.as_str(), manifest.entry.port))
+                    .is_err()
+            {
+                return Err(RuntimeError::PortConflict);
+            }
+            self.next_pid = self.next_pid.max(40_000) + 1;
+            self.alive = true;
+            Ok(OwnedProcessIdentity {
+                pid: self.next_pid,
+                creation_identity: u64::from(self.next_pid) + 5,
+                executable_sha256: manifest.core.sha256.clone(),
+                fencing_token,
+            })
+        }
+
+        fn stop_owned(
+            &mut self,
+            identity: &OwnedProcessIdentity,
+            fencing_token: u64,
+        ) -> Result<(), RuntimeError> {
+            if identity.fencing_token != fencing_token {
+                return Err(RuntimeError::OwnedCore);
+            }
+            self.stop_attempts = self.stop_attempts.saturating_add(1);
+            if std::mem::take(&mut self.fail_stop_once) {
+                return Err(RuntimeError::OwnedCore);
+            }
+            self.stopped.push(identity.pid);
+            self.alive = false;
+            Ok(())
+        }
+
+        fn owned_child_alive(
+            &mut self,
+            identity: &OwnedProcessIdentity,
+            fencing_token: u64,
+        ) -> Result<bool, RuntimeError> {
+            Ok(identity.fencing_token == fencing_token && self.alive)
+        }
+
+        fn network_fingerprint(&self) -> Result<[u8; 32], RuntimeError> {
+            if self.network_fail {
+                Err(RuntimeError::OwnedCore)
+            } else {
+                Ok(self.fingerprint)
+            }
+        }
+    }
+
+    fn manifest(generation: u64) -> SupervisionManifest {
+        SupervisionManifest {
+            schema_version: 1,
+            install_id: "install-a".into(),
+            generation,
+            core: CoreArtifact {
+                relative_path: "bin/mihomo.exe".into(),
+                sha256: "a".repeat(64),
+            },
+            runtime_config_relative_path: "runtime/mihomo.yaml".into(),
+            guardian_database_relative_path: "data/guardian.db".into(),
+            entry: EntrySummary {
+                host: "127.0.0.1".into(),
+                port: 48_321,
+            },
+            outlets: vec![OutletSummary {
+                outlet_id: "subscription-a".into(),
+                kind: OutletKindSummary::Subscription,
+                health: OutletHealthSummary::Healthy,
+            }],
+        }
+    }
+
+    fn request(command: Command) -> AuthenticatedRequest {
+        AuthenticatedRequest {
+            request_id: "request-a".into(),
+            install_id: "install-a".into(),
+            nonce: "nonce-a".into(),
+            challenge: "challenge-a".into(),
+            command,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn stop_faults_retain_the_same_wrapper_until_exit_is_confirmed() {
+        #[derive(Clone, Copy)]
+        enum Fault {
+            Creation,
+            Hash,
+            InitialTryWait,
+            StartKill,
+            PostKillTryWait,
+            Timeout,
+        }
+
+        for fault in [
+            Fault::Creation,
+            Fault::Hash,
+            Fault::InitialTryWait,
+            Fault::StartKill,
+            Fault::PostKillTryWait,
+            Fault::Timeout,
+        ] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let waits = match fault {
+                Fault::InitialTryWait => [Err(())].into_iter().collect(),
+                Fault::StartKill => [Ok(false)].into_iter().collect(),
+                Fault::PostKillTryWait => [Ok(false), Err(())].into_iter().collect(),
+                Fault::Timeout => [Ok(false), Ok(false)].into_iter().collect(),
+                Fault::Creation | Fault::Hash => std::collections::VecDeque::new(),
+            };
+            let mut slot = Some(FakeStoppableChild {
+                handle_id: 77,
+                pid: 43_210,
+                creation_identity: 99,
+                creation_fails: matches!(fault, Fault::Creation),
+                start_kill_fails: matches!(fault, Fault::StartKill),
+                waits,
+                drops: Arc::clone(&drops),
+            });
+            let identity = OwnedProcessIdentity {
+                pid: 43_210,
+                creation_identity: 99,
+                executable_sha256: "a".repeat(64),
+                fencing_token: 5,
+            };
+            let result = stop_held_child(
+                &mut slot,
+                &identity,
+                5,
+                || {
+                    if matches!(fault, Fault::Hash) {
+                        Err(RuntimeError::OwnedCore)
+                    } else {
+                        Ok("a".repeat(64))
+                    }
+                },
+                || matches!(fault, Fault::Timeout),
+                || {},
+            );
+            assert!(result.is_err());
+            assert_eq!(slot.as_ref().map(|child| child.handle_id), Some(77));
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+            let retained = slot.as_mut().expect("same wrapper retained");
+            retained.creation_fails = false;
+            retained.start_kill_fails = false;
+            retained.waits = [Ok(true)].into_iter().collect();
+            stop_held_child(
+                &mut slot,
+                &identity,
+                5,
+                || Ok("a".repeat(64)),
+                || false,
+                || {},
+            )
+            .expect("retained wrapper can be retried");
+            assert!(slot.is_none());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn command_handler_only_stops_its_exact_owned_child() {
+        let source = Arc::new(Mutex::new(manifest(1)));
+        let provider = FakeProvider(source);
+        let mut runtime =
+            HelperRuntime::acquire_helper(FakeBackend::default(), provider, 1_000).unwrap();
+        let started = runtime.handle(&request(Command::Start), 1_001).unwrap();
+        let owned_pid = started.owned_pid.unwrap();
+        runtime.handle(&request(Command::Stop), 1_002).unwrap();
+        assert_eq!(runtime.backend.stopped, vec![owned_pid]);
+        assert!(!runtime.backend.stopped.contains(&99_999));
+    }
+
+    #[test]
+    fn failed_stop_retains_exact_live_identity_for_retry() {
+        let source = Arc::new(Mutex::new(manifest(1)));
+        let provider = FakeProvider(source);
+        let mut runtime =
+            HelperRuntime::acquire_helper(FakeBackend::default(), provider, 1_000).unwrap();
+        let started = runtime.handle(&request(Command::Start), 1_001).unwrap();
+        let owned_pid = started.owned_pid.unwrap();
+        runtime.backend.fail_stop_once = true;
+        assert!(matches!(
+            runtime.handle(&request(Command::Stop), 1_002),
+            Err(RuntimeError::OwnedCore)
+        ));
+        assert_eq!(
+            runtime.owned.as_ref().map(|identity| identity.pid),
+            Some(owned_pid)
+        );
+        assert!(runtime.backend.alive);
+        assert!(matches!(
+            runtime.supervisor.state(),
+            crate::SupervisorState::Running { pid, .. } if pid == owned_pid
+        ));
+        runtime
+            .tick(1_002)
+            .expect("failed stop must not exit the service loop");
+        let stopped = runtime.handle(&request(Command::Stop), 1_003).unwrap();
+        assert!(stopped.owned_pid.is_none());
+        assert_eq!(runtime.backend.stop_attempts, 2);
+        assert_eq!(runtime.backend.stopped, vec![owned_pid]);
+    }
+
+    #[test]
+    fn stale_stop_if_owned_never_touches_replacement_child() {
+        let source = Arc::new(Mutex::new(manifest(1)));
+        let provider = FakeProvider(source);
+        let mut runtime =
+            HelperRuntime::acquire_helper(FakeBackend::default(), provider, 1_000).unwrap();
+        let first = runtime.handle(&request(Command::Start), 1_001).unwrap();
+        let stale = first.ownership.expect("first ownership snapshot");
+        let first_pid = stale.pid;
+
+        let replacement = runtime.handle(&request(Command::Restart), 1_002).unwrap();
+        let replacement_pid = replacement.owned_pid.expect("replacement pid");
+        assert_ne!(replacement_pid, first_pid);
+
+        let rejected = runtime
+            .handle(&request(Command::StopIfOwned(stale)), 1_003)
+            .unwrap();
+        assert_eq!(rejected.command_applied, Some(false));
+        assert_eq!(rejected.owned_pid, Some(replacement_pid));
+        assert_eq!(runtime.backend.stopped, vec![first_pid]);
+        assert!(runtime.backend.alive);
+    }
+
+    #[test]
+    fn dynamic_generation_reload_preserves_authority_fencing() {
+        let source = Arc::new(Mutex::new(manifest(1)));
+        let provider = FakeProvider(Arc::clone(&source));
+        let mut runtime =
+            HelperRuntime::acquire_helper(FakeBackend::default(), provider, 1_000).unwrap();
+        runtime.handle(&request(Command::Start), 1_001).unwrap();
+        let mut next = manifest(2);
+        next.outlets.push(OutletSummary {
+            outlet_id: "subscription-b".into(),
+            kind: OutletKindSummary::Subscription,
+            health: OutletHealthSummary::Unknown,
+        });
+        *source.lock().unwrap() = next;
+        let reply = runtime.handle(&request(Command::Reload), 1_002).unwrap();
+        assert_eq!(reply.generation, 2);
+        assert_eq!(reply.entry_port, 48_321);
+        assert_eq!(reply.outlets[0].outlet_id, "subscription-a");
+        assert_eq!(reply.outlets[1].outlet_id, "subscription-b");
+        let serialized = serde_json::to_string(&reply).unwrap();
+        assert!(!serialized.contains("url"));
+        assert!(!serialized.contains("token"));
+        assert!(!serialized.contains("node"));
+    }
+
+    #[test]
+    fn owned_crash_drives_bounded_backoff_and_restart() {
+        let source = Arc::new(Mutex::new(manifest(1)));
+        let provider = FakeProvider(source);
+        let mut runtime =
+            HelperRuntime::acquire_helper(FakeBackend::default(), provider, 1_000).unwrap();
+        let first = runtime.handle(&request(Command::Start), 1_001).unwrap();
+        runtime.backend.alive = false;
+        runtime.tick(1_100).unwrap();
+        assert!(matches!(
+            runtime.supervisor.state(),
+            crate::SupervisorState::Backoff { .. }
+        ));
+        runtime.tick(2_100).unwrap();
+        let restarted = runtime.handle(&request(Command::Status), 2_101).unwrap();
+        assert_ne!(first.owned_pid, restarted.owned_pid);
+    }
+
+    #[test]
+    fn repeated_restart_failures_reach_circuit_without_exiting_tick_loop() {
+        let source = Arc::new(Mutex::new(manifest(1)));
+        let provider = FakeProvider(source);
+        let mut runtime =
+            HelperRuntime::acquire_helper(FakeBackend::default(), provider, 1_000).unwrap();
+        runtime.handle(&request(Command::Start), 1_001).unwrap();
+        runtime.backend.alive = false;
+        runtime.backend.fail_start = true;
+        runtime.tick(1_100).unwrap();
+        for due in [2_100, 4_100, 8_100, 16_100] {
+            runtime.tick(due).unwrap();
+        }
+        assert_eq!(runtime.supervisor.circuit(), crate::CircuitState::Open);
+        assert!(matches!(
+            runtime.supervisor.state(),
+            crate::SupervisorState::FailClosed(FailClosedReason::OwnershipLost)
+        ));
+    }
+
+    #[test]
+    fn replacement_start_failure_is_stopped_then_retried_for_all_recovery_paths() {
+        for command in [Command::Reload, Command::NetworkChanged, Command::Resume] {
+            let source = Arc::new(Mutex::new(manifest(1)));
+            let provider = FakeProvider(Arc::clone(&source));
+            let mut runtime =
+                HelperRuntime::acquire_helper(FakeBackend::default(), provider, 1_000).unwrap();
+            let first = runtime.handle(&request(Command::Start), 1_001).unwrap();
+            let first_pid = first.owned_pid.unwrap();
+            if command == Command::Reload {
+                *source.lock().unwrap() = manifest(2);
+            }
+            runtime.backend.fail_start = true;
+            let reply = runtime.handle(&request(command), 1_002).unwrap();
+            assert!(reply.owned_pid.is_none(), "{command:?}");
+            assert_eq!(runtime.backend.stopped, vec![first_pid], "{command:?}");
+            assert!(runtime.replacement_pending, "{command:?}");
+            assert!(matches!(
+                runtime.supervisor.state(),
+                crate::SupervisorState::Backoff { .. }
+            ));
+            runtime.backend.fail_start = false;
+            runtime.tick(2_002).unwrap();
+            let recovered = runtime.handle(&request(Command::Status), 2_003).unwrap();
+            assert_ne!(recovered.owned_pid, Some(first_pid), "{command:?}");
+            assert!(recovered.owned_pid.is_some(), "{command:?}");
+            assert!(!runtime.replacement_pending, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn network_errors_keep_previous_state_and_real_change_recovers_once() {
+        let source = Arc::new(Mutex::new(manifest(1)));
+        let provider = FakeProvider(source);
+        let mut runtime =
+            HelperRuntime::acquire_helper(FakeBackend::default(), provider, 1_000).unwrap();
+        runtime.handle(&request(Command::Start), 1_001).unwrap();
+        runtime.backend.network_fail = true;
+        runtime.tick(1_100).unwrap();
+        assert_eq!(runtime.backend.stop_attempts, 0);
+        runtime.backend.network_fail = false;
+        runtime.tick(1_200).unwrap();
+        assert_eq!(runtime.backend.stop_attempts, 0);
+        runtime.backend.fingerprint = [9; 32];
+        runtime.tick(1_300).unwrap();
+        assert_eq!(runtime.backend.stop_attempts, 1);
+        runtime.tick(1_400).unwrap();
+        assert_eq!(runtime.backend.stop_attempts, 1);
+    }
+
+    #[test]
+    fn crash_and_network_change_in_one_tick_never_reload_dead_child() {
+        let source = Arc::new(Mutex::new(manifest(1)));
+        let provider = FakeProvider(source);
+        let mut runtime =
+            HelperRuntime::acquire_helper(FakeBackend::default(), provider, 1_000).unwrap();
+        runtime.handle(&request(Command::Start), 1_001).unwrap();
+        runtime.backend.alive = false;
+        runtime.backend.fingerprint = [7; 32];
+        runtime.tick(1_100).unwrap();
+        assert_eq!(runtime.backend.stop_attempts, 0);
+        assert!(runtime.owned.is_none());
+    }
+
+    #[test]
+    fn occupied_dynamic_entry_port_returns_sanitized_fail_closed_reason() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut value = manifest(1);
+        value.entry.port = port;
+        let source = Arc::new(Mutex::new(value));
+        let provider = FakeProvider(source);
+        let backend = FakeBackend {
+            check_port: true,
+            ..FakeBackend::default()
+        };
+        let mut runtime = HelperRuntime::acquire_helper(backend, provider, 1_000).unwrap();
+        let reply = runtime.handle(&request(Command::Start), 1_001).unwrap();
+        assert!(!reply.ok);
+        assert_eq!(reply.reason.as_deref(), Some("port-conflict"));
+        assert!(reply.owned_pid.is_none());
+        drop(listener);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn program_data_provider_rejects_a_corrupt_database_without_exposing_content() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("data")).unwrap();
+        let database = temp.path().join("data/guardian.db");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute("CREATE TABLE health (id INTEGER PRIMARY KEY)", [])
+            .unwrap();
+        drop(connection);
+        let manifest = manifest(1);
+        let manifest_path = temp.path().join("supervision.json");
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let provider = ProgramDataManifestProvider {
+            root: temp.path().to_path_buf(),
+            manifest_path: manifest_path.clone(),
+            install_id: "install-a".into(),
+        };
+        assert!(provider.load().is_ok());
+        let runtime_provider = ProgramDataManifestProvider {
+            root: temp.path().to_path_buf(),
+            manifest_path,
+            install_id: "install-a".into(),
+        };
+        let mut runtime =
+            HelperRuntime::acquire_helper(FakeBackend::default(), runtime_provider, 1_000).unwrap();
+        runtime.handle(&request(Command::Start), 1_001).unwrap();
+        runtime.handle(&request(Command::Stop), 1_002).unwrap();
+        std::fs::write(&database, b"not a sqlite database").unwrap();
+        assert!(matches!(
+            provider.load(),
+            Err(RuntimeError::CorruptDatabase)
+        ));
+        let reply = runtime.handle(&request(Command::Start), 1_003).unwrap();
+        assert!(!reply.ok);
+        assert_eq!(reply.reason.as_deref(), Some("corrupt-database"));
+        assert!(reply.owned_pid.is_none());
+    }
+}

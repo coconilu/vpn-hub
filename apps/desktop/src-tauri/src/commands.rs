@@ -40,7 +40,7 @@ pub struct DashboardSnapshot {
     udp_capabilities: Vec<UdpCapabilityEvidence>,
 }
 
-fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
+async fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
     let private = state.private_config()?;
@@ -81,7 +81,7 @@ fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
     Ok(DashboardSnapshot {
         updated_at: Utc::now().to_rfc3339(),
         entry: AppState::port_snapshot(&private.entry.host, private.entry.port),
-        mihomo: state.core_status()?,
+        mihomo: state.core_status_authoritative().await?,
         routing: state.routing_status()?,
         summaries: store
             .summaries()
@@ -399,14 +399,14 @@ pub async fn get_dashboard_snapshot(
     state: State<'_, AppState>,
 ) -> Result<DashboardSnapshot, String> {
     let _transaction = state.lock_routing_transaction().await;
-    load_dashboard(&state)
+    load_dashboard(&state).await
 }
 
 #[tauri::command]
 pub async fn refresh_guardian(state: State<'_, AppState>) -> Result<DashboardSnapshot, String> {
     let _transaction = state.lock_routing_transaction().await;
     record_routing_cycle_locked(&state).await?;
-    load_dashboard(&state)
+    load_dashboard(&state).await
 }
 
 #[tauri::command]
@@ -473,7 +473,7 @@ pub async fn revalidate_udp_capabilities(
             .map_err(|error| format!("无法写入 UDP 能力证据：{error}"))?;
     }
     drop(echo);
-    load_dashboard(&state)
+    load_dashboard(&state).await
 }
 
 struct OwnedUdpEcho {
@@ -541,7 +541,7 @@ pub async fn set_route_mode(
     state.set_route_mode(mode, manual_outlet)?;
     record_routing_cycle_locked(&state).await?;
     lifecycle::dispatch(&app, LifecycleEvent::RouteChanged);
-    load_dashboard(&state)
+    load_dashboard(&state).await
 }
 
 #[tauri::command]
@@ -585,7 +585,8 @@ pub async fn start_development_core(
         Ok(status) => status,
         Err(error) => {
             if state
-                .core_status()
+                .core_status_authoritative()
+                .await
                 .is_ok_and(|status| status.state == "external")
             {
                 lifecycle::dispatch(&app, LifecycleEvent::PortConflictObserved);
@@ -598,10 +599,18 @@ pub async fn start_development_core(
         coordinator.complete_manual_start_failure(start_epoch);
         return Err("应用自管核心未发布可验证 PID；已保持 Fail Closed".into());
     };
+    if state.uses_helper_authority() {
+        if !coordinator.complete_manual_start(pid, start_epoch) {
+            let _ = state.stop_supervised_core_if_pid(pid).await;
+            return Err("停止请求优先于 Helper 启动结果；核心已安全停止".into());
+        }
+        status.message = "Helper authority 已启动并监督核心".into();
+        return Ok(status);
+    }
     if !coordinator.manual_start_allowed(start_epoch)
         || !state.owned_core_controller_is_running(pid)
     {
-        let _ = state.stop_owned_core_if_pid(pid);
+        let _ = state.stop_supervised_core_if_pid(pid).await;
         coordinator.complete_manual_start_failure(start_epoch);
         return Err("应用自管核心在首次 Guardian 前失去 PID 或 Controller ownership；已停止并保持 Fail Closed".into());
     }
@@ -610,14 +619,14 @@ pub async fn start_development_core(
         || !coordinator.manual_start_allowed(start_epoch)
         || !state.owned_core_controller_is_running(pid)
     {
-        let _ = state.stop_owned_core_if_pid(pid);
+        let _ = state.stop_supervised_core_if_pid(pid).await;
         coordinator.complete_manual_start_failure(start_epoch);
         return Err("应用自管核心未通过首次 Guardian 的 PID 与 Controller ownership 复核；已停止并保持 Fail Closed".into());
     }
     if !coordinator.complete_manual_start(pid, start_epoch)
         || !state.owned_core_controller_is_running(pid)
     {
-        let _ = state.stop_owned_core_if_pid(pid);
+        let _ = state.stop_supervised_core_if_pid(pid).await;
         return Err("停止请求已优先于迟到的启动结果；应用自管核心已清理".into());
     }
     status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();
@@ -643,7 +652,7 @@ pub async fn stop_development_core(
             message: "应用自管核心与待恢复任务已停止".into(),
         },
         lifecycle::StopRequestResult::Pending => {
-            let pid = state.owned_core_pid();
+            let pid = state.owned_core_pid_authoritative().await?;
             CoreStatus {
                 state: "stopping".into(),
                 managed: pid.is_some(),
@@ -745,7 +754,7 @@ mod tests {
         let data_directory = directory.path().join("clean-app-data");
         let state = AppState::new_for_test(workspace_root, &data_directory);
 
-        let initial = load_dashboard(&state).expect("clean dashboard");
+        let initial = load_dashboard(&state).await.expect("clean dashboard");
         assert_eq!(initial.entry.host, "127.0.0.1");
         assert_eq!(initial.entry.port, 3_666);
         assert!(initial.routing.outlets.is_empty());
@@ -758,13 +767,13 @@ mod tests {
             .await
             .expect_err("manual startup must reject the direct Guardian fallback");
         assert!(strict_error.contains("Controller"));
-        let refreshed = load_dashboard(&state).expect("refreshed dashboard");
+        let refreshed = load_dashboard(&state).await.expect("refreshed dashboard");
         assert!(refreshed.routing.outlets.is_empty());
         assert!(refreshed.summaries.is_empty());
     }
 
-    #[test]
-    fn dashboard_projects_stale_udp_evidence_as_unknown_without_rewriting_history() {
+    #[tokio::test]
+    async fn dashboard_projects_stale_udp_evidence_as_unknown_without_rewriting_history() {
         let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
         let data_directory = directory.path().join("dashboard-stale-evidence");
@@ -802,7 +811,7 @@ mod tests {
         config
             .save(state.private_config_path_for_test())
             .expect("save changed config");
-        let dashboard = load_dashboard(&state).expect("dashboard snapshot");
+        let dashboard = load_dashboard(&state).await.expect("dashboard snapshot");
         assert_eq!(dashboard.udp_capabilities.len(), 1);
         assert_eq!(
             dashboard.udp_capabilities[0].status,

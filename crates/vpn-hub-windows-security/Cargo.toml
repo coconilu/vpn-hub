@@ -1,0 +1,22 @@
+[package]
+name = "vpn-hub-windows-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+tokio = { workspace = true, features = ["net"] }
+windows-permissions.workspace = true
+windows-sys.workspace = true
+
+[dev-dependencies]
+junction = "1.2.0"
+tempfile = "3.23.0"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
