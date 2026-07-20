@@ -10,8 +10,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use vpn_hub_core::{
-    ControllerClient, OutletConfigSummary, PrivateRoutingConfig, RouteDecision, RouteMode,
-    RoutingEngine, generate_controller_secret, generate_mihomo_config,
+    ControllerClient, OutletConfigSummary, PrivateRoutingConfig, ResolvedSubscriptionUrls,
+    RouteDecision, RouteMode, RoutingEngine, SecretStore, SubscriptionCredentialStatus,
+    SubscriptionSecrets, SystemSecretStore, generate_controller_secret, generate_mihomo_config,
+    migrate_legacy_subscription,
 };
 
 const DEFAULT_GUARDIAN_CONFIG: &str = r#"database_path = "guardian-desktop.db"
@@ -56,6 +58,7 @@ pub struct AppState {
     guardian_config_path: PathBuf,
     private_config_path: PathBuf,
     runtime_directory: PathBuf,
+    secret_store: Option<SystemSecretStore>,
     managed_core: Mutex<Option<ManagedCore>>,
     routing_engine: Mutex<RoutingEngine>,
     routing_transaction: RoutingTransaction,
@@ -106,11 +109,31 @@ impl AppState {
         guardian_override: Option<PathBuf>,
     ) -> Self {
         let runtime_directory = data_directory.join("runtime");
-        let initialization_error = initialize_runtime_security(&runtime_directory).err();
+        let mut initialization_error = initialize_runtime_security(&runtime_directory).err();
         let guardian_config_path = guardian_override
             .unwrap_or_else(|| prepare_local_guardian_config(data_directory, &workspace_root));
         let private_config_path = data_directory.join("private-routing.toml");
-        let _ = PrivateRoutingConfig::create_default(&private_config_path);
+        let secret_store = if let Ok(store) = SystemSecretStore::new() {
+            if prepare_private_config(&private_config_path, &store).is_err() {
+                initialization_error.get_or_insert_with(|| {
+                    "本机路由配置恢复或受保护凭据迁移失败；开发核心保持 Fail Closed".into()
+                });
+            }
+            Some(store)
+        } else {
+            let backup = private_config_path.with_extension("toml.bak");
+            if !private_config_path.exists()
+                && !backup.exists()
+                && PrivateRoutingConfig::create_default(&private_config_path).is_err()
+            {
+                initialization_error
+                    .get_or_insert_with(|| "无法创建本机路由配置；开发核心保持 Fail Closed".into());
+            }
+            initialization_error.get_or_insert_with(|| {
+                "Windows 受保护凭据存储不可用；开发核心保持 Fail Closed".into()
+            });
+            None
+        };
         let _ = harden_private_config_files(&private_config_path);
         let private_config = PrivateRoutingConfig::load(&private_config_path).unwrap_or_default();
         let routing_engine = RoutingEngine::new(
@@ -122,6 +145,7 @@ impl AppState {
             guardian_config_path,
             private_config_path,
             runtime_directory,
+            secret_store,
             managed_core: Mutex::new(None),
             routing_engine: Mutex::new(routing_engine),
             routing_transaction: RoutingTransaction::default(),
@@ -144,6 +168,66 @@ impl AppState {
             .map_err(|error| format!("无法加载本机私密路由配置：{error}"))
     }
 
+    pub fn resolved_subscription_urls(
+        &self,
+        config: &PrivateRoutingConfig,
+    ) -> Result<ResolvedSubscriptionUrls, String> {
+        if !config
+            .outlets
+            .iter()
+            .any(|outlet| outlet.secret_ref().is_some())
+        {
+            return Ok(ResolvedSubscriptionUrls::new());
+        }
+        let store = self
+            .secret_store
+            .as_ref()
+            .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?;
+        SubscriptionSecrets::new(store)
+            .resolve(config)
+            .map_err(|error| format!("无法解析订阅凭据：{error}"))
+    }
+
+    pub fn subscription_credential_statuses(
+        &self,
+    ) -> Result<Vec<SubscriptionCredentialStatus>, String> {
+        let config = self.private_config()?;
+        let store = self
+            .secret_store
+            .as_ref()
+            .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?;
+        Ok(SubscriptionSecrets::new(store).statuses(&config))
+    }
+
+    pub fn set_subscription_credential(
+        &self,
+        subscription_id: &str,
+        credential: &str,
+    ) -> Result<SubscriptionCredentialStatus, String> {
+        let config = self.private_config()?;
+        let store = self
+            .secret_store
+            .as_ref()
+            .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?;
+        SubscriptionSecrets::new(store)
+            .set(&config, subscription_id, credential)
+            .map_err(|error| format!("无法保存订阅凭据：{error}"))
+    }
+
+    pub fn delete_subscription_credential(
+        &self,
+        subscription_id: &str,
+    ) -> Result<SubscriptionCredentialStatus, String> {
+        let config = self.private_config()?;
+        let store = self
+            .secret_store
+            .as_ref()
+            .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?;
+        SubscriptionSecrets::new(store)
+            .delete(&config, subscription_id)
+            .map_err(|error| format!("无法删除订阅凭据：{error}"))
+    }
+
     #[must_use]
     pub fn port_snapshot(host: &str, port: u16) -> PortSnapshot {
         PortSnapshot {
@@ -156,7 +240,7 @@ impl AppState {
 
     pub fn routing_status(&self) -> Result<RoutingStatus, String> {
         let config = self.private_config()?;
-        let resolved = config.resolved_subscription_urls();
+        let resolved = self.resolved_subscription_urls(&config)?;
         let controller_ready = self.controller_client()?.is_some();
         let engine = self
             .routing_engine
@@ -314,7 +398,7 @@ impl AppState {
             .map_err(|error| format!("无法创建 Mihomo 运行目录：{error}"))?;
         harden_private_path(&self.runtime_directory)?;
         let controller_secret = generate_controller_secret();
-        let resolved = private_config.resolved_subscription_urls();
+        let resolved = self.resolved_subscription_urls(&private_config)?;
         let (yaml, _) = generate_mihomo_config(&private_config, &resolved, &controller_secret)
             .map_err(|error| format!("无法生成 Mihomo 配置：{error}"))?;
         let config_path = self.runtime_directory.join("mihomo.yaml");
@@ -499,6 +583,17 @@ fn clear_legacy_raw_logs(runtime_directory: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn prepare_private_config<S: SecretStore + ?Sized>(path: &Path, store: &S) -> Result<(), String> {
+    let backup = path.with_extension("toml.bak");
+    if path.exists() || backup.exists() {
+        migrate_legacy_subscription(path, store)
+            .map(|_| ())
+            .map_err(|_| "无法恢复本机路由配置或迁移旧凭据".to_string())
+    } else {
+        PrivateRoutingConfig::create_default(path).map_err(|_| "无法创建本机路由配置".to_string())
+    }
+}
+
 fn harden_private_config_files(path: &Path) -> Result<(), String> {
     harden_private_path(path)?;
     let backup = path.with_extension("toml.bak");
@@ -629,11 +724,76 @@ fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
     use vpn_hub_core::{
         HealthStatus, MASTER_SELECTOR, OutletConfig, OutletHealth, OutletKind, RoutingPolicy,
-        outlet_proxy_name,
+        SecretStoreError, outlet_proxy_name,
     };
+
+    #[derive(Default)]
+    struct TestSecretStore {
+        values: Mutex<BTreeMap<String, String>>,
+    }
+
+    impl SecretStore for TestSecretStore {
+        fn get(&self, secret_ref: &str) -> Result<Option<String>, SecretStoreError> {
+            Ok(self.values.lock().expect("values").get(secret_ref).cloned())
+        }
+
+        fn set(&self, secret_ref: &str, secret: &str) -> Result<(), SecretStoreError> {
+            self.values
+                .lock()
+                .expect("values")
+                .insert(secret_ref.into(), secret.into());
+            Ok(())
+        }
+
+        fn delete(&self, secret_ref: &str) -> Result<(), SecretStoreError> {
+            self.values.lock().expect("values").remove(secret_ref);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn prepares_missing_primary_from_legacy_backup_before_default_creation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("private-routing.toml");
+        let backup = path.with_extension("toml.bak");
+        let credential = format!(
+            "https://example.invalid/subscription/{}",
+            generate_controller_secret()
+        );
+        fs::write(
+            &backup,
+            format!(
+                r#"subscription_url = "{credential}"
+provider_update_seconds = 180
+controller_port = 39090
+route_mode = "priority"
+priority = ["subscription-a", "chaoshihui"]
+cooldown_seconds = 60
+minimum_improvement_ms = 150
+probe_targets = ["https://example.com/a", "https://example.com/b"]
+"#
+            ),
+        )
+        .expect("legacy backup");
+        let store = TestSecretStore::default();
+
+        prepare_private_config(&path, &store).expect("recover before default");
+
+        assert!(path.exists());
+        for config_path in [&path, &backup] {
+            let content = fs::read_to_string(config_path).expect("sanitized config");
+            assert!(!content.contains(&credential));
+            assert!(!content.contains("subscription_url"));
+        }
+        assert_eq!(store.values.lock().expect("values").len(), 1);
+        assert_eq!(
+            store.get("legacy.subscription-a").expect("migrated secret"),
+            Some(credential)
+        );
+    }
 
     #[test]
     fn app_initialization_removes_raw_logs_and_keeps_diagnostics_sanitized() {
