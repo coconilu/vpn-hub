@@ -1,18 +1,30 @@
 import { execFileSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import process from "node:process";
-import { devArtifactName, sha256, stableJson } from "./release-lib.mjs";
+import {
+  assertExpectedCommit,
+  devArtifactName,
+  sha256,
+  stableJson,
+  validateBuildEnvironment,
+} from "./release-lib.mjs";
+import { normalizeFrontendSbom } from "./sbom-lib.mjs";
 
 const options = parseArgs(process.argv.slice(2));
 const root = resolve(options.root ?? ".");
 const sourceArtifact = resolve(required(options, "artifact"));
 const output = resolve(required(options, "output"));
 const commit = run("git", ["rev-parse", "HEAD"], root);
+const expectedCommit = required(options, "expected-commit");
+assertExpectedCommit(commit, expectedCommit);
 const cargoMetadata = JSON.parse(
   run("cargo", ["metadata", "--locked", "--format-version", "1", "--filter-platform", "x86_64-pc-windows-msvc"], root),
 );
-const packageLock = JSON.parse(readFileSync(join(root, "apps/desktop/package-lock.json"), "utf8"));
+const environmentSource = resolve(required(options, "environment"));
+const buildEnvironment = JSON.parse(readFileSync(environmentSource, "utf8"));
+validateBuildEnvironment(buildEnvironment);
 const tauriConfig = JSON.parse(
   readFileSync(join(root, "apps/desktop/src-tauri/tauri.conf.json"), "utf8"),
 );
@@ -57,25 +69,24 @@ const rustDependencies = (cargoMetadata.resolve?.nodes ?? [])
   .filter((item) => item.ref && rustRefs.has(item.ref))
   .sort((left, right) => left.ref.localeCompare(right.ref));
 
-const frontendComponents = Object.entries(packageLock.packages ?? {})
-  .filter(([path, value]) => path.startsWith("node_modules/") && value.version)
-  .map(([path, value]) => {
-    const name = path.slice("node_modules/".length);
-    return {
-      "bom-ref": `pkg:npm/${encodeURIComponent(name)}@${value.version}`,
-      hashes: integrityHash(value.integrity),
-      licenses: value.license ? [{ expression: value.license }] : [{ expression: "NOASSERTION" }],
-      name,
-      purl: `pkg:npm/${encodeURIComponent(name)}@${value.version}`,
-      type: "library",
-      version: value.version,
-    };
-  })
-  .sort(componentOrder)
-  .map(removeUndefined);
+const desktopRoot = join(root, "apps/desktop");
+const cyclonedxCli = join(desktopRoot, "node_modules/@cyclonedx/cyclonedx-npm/bin/cyclonedx-npm-cli.js");
+const frontendRaw = JSON.parse(run(process.execPath, [
+  cyclonedxCli,
+  "--package-lock-only",
+  "--flatten-components",
+  "--output-reproducible",
+  "--validate",
+  "--spec-version", "1.6",
+  "--output-format", "JSON",
+  "--output-file", "-",
+], desktopRoot));
+const requireFromDesktop = createRequire(join(desktopRoot, "package.json"));
+const { PackageURL } = requireFromDesktop("packageurl-js");
+const frontendSbom = normalizeFrontendSbom(frontendRaw, (value) => PackageURL.fromString(value));
+const frontendComponents = frontendSbom.components;
 
 const rustSbom = cyclone("VPN Hub Rust workspace", workspaceVersion, rustComponents, rustDependencies);
-const frontendSbom = cyclone("VPN Hub frontend", workspaceVersion, frontendComponents, []);
 const licenses = [...rustComponents.map((item) => licenseRow("cargo", item)), ...frontendComponents.map((item) => licenseRow("npm", item))]
   .sort((left, right) => `${left.ecosystem}:${left.name}:${left.version}`.localeCompare(`${right.ecosystem}:${right.name}:${right.version}`));
 const reproducibility = {
@@ -93,12 +104,14 @@ const reproducibility = {
   normalization: "No wall-clock timestamp, absolute path, username, runner name, or SBOM serial number is recorded.",
   source: { commit, version: workspaceVersion },
   toolchain,
+  build_environment: buildEnvironment,
 };
 
 const rustBytes = writeStable(join(output, "rust-sbom.cdx.json"), rustSbom);
 const frontendBytes = writeStable(join(output, "frontend-sbom.cdx.json"), frontendSbom);
 const licenseBytes = writeStable(join(output, "licenses.json"), { schema_version: 1, components: licenses });
 const reproducibilityBytes = writeStable(join(output, "reproducibility.json"), reproducibility);
+const environmentBytes = writeStable(join(output, "build-environment.json"), buildEnvironment);
 const artifactBytes = readFileSync(copiedArtifact);
 const manifest = {
   artifact: {
@@ -107,6 +120,7 @@ const manifest = {
     sha256: sha256(artifactBytes),
     size: statSync(copiedArtifact).size,
   },
+  build_environment_sha256: sha256(environmentBytes),
   channel: "dev",
   commit,
   frontend_sbom_sha256: sha256(frontendBytes),
@@ -145,12 +159,12 @@ function run(command, args, cwd) {
 }
 function versionOnly(output) { return output.split(/\s+/)[1]; }
 function componentOrder(left, right) { return left["bom-ref"].localeCompare(right["bom-ref"]); }
-function removeUndefined(value) { return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)); }
-function integrityHash(integrity) {
-  if (typeof integrity !== "string" || !integrity.startsWith("sha512-")) return undefined;
-  return [{ alg: "SHA-512", content: Buffer.from(integrity.slice(7), "base64").toString("hex") }];
+function licenseRow(ecosystem, item) {
+  const entry = item.licenses?.[0];
+  const license = entry?.expression ?? entry?.license?.id ?? entry?.license?.name ?? "NOASSERTION";
+  const name = item.group ? `${item.group}/${item.name}` : item.name;
+  return { ecosystem, license, name, version: item.version };
 }
-function licenseRow(ecosystem, item) { return { ecosystem, license: item.licenses[0].expression, name: item.name, version: item.version }; }
 function cyclone(name, version, components, dependencies) {
   return {
     bomFormat: "CycloneDX",

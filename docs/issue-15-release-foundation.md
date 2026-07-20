@@ -9,9 +9,9 @@
 | Windows NSIS | 可构建并重命名为 `.dev.nsis-setup.exe` | 受信 Authenticode 证书、SHA-256、RFC3161 时间戳和 `signtool verify /pa /tw` |
 | 更新清单 | typed canonical JSON、Ed25519 验证、key-id、anti-rollback | 审核后的生产公钥和 HTTPS 更新域名；生产默认 trust root 为空，因此 updater disabled |
 | 更新源 | 精确域名 allowlist，只接受 HTTPS | 域名/托管所有权、TLS 运维和事故撤回流程 |
-| SBOM | Rust 与 npm 各一份 CycloneDX 1.6 JSON | 每次候选构建校验、留档并随发行材料发布 |
+| SBOM | Rust 与 npm 各一份 CycloneDX 1.6 JSON；npm 使用官方生成器解析 lockfile v3 依赖图 | 每次候选构建校验、留档并随发行材料发布 |
 | 许可证 | Rust/npm 组件清单；缺失声明标为 `NOASSERTION` | 人工完成 `NOASSERTION` 和再分发义务审查 |
-| 可复现性 | 连续两次构建比较规范化依赖、许可证、toolchain 与 artifact hash | NSIS/PE 字节差异必须留报告；签名与时间戳不纳入 unsigned dev 的字节等价承诺 |
+| 可复现性 | 同一 runner 内两个全新 checkout、独立 `node_modules` 与 `CARGO_TARGET_DIR` 比较规范化材料 | 当前只能称为 same-run normalized consistency；跨 runner/镜像复现与正式 promotion 仍阻断 |
 | System proxy | 不包含 Issue #12 executor | 首版只有明确纳入该功能时才追加 #12 的隔离验收 |
 | TUN | production executor 明确 unsupported，release feature 强制 disabled | Issue #14 的真实 Windows executor 独立评审与隔离验收 |
 
@@ -19,7 +19,9 @@
 
 ## 产物与可比较范围
 
-`.github/workflows/windows-release-foundation.yml` 锁定 Node `24.15.0`、npm `11.12.1`、Rust `1.97.0`、Tauri CLI `2.11.4`，第三方 Actions 使用 full SHA。PR 运行完整验证但不上传；普通手动 dev run 只保留 7 天 Actions evidence；tag 或明确 promotion 请求会进入 fail-closed gate，不会创建 tag、GitHub Release 或更新 channel。
+`.github/workflows/windows-release-foundation.yml` 锁定 Node `24.15.0`、npm `11.12.1`、Rust `1.97.0`、Tauri CLI `2.11.4`，第三方 Actions 使用 full SHA。所有 required PR job 都 checkout `pull_request.head.sha` 并立即断言 `HEAD`；非 PR 事件才 fallback 到 `github.sha`。release manifest 的 commit 也必须与该 expected SHA 完全一致。
+
+两次 NSIS 构建分别使用独立 checkout（各自保留 `.git`）、独立 `npm ci` 和全新 `CARGO_TARGET_DIR`，每次独立定位唯一 installer。证据记录 GitHub runner `ImageOS/ImageVersion`、MSVC `cl/link`、Windows SDK、NSIS/makensis、Rust/Cargo、Node/npm 与 Tauri 版本。若 build root 已存在任何 stale state，或两次环境证据漂移，比较直接失败。PR 不上传；普通手动 dev run 只保留 7 天 evidence；tag 或明确 promotion 请求无条件失败。
 
 | 文件 | 作用 | 是否可 promotion |
 | --- | --- | --- |
@@ -29,41 +31,39 @@
 | `frontend-sbom.cdx.json` | npm dependency coverage | 单独不足 |
 | `licenses.json` | 许可证表达式清单 | 单独不足 |
 | `reproducibility.json` | 规范化、可比与排除范围 | 单独不足 |
+| `build-environment.json` | runner image 与完整编译/打包工具版本 | 单独不足 |
 | `release-manifest.dev.json` | version/commit/toolchain/hashes 绑定；无签名、无更新 URL | 否 |
 | `reproducibility-diff.json` | 两次构建的材料/installer hash 差异 | 单独不足 |
 
-规范化材料不记录 wall-clock time、绝对路径、用户名、runner 名或随机 SBOM serial number。installer 的两个 SHA 会原样报告，绝不把不同二进制“归一化成相同”。
+规范化材料不记录 wall-clock time、绝对路径、用户名、runner 名或随机 SBOM serial number。installer 的两个 SHA 会原样报告，绝不把不同二进制“归一化成相同”。由于 `windows-latest` 是移动标签，当前结果明确命名为 **same-run normalized consistency**，不是正式跨环境可复现性证明。
 
 ## 更新验证与 promotion gate
 
 ```mermaid
 flowchart LR
-  A["HTTPS exact-host allowlist"] --> G["Fail-closed promotion"]
-  B["Known key-id + Ed25519 manifest signature"] --> G
-  C["Artifact hash + Rust/npm SBOM + licenses"] --> G
-  D["Trusted Authenticode chain + timestamp"] --> G
-  E["Anti-rollback version check"] --> G
-  F["Clean Windows VM evidence"] --> G
-  G -->|"任一缺失"| X["BLOCKED: no release/update channel"]
-  G -->|"全部满足"| Y["Eligible for separate human-controlled publish process"]
+  A["Partial foundation candidate"] --> G["Formal promotion boundary"]
+  D["No machine-produced Authenticode verifier"] --> G
+  E["No machine-produced update-signature verifier"] --> G
+  F["No clean Windows VM attestation verifier"] --> G
+  G -->|"unconditional"| X["BLOCKED: no release/update channel"]
 ```
 
-production `ReleasePolicy::disabled()` 没有任何占位公钥；未知 key、清单字段篡改、HTTP、未知域名、同版本/降级、artifact hash 或 size 不匹配均拒绝。测试密钥只存在于 `#[cfg(test)]`，是固定 fixture，不属于生产 binary。
+production `ReleasePolicy::disabled()` 没有任何占位公钥；未知 key、清单字段篡改、HTTP、未知域名、同版本/降级、artifact hash 或 size 不匹配均拒绝。测试密钥只存在于 `#[cfg(test)]`，是固定 fixture，不属于生产 binary。当前 promotion checker 不接受“全 true”手写 JSON：未来 attestation contract 只允许 `missing`，拒绝未知字段，而且无论 commit/hash 是否绑定都始终返回上述三个缺失外部证明。
 
 ## 安装、升级和卸载 contract
 
 | 场景 | 顺序 | 数据结果 |
 | --- | --- | --- |
-| Fresh install | 验证 helper plan → 断言不含 system proxy/TUN executor → snapshot → 逐项迁移 → schema/orphan 验证 | 初始化 EntryConfig、OutletConfig、Secret Store、SQLite、Helper、TUN journal contract |
+| Fresh install | 断言不含 system proxy/TUN executor → snapshot → helper plan → 逐项迁移 → schema/orphan 验证 | snapshot 必须早于任何 Helper/owned mutation；初始化 EntryConfig、OutletConfig、Secret Store、SQLite、Helper、TUN journal contract |
 | Upgrade | `EnterFailClosed → StopOwnedJob → RestoreTunSnapshot` → snapshot → helper replacement plan → 逐项迁移 → verify | 失败只回滚本次已完成、由 VPN Hub 拥有的变更；保持 fail-closed/stopped，不恢复为不安全运行态 |
 | Uninstall preserve | 同一安全前缀 → snapshot/preserve user data → helper cleanup → no-orphan verify | 保留 EntryConfig、OutletConfig、Secret Store 与 SQLite；移除 owned Helper/TUN journal |
 | Uninstall delete | 同一安全前缀 → 删除 VPN Hub owned data → helper cleanup → no-orphan verify | 删除应用拥有的数据，不扫描或删除第三方进程/客户端/配置 |
 
-这些只由 planner、fake backend 和 temp directory 验收；当前 PR 不执行真实安装、升级、卸载或系统操作。
+`ReleaseMigrationPlan` 字段私有且不可反序列化；执行前会从 action/disposition/install-id/helper hash 重建 canonical plan，并对 schema、dry-run、system proxy=false、TUN supported=false、安全前缀和完整操作顺序做 exact compare。失败回滚参数严格按已完成 owned mutation 的逆完成顺序传递，安全前缀不回滚。真实 executor 仍不存在；这些只由 planner、fake backend 和 temp directory 验收，当前 PR 不执行真实安装、升级、卸载或系统操作。
 
 ## 发布清单
 
-正式候选必须全部满足，否则 promotion script 返回失败：
+以下是未来发布流程的输入清单；当前 foundation 即使全部被手写标记为满足，promotion script 也仍然失败，直到存在可验证的机器证明实现：
 
 - [ ] commit、Cargo/Tauri/frontend version 一致，依赖与 tools 使用锁定版本。
 - [ ] 两次构建的 normalized materials 相同，NSIS hash 差异已审阅。

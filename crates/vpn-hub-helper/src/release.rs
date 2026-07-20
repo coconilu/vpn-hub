@@ -62,6 +62,7 @@ pub struct ReleaseManifest {
     pub source_url: String,
     pub signing_key_id: String,
     pub artifact: ReleaseArtifact,
+    pub build_environment_sha256: String,
     pub rust_sbom_sha256: String,
     pub frontend_sbom_sha256: String,
     pub licenses_sha256: String,
@@ -187,6 +188,7 @@ fn validate_manifest(manifest: &ReleaseManifest) -> Result<(), ReleaseError> {
         || manifest.artifact.size == 0
         || !valid_file_name(&manifest.artifact.file_name)
         || !valid_hash(&manifest.artifact.sha256)
+        || !valid_hash(&manifest.build_environment_sha256)
         || !valid_hash(&manifest.rust_sbom_sha256)
         || !valid_hash(&manifest.frontend_sbom_sha256)
         || !valid_hash(&manifest.licenses_sha256)
@@ -326,15 +328,17 @@ impl ReleaseOperation {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ReleaseMigrationPlan {
-    pub schema_version: u16,
-    pub action: ReleaseLifecycleAction,
-    pub disposition: DataDisposition,
-    pub dry_run: bool,
-    pub system_proxy_included: bool,
-    pub tun_executor_supported: bool,
-    pub operations: Vec<ReleaseOperation>,
+    schema_version: u16,
+    action: ReleaseLifecycleAction,
+    disposition: DataDisposition,
+    dry_run: bool,
+    system_proxy_included: bool,
+    tun_executor_supported: bool,
+    install_id: String,
+    helper_sha256: String,
+    operations: Vec<ReleaseOperation>,
 }
 
 impl ReleaseMigrationPlan {
@@ -357,14 +361,14 @@ impl ReleaseMigrationPlan {
 
         match action {
             ReleaseLifecycleAction::FreshInstall => {
+                operations.push(ReleaseOperation::AssertSystemProxyExcluded);
+                operations.push(ReleaseOperation::AssertTunExecutorDisabled);
+                operations.push(ReleaseOperation::SnapshotOwnedData);
                 operations.extend(
                     helper_operations
                         .into_iter()
                         .map(|helper_step| ReleaseOperation::HelperOperation { helper_step }),
                 );
-                operations.push(ReleaseOperation::AssertSystemProxyExcluded);
-                operations.push(ReleaseOperation::AssertTunExecutorDisabled);
-                operations.push(ReleaseOperation::SnapshotOwnedData);
                 operations.extend(
                     migration_components()
                         .into_iter()
@@ -437,8 +441,30 @@ impl ReleaseMigrationPlan {
             dry_run: true,
             system_proxy_included: false,
             tun_executor_supported: false,
+            install_id: install_id.to_owned(),
+            helper_sha256: helper_sha256.to_owned(),
             operations,
         })
+    }
+
+    /// Rebuilds the canonical plan from its immutable inputs and requires an
+    /// exact match before any backend operation can run.
+    pub fn validate(&self) -> Result<(), ReleaseError> {
+        let canonical = Self::build(
+            self.action,
+            self.disposition,
+            &self.install_id,
+            &self.helper_sha256,
+        )?;
+        if self != &canonical {
+            return Err(ReleaseError::UnsafeMigrationPlan);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn operations(&self) -> &[ReleaseOperation] {
+        &self.operations
     }
 }
 
@@ -487,18 +513,25 @@ pub trait ReleaseMigrationBackend {
     type Error;
 
     fn execute(&mut self, operation: &ReleaseOperation) -> Result<(), Self::Error>;
-    fn rollback_owned(&mut self, completed: &[ReleaseOperation]) -> Result<(), Self::Error>;
+    /// Receives completed owned mutations in strict reverse completion order.
+    fn rollback_owned(
+        &mut self,
+        reverse_completion_order: &[ReleaseOperation],
+    ) -> Result<(), Self::Error>;
 }
 
 pub fn execute_release_migration<B: ReleaseMigrationBackend>(
     plan: &ReleaseMigrationPlan,
     backend: &mut B,
 ) -> Result<(), MigrationExecutionError<B::Error>> {
+    plan.validate()
+        .map_err(MigrationExecutionError::InvalidPlan)?;
     let mut completed = Vec::new();
     for operation in &plan.operations {
         if let Err(error) = backend.execute(operation) {
             let rollback_scope = completed
                 .iter()
+                .rev()
                 .filter(|item: &&ReleaseOperation| item.mutates_owned_state())
                 .cloned()
                 .collect::<Vec<_>>();
@@ -520,6 +553,7 @@ pub enum EvidenceStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PromotionEvidence {
     pub manifest_channel: ReleaseChannel,
     pub authenticode_chain: EvidenceStatus,
@@ -538,28 +572,16 @@ pub struct PromotionEvidence {
 
 impl PromotionEvidence {
     pub fn validate(&self) -> Result<(), ReleaseError> {
-        if self.manifest_channel != ReleaseChannel::Stable
-            || self.authenticode_chain != EvidenceStatus::Verified
-            || self.authenticode_timestamp != EvidenceStatus::Verified
-            || self.update_signature != EvidenceStatus::Verified
-            || self.trusted_https_source != EvidenceStatus::Verified
-            || self.artifact_hash != EvidenceStatus::Verified
-            || self.rust_sbom != EvidenceStatus::Verified
-            || self.frontend_sbom != EvidenceStatus::Verified
-            || self.licenses != EvidenceStatus::Verified
-            || self.reproducible_materials != EvidenceStatus::Verified
-            || self.clean_windows_vm_acceptance != EvidenceStatus::Verified
-            || self.system_proxy_included
-            || self.tun_executor_supported
-        {
-            return Err(ReleaseError::PromotionBlocked);
-        }
-        Ok(())
+        // This foundation has no machine-produced Authenticode, update
+        // signature, or clean-VM attestation verifier. Typed claims remain
+        // descriptive only and can never make a candidate eligible.
+        Err(ReleaseError::PromotionBlocked)
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum MigrationExecutionError<E> {
+    InvalidPlan(ReleaseError),
     Operation(E),
     Rollback(E),
 }
@@ -624,6 +646,7 @@ mod manifest_tests {
                 sha256: format!("{:x}", Sha256::digest(ARTIFACT)),
                 size: ARTIFACT.len() as u64,
             },
+            build_environment_sha256: "0".repeat(64),
             rust_sbom_sha256: "1".repeat(64),
             frontend_sbom_sha256: "2".repeat(64),
             licenses_sha256: "3".repeat(64),
@@ -787,12 +810,24 @@ mod migration_tests {
             .unwrap();
             assert!(!plan.system_proxy_included);
             assert!(!plan.tun_executor_supported);
+            assert_eq!(plan.validate(), Ok(()));
             for component in migration_components() {
                 assert!(
                     plan.operations
                         .contains(&ReleaseOperation::Migrate { component })
                 );
             }
+            let snapshot = plan
+                .operations
+                .iter()
+                .position(|operation| operation == &ReleaseOperation::SnapshotOwnedData)
+                .unwrap();
+            let first_helper_mutation = plan
+                .operations
+                .iter()
+                .position(ReleaseOperation::mutates_owned_state)
+                .unwrap();
+            assert!(snapshot < first_helper_mutation);
             if action == ReleaseLifecycleAction::Upgrade {
                 assert!(matches!(
                     plan.operations.as_slice(),
@@ -809,11 +844,6 @@ mod migration_tests {
                         ..
                     ]
                 ));
-                let snapshot = plan
-                    .operations
-                    .iter()
-                    .position(|operation| operation == &ReleaseOperation::SnapshotOwnedData)
-                    .unwrap();
                 let replacement = plan
                     .operations
                     .iter()
@@ -857,6 +887,14 @@ mod migration_tests {
                 .iter()
                 .all(ReleaseOperation::mutates_owned_state)
         );
+        let expected_reverse = backend
+            .completed
+            .iter()
+            .rev()
+            .filter(|operation| operation.mutates_owned_state())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(backend.rolled_back, expected_reverse);
         assert!(!backend.rolled_back.contains(&ReleaseOperation::Migrate {
             component: MigrationComponent::Sqlite
         }));
@@ -867,6 +905,96 @@ mod migration_tests {
                     helper_step: PlanOperation::EnterFailClosed
                 })
         );
+    }
+
+    #[test]
+    fn tampered_or_forward_order_plan_is_rejected_before_backend_execution() {
+        let canonical = ReleaseMigrationPlan::build(
+            ReleaseLifecycleAction::Upgrade,
+            DataDisposition::Preserve,
+            "install-a",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let mut cases = Vec::new();
+        let mut schema = canonical.clone();
+        schema.schema_version = 2;
+        cases.push(schema);
+        let mut proxy = canonical.clone();
+        proxy.system_proxy_included = true;
+        cases.push(proxy);
+        let mut tun = canonical.clone();
+        tun.tun_executor_supported = true;
+        cases.push(tun);
+        let mut forward = canonical;
+        forward.operations.swap(0, 1);
+        cases.push(forward);
+
+        for plan in cases {
+            let mut backend = FakeMigrationBackend::default();
+            assert_eq!(
+                execute_release_migration(&plan, &mut backend),
+                Err(MigrationExecutionError::InvalidPlan(
+                    ReleaseError::UnsafeMigrationPlan
+                ))
+            );
+            assert!(backend.completed.is_empty());
+            assert!(backend.rolled_back.is_empty());
+        }
+    }
+
+    #[test]
+    fn canonical_upgrade_recovery_keeps_safety_prefix_and_rolls_back_mutations_in_reverse() {
+        let plan = ReleaseMigrationPlan::build(
+            ReleaseLifecycleAction::Upgrade,
+            DataDisposition::Preserve,
+            "install-a",
+            &"a".repeat(64),
+        )
+        .unwrap();
+        let mut backend = FakeMigrationBackend {
+            fail_on: Some(MigrationComponent::Helper),
+            ..FakeMigrationBackend::default()
+        };
+        assert!(matches!(
+            execute_release_migration(&plan, &mut backend),
+            Err(MigrationExecutionError::Operation(
+                MigrationComponent::Helper
+            ))
+        ));
+        assert!(matches!(
+            backend.completed.as_slice(),
+            [
+                ReleaseOperation::HelperOperation {
+                    helper_step: PlanOperation::EnterFailClosed
+                },
+                ReleaseOperation::HelperOperation {
+                    helper_step: PlanOperation::StopOwnedJob
+                },
+                ReleaseOperation::HelperOperation {
+                    helper_step: PlanOperation::RestoreTunSnapshot
+                },
+                ..
+            ]
+        ));
+        assert_eq!(
+            backend.rolled_back,
+            backend
+                .completed
+                .iter()
+                .rev()
+                .filter(|item| item.mutates_owned_state())
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+        assert!(!backend.rolled_back.iter().any(|operation| matches!(
+            operation,
+            ReleaseOperation::HelperOperation {
+                helper_step: PlanOperation::EnterFailClosed
+                    | PlanOperation::StopOwnedJob
+                    | PlanOperation::RestoreTunSnapshot
+            }
+        )));
     }
 
     #[test]
@@ -932,7 +1060,7 @@ mod migration_tests {
             system_proxy_included: false,
             tun_executor_supported: false,
         };
-        assert_eq!(complete.validate(), Ok(()));
+        assert_eq!(complete.validate(), Err(ReleaseError::PromotionBlocked));
 
         let mut missing = complete.clone();
         missing.clean_windows_vm_acceptance = EvidenceStatus::Missing;
@@ -940,5 +1068,13 @@ mod migration_tests {
         let mut dev = complete;
         dev.manifest_channel = ReleaseChannel::Dev;
         assert_eq!(dev.validate(), Err(ReleaseError::PromotionBlocked));
+
+        let serialized = serde_json::to_value(&missing).unwrap();
+        let mut with_unknown = serialized.as_object().unwrap().clone();
+        with_unknown.insert("unknown".into(), serde_json::Value::Bool(true));
+        assert!(
+            serde_json::from_value::<PromotionEvidence>(serde_json::Value::Object(with_unknown))
+                .is_err()
+        );
     }
 }
