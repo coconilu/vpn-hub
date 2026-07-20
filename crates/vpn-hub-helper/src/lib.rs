@@ -12,6 +12,7 @@ mod installation;
 mod manifest;
 mod ownership;
 mod protocol;
+mod release;
 mod runtime;
 mod service_shell;
 mod status;
@@ -38,6 +39,13 @@ pub use protocol::{
     AuthError, AuthenticatedRequest, Command, ExpectedOwnership, NamedPipeContract, ProtocolKey,
     ReplayCache, SignedRequest, SignedResponse, UnsignedRequest, UnsignedResponse,
     authenticate_challenged_frame, authenticate_response_frame, pipe_name,
+};
+pub use release::{
+    ArtifactKind, DataDisposition, EvidenceStatus, MigrationComponent, MigrationExecutionError,
+    PromotionEvidence, ReleaseArtifact, ReleaseChannel, ReleaseError, ReleaseLifecycleAction,
+    ReleaseManifest, ReleaseMigrationBackend, ReleaseMigrationPlan, ReleaseOperation,
+    ReleasePolicy, ReleaseToolchain, SignedReleaseManifest, VerifiedRelease,
+    execute_release_migration,
 };
 pub use runtime::{CoreBackend, HelperRuntime, ManifestProvider, RuntimeError, RuntimeReply};
 #[cfg(target_os = "windows")]

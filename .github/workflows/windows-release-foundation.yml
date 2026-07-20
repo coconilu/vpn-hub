@@ -1,0 +1,137 @@
+name: Windows release foundation
+
+on:
+  pull_request:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      request-promotion:
+        description: Require every production promotion evidence gate
+        required: true
+        type: boolean
+        default: false
+      promotion-evidence-path:
+        description: Repository-relative reviewed evidence JSON (never a secret)
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_NODE: 24.15.0
+  EXPECTED_NPM: 11.12.1
+  EXPECTED_RUST: 1.97.0
+
+jobs:
+  release-foundation:
+    name: Reproducible unsigned dev package
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout immutable source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install exact Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install exact Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.0
+          components: clippy,rustfmt
+
+      - name: Verify tool versions
+        shell: pwsh
+        run: |
+          if ((node --version) -ne "v$env:EXPECTED_NODE") { throw "unexpected Node.js version" }
+          if ((npm --version) -ne $env:EXPECTED_NPM) { throw "unexpected npm version" }
+          if (-not ((rustc --version).StartsWith("rustc $env:EXPECTED_RUST "))) { throw "unexpected Rust version" }
+
+      - name: Install locked frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci --ignore-scripts
+
+      - name: Validate release scripts
+        working-directory: apps/desktop
+        run: npm run test:release
+
+      - name: Validate workspace
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          cargo build --workspace --locked
+          npm test --prefix apps/desktop
+          npm run build --prefix apps/desktop
+
+      - name: Build unsigned NSIS dev package (pass 1)
+        working-directory: apps/desktop
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Locate the single NSIS output
+        id: nsis
+        shell: pwsh
+        run: |
+          $artifacts = @(Get-ChildItem -Path "target/release/bundle/nsis/*-setup.exe" -File)
+          if ($artifacts.Count -ne 1) { throw "expected exactly one NSIS setup executable" }
+          "artifact=$($artifacts[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Generate normalized materials (pass 1)
+        shell: pwsh
+        env:
+          NSIS_ARTIFACT: ${{ steps.nsis.outputs.artifact }}
+        run: |
+          node scripts/release/generate-materials.mjs --root . --artifact $env:NSIS_ARTIFACT --output release-out/build-1
+          node scripts/release/validate-materials.mjs release-out/build-1
+
+      - name: Build unsigned NSIS dev package (pass 2)
+        working-directory: apps/desktop
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Generate normalized materials (pass 2)
+        shell: pwsh
+        env:
+          NSIS_ARTIFACT: ${{ steps.nsis.outputs.artifact }}
+        run: |
+          node scripts/release/generate-materials.mjs --root . --artifact $env:NSIS_ARTIFACT --output release-out/build-2
+          node scripts/release/validate-materials.mjs release-out/build-2
+
+      - name: Compare consecutive builds
+        run: node scripts/release/compare-builds.mjs release-out/build-1 release-out/build-2 release-out/reproducibility-diff.json
+
+      - name: Scan tracked release inputs for sensitive material
+        run: node scripts/release/sensitive-scan.mjs . release-out
+
+      - name: Fail closed when formal promotion is requested
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.request-promotion == true
+        shell: pwsh
+        env:
+          PROMOTION_EVIDENCE_PATH: ${{ inputs.promotion-evidence-path }}
+        run: |
+          $path = $env:PROMOTION_EVIDENCE_PATH
+          if ([string]::IsNullOrWhiteSpace($path)) { throw "promotion blocked: reviewed evidence path is required" }
+          node scripts/release/check-promotion.mjs $path
+
+      - name: Retain dev evidence only for non-promotion manual runs
+        if: github.event_name == 'workflow_dispatch' && inputs.request-promotion != true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vpn-hub-unsigned-dev-${{ github.sha }}
+          path: release-out/
+          if-no-files-found: error
+          retention-days: 7

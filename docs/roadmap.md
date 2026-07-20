@@ -33,6 +33,7 @@
 | Windows Helper | 代码完成/待签名安装验收 | LocalService、认证 named pipe、owned child/job 与动态配置监督已实现；当前开发机未安装或运行 Service |
 | TUN 计划与恢复 | 计划层完成/真实 backend 阻断 | typed plan、generation/fencing、snapshot → stage → apply → verify → commit journal、失败/崩溃/卸载幂等恢复由 fake backend 验收 |
 | Windows 应用身份排除 | `unsupported` | 官方 Mihomo Windows TUN 字段不能证明按进程排除；在 WFP/ALE adapter 独立安全评审前保持默认关闭和 Fail Closed |
+| Windows release foundation | 安全前置完成/正式发布阻断 | exact toolchains、unsigned dev NSIS、SHA-256、CycloneDX、licenses、typed updater/promotion/migration contract 已自动化；证书、HTTPS 托管、生产更新公钥、#14 executor 与 clean VM 验收未具备，Issue #15 保持 open |
 | 桌面入口 | 已接入安全预览 | 设置页显示默认关闭、风险确认禁用原因、动态 outlet 计划 generation 与缺失身份；不会误记为已启用 |
 | 真实系统验收 | 待隔离 Windows 环境 | 必须验证 IPv4/IPv6、TCP/UDP/DNS、睡眠/崩溃/断电/卸载恢复，不得在日常开发机执行 |
 
