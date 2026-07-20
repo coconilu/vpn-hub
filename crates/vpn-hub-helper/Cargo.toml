@@ -23,6 +23,7 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "process"] }
 zeroize.workspace = true
+vpn-hub-core = { path = "../vpn-hub-core" }
 
 [target.'cfg(windows)'.dependencies]
 process-wrap = { workspace = true, features = ["job-object", "kill-on-drop"] }
