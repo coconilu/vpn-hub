@@ -158,6 +158,29 @@ export interface RoutingOutlet {
   configured: boolean;
 }
 
+export type SubscriptionNodeGroupState = "available" | "core_unavailable" | "provider_unavailable";
+
+export interface SubscriptionNode {
+  name: string;
+  proxy_type: string;
+  alive: boolean | null;
+  latency_ms: number | null;
+}
+
+export interface SubscriptionNodeGroup {
+  subscription_id: string;
+  label: string;
+  state: SubscriptionNodeGroupState;
+  current_node: string | null;
+  nodes: SubscriptionNode[];
+}
+
+export interface SubscriptionNodeCatalog {
+  controller_ready: boolean;
+  subscriptions: SubscriptionNodeGroup[];
+  message: string;
+}
+
 export interface DashboardSnapshot {
   updated_at: string;
   entry: PortSnapshot;

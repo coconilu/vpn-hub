@@ -20,7 +20,7 @@ mod store;
 mod udp_capability;
 
 pub use config::{ConfigError, GuardianConfig, MonitorConfig, ProbeOutletConfig};
-pub use controller::{ControllerClient, ControllerError};
+pub use controller::{ControllerClient, ControllerError, SelectorNodeSnapshot, SubscriptionNode};
 pub use durable::{
     DurableFileOps, SystemDurableFileOps, durable_atomic_save_with_backup,
     durable_remove_if_exists, durable_replace, durable_write_new,

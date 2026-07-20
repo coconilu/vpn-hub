@@ -1,6 +1,6 @@
-import { History, LayoutDashboard, Settings, ShieldCheck } from "lucide-react";
+import { History, LayoutDashboard, Network, Settings, ShieldCheck } from "lucide-react";
 
-export type ViewId = "overview" | "history" | "settings";
+export type ViewId = "overview" | "nodes" | "history" | "settings";
 
 interface SidebarProps {
   active: ViewId;
@@ -9,6 +9,7 @@ interface SidebarProps {
 
 const items = [
   { id: "overview" as const, label: "总览", icon: LayoutDashboard },
+  { id: "nodes" as const, label: "节点选择", icon: Network },
   { id: "history" as const, label: "历史", icon: History },
   { id: "settings" as const, label: "设置", icon: Settings },
 ];

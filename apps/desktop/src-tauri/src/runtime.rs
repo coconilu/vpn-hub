@@ -18,11 +18,12 @@ use vpn_hub_helper::{
 
 use serde::{Deserialize, Serialize};
 use vpn_hub_core::{
-    ControllerClient, CredentialState, DurableFileOps, EntryConfig, FAIL_CLOSED_PROXY,
-    GuardianConfig, GuardianStore, HistoryOutletKind, HistoryOutletSnapshot, MASTER_SELECTOR,
-    OutletConfig, OutletConfigSummary, OutletKind, PrivateRoutingConfig, ResolvedSubscriptionUrls,
-    RouteDecision, RouteMode, RoutingEngine, RoutingSession, RoutingStateError, SafeSettingsView,
-    SecretStore, SettingsDiff, SettingsDraft, SettingsOutletDraft, SubscriptionCredentialStatus,
+    ControllerClient, ControllerError, CredentialState, DurableFileOps, EntryConfig,
+    FAIL_CLOSED_PROXY, GuardianConfig, GuardianStore, HistoryOutletKind, HistoryOutletSnapshot,
+    MASTER_SELECTOR, OutletConfig, OutletConfigSummary, OutletKind, PrivateRoutingConfig,
+    ResolvedSubscriptionUrls, RouteDecision, RouteMode, RoutingEngine, RoutingSession,
+    RoutingStateError, SafeSettingsView, SecretStore, SelectorNodeSnapshot, SettingsDiff,
+    SettingsDraft, SettingsOutletDraft, SubscriptionCredentialStatus, SubscriptionNode,
     SubscriptionSecrets, SystemDurableFileOps, SystemSecretStore, UDP_SELECTOR,
     UdpCapabilityEvidence, UdpCapabilityMap, UdpProbeTarget, ValidationIssue,
     classify_subscription_udp, durable_atomic_save_with_backup, durable_remove_if_exists,
@@ -66,6 +67,30 @@ pub struct RoutingStatus {
     pub manual_outlet: Option<String>,
     pub controller_ready: bool,
     pub outlets: Vec<OutletConfigSummary>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionNodeGroupState {
+    Available,
+    CoreUnavailable,
+    ProviderUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubscriptionNodeGroup {
+    pub subscription_id: String,
+    pub label: String,
+    pub state: SubscriptionNodeGroupState,
+    pub current_node: Option<String>,
+    pub nodes: Vec<SubscriptionNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubscriptionNodeCatalog {
+    pub controller_ready: bool,
+    pub subscriptions: Vec<SubscriptionNodeGroup>,
     pub message: String,
 }
 
@@ -1657,6 +1682,123 @@ impl AppState {
         })
     }
 
+    pub async fn subscription_node_catalog(&self) -> Result<SubscriptionNodeCatalog, String> {
+        let config = self.private_config()?;
+        let credential_states = self
+            .subscription_credential_statuses()?
+            .into_iter()
+            .map(|status| (status.subscription_id, status.state))
+            .collect::<HashMap<_, _>>();
+        let controller = self.controller_client()?;
+        let controller_ready = controller.is_some();
+        let mut subscriptions = Vec::new();
+
+        for outlet in config.enabled_outlets() {
+            if !matches!(outlet.kind, OutletKind::Subscription { .. })
+                || credential_states.get(&outlet.id) != Some(&CredentialState::Configured)
+            {
+                continue;
+            }
+            let group = match controller.as_ref() {
+                Some(controller) => {
+                    match controller
+                        .selector_nodes(&outlet_proxy_name(&outlet.id))
+                        .await
+                    {
+                        Ok(snapshot) if !snapshot.nodes.is_empty() => subscription_node_group(
+                            outlet,
+                            SubscriptionNodeGroupState::Available,
+                            snapshot,
+                        ),
+                        Ok(snapshot) => subscription_node_group(
+                            outlet,
+                            SubscriptionNodeGroupState::ProviderUnavailable,
+                            snapshot,
+                        ),
+                        Err(_) => subscription_node_group(
+                            outlet,
+                            SubscriptionNodeGroupState::ProviderUnavailable,
+                            SelectorNodeSnapshot {
+                                current_node: None,
+                                nodes: Vec::new(),
+                            },
+                        ),
+                    }
+                }
+                None => subscription_node_group(
+                    outlet,
+                    SubscriptionNodeGroupState::CoreUnavailable,
+                    SelectorNodeSnapshot {
+                        current_node: None,
+                        nodes: Vec::new(),
+                    },
+                ),
+            };
+            subscriptions.push(group);
+        }
+
+        let message = if subscriptions.is_empty() {
+            "没有已启用且凭据可用的订阅出口；请先在设置中完成订阅配置".into()
+        } else if !controller_ready {
+            "节点列表仅来自本应用自管 Mihomo；请先启动开发核心".into()
+        } else if subscriptions
+            .iter()
+            .any(|group| group.state == SubscriptionNodeGroupState::ProviderUnavailable)
+        {
+            "部分订阅 provider 尚未就绪；原节点选择保持不变".into()
+        } else {
+            "节点列表来自本机 Mihomo Controller，不会写入配置、历史或日志".into()
+        };
+
+        Ok(SubscriptionNodeCatalog {
+            controller_ready,
+            subscriptions,
+            message,
+        })
+    }
+
+    pub async fn select_subscription_node(
+        &self,
+        subscription_id: &str,
+        node_name: &str,
+    ) -> Result<SubscriptionNodeGroup, String> {
+        let config = self.private_config()?;
+        let outlet = config
+            .enabled_outlets()
+            .find(|outlet| {
+                outlet.id == subscription_id
+                    && matches!(outlet.kind, OutletKind::Subscription { .. })
+            })
+            .ok_or_else(|| "订阅出口不存在或未启用".to_string())?;
+        let configured = self
+            .subscription_credential_statuses()?
+            .into_iter()
+            .any(|status| {
+                status.subscription_id == subscription_id
+                    && status.state == CredentialState::Configured
+            });
+        if !configured {
+            return Err("订阅凭据不可用；原节点选择保持不变".into());
+        }
+        let controller = self
+            .controller_client()?
+            .ok_or_else(|| "请先启动本应用自管 Mihomo 核心；原节点选择保持不变".to_string())?;
+        let snapshot = controller
+            .select_selector_node(&outlet_proxy_name(subscription_id), node_name)
+            .await
+            .map_err(|error| match error {
+                ControllerError::TargetUnavailable => {
+                    "节点列表已变化，请刷新后重试；原节点选择保持不变".to_string()
+                }
+                _ => "无法切换订阅节点；原节点选择保持不变".to_string(),
+            })?;
+        Ok(subscription_node_group(
+            outlet,
+            SubscriptionNodeGroupState::Available,
+            snapshot,
+        ))
+    }
+
     fn udp_capability_map(
         &self,
         private_config: &PrivateRoutingConfig,
@@ -2551,6 +2693,20 @@ impl AppState {
             return Err(format!("Helper Fail Closed：{reason}"));
         }
         Ok(reply)
+    }
+}
+
+fn subscription_node_group(
+    outlet: &OutletConfig,
+    state: SubscriptionNodeGroupState,
+    snapshot: SelectorNodeSnapshot,
+) -> SubscriptionNodeGroup {
+    SubscriptionNodeGroup {
+        subscription_id: outlet.id.clone(),
+        label: outlet.label.clone(),
+        state,
+        current_node: snapshot.current_node,
+        nodes: snapshot.nodes,
     }
 }
 

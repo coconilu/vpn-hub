@@ -23,7 +23,8 @@ use crate::{
     lifecycle::{self, LifecycleEvent},
     runtime::{
         AppState, CoreStatus, PortSnapshot, RoutingStatus, SettingsApplyRequest,
-        SettingsApplyResult, SettingsPreview, SettingsPreviewRequest,
+        SettingsApplyResult, SettingsPreview, SettingsPreviewRequest, SubscriptionNodeCatalog,
+        SubscriptionNodeGroup,
     },
 };
 
@@ -198,6 +199,28 @@ pub async fn get_settings(
 ) -> Result<vpn_hub_core::SafeSettingsView, String> {
     let _transaction = state.lock_routing_transaction().await;
     state.settings_view()
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn get_subscription_node_catalog(
+    state: State<'_, AppState>,
+) -> Result<SubscriptionNodeCatalog, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    state.subscription_node_catalog().await
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn select_subscription_node(
+    state: State<'_, AppState>,
+    subscription_id: String,
+    node_name: String,
+) -> Result<SubscriptionNodeGroup, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    state
+        .select_subscription_node(&subscription_id, &node_name)
+        .await
 }
 
 #[tauri::command]
