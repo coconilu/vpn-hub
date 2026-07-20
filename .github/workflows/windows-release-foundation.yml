@@ -1,0 +1,190 @@
+name: Windows release foundation
+
+on:
+  pull_request:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      request-promotion:
+        description: Exercise the fail-closed formal-promotion boundary (always blocked)
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  EXPECTED_NODE: 24.15.0
+  EXPECTED_NPM: 11.12.1
+  EXPECTED_RUST: 1.97.0
+  EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  release-foundation:
+    name: Reproducible unsigned dev package
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout immutable source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.EXPECTED_SHA }}
+          persist-credentials: false
+
+      - name: Assert exact reviewed source
+        shell: pwsh
+        run: |
+          $actual = git rev-parse HEAD
+          if ($actual -ne $env:EXPECTED_SHA) { throw "review source mismatch: expected $env:EXPECTED_SHA, got $actual" }
+
+      - name: Install exact Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install exact Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.0
+          components: clippy,rustfmt
+
+      - name: Verify tool versions
+        shell: pwsh
+        run: |
+          if ((node --version) -ne "v$env:EXPECTED_NODE") { throw "unexpected Node.js version" }
+          if ((npm --version) -ne $env:EXPECTED_NPM) { throw "unexpected npm version" }
+          if (-not ((rustc --version).StartsWith("rustc $env:EXPECTED_RUST "))) { throw "unexpected Rust version" }
+
+      - name: Install locked frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci --ignore-scripts
+
+      - name: Validate release scripts
+        working-directory: apps/desktop
+        run: npm run test:release
+
+      - name: Validate workspace
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+          cargo build --workspace --locked
+          npm test --prefix apps/desktop
+          npm run build --prefix apps/desktop
+
+      - name: Checkout isolated build source 1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.EXPECTED_SHA }}
+          path: isolated/source-1
+          persist-credentials: false
+
+      - name: Checkout isolated build source 2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.EXPECTED_SHA }}
+          path: isolated/source-2
+          persist-credentials: false
+
+      - name: Assert isolated sources and fresh targets
+        shell: pwsh
+        env:
+          TARGET_ONE: ${{ runner.temp }}\vpn-hub-target-1
+          TARGET_TWO: ${{ runner.temp }}\vpn-hub-target-2
+        run: |
+          foreach ($source in @("isolated/source-1", "isolated/source-2")) {
+            $actual = git -C $source rev-parse HEAD
+            if ($actual -ne $env:EXPECTED_SHA) { throw "isolated source mismatch: expected $env:EXPECTED_SHA, got $actual" }
+            if (-not (Test-Path -LiteralPath (Join-Path $source ".git"))) { throw "isolated source lacks independent .git metadata" }
+          }
+          node scripts/release/assert-fresh-build-root.mjs $env:TARGET_ONE
+          node scripts/release/assert-fresh-build-root.mjs $env:TARGET_TWO
+
+      - name: Install isolated frontend dependencies 1
+        working-directory: isolated/source-1/apps/desktop
+        run: npm ci --ignore-scripts
+
+      - name: Build unsigned NSIS dev package in isolation 1
+        working-directory: isolated/source-1/apps/desktop
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\vpn-hub-target-1
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Locate only isolation 1 NSIS output
+        id: nsis1
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\vpn-hub-target-1
+        run: |
+          $artifacts = @(Get-ChildItem -LiteralPath (Join-Path $env:CARGO_TARGET_DIR "release\bundle\nsis") -Filter "*-setup.exe" -File)
+          if ($artifacts.Count -ne 1) { throw "isolation 1 expected exactly one newly built NSIS setup executable" }
+          "artifact=$($artifacts[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Generate normalized materials from isolation 1
+        shell: pwsh
+        env:
+          NSIS_ARTIFACT: ${{ steps.nsis1.outputs.artifact }}
+        run: |
+          ./scripts/release/capture-build-environment.ps1 -SourceRoot isolated/source-1 -OutputPath release-out/build-1/build-environment.json
+          node scripts/release/generate-materials.mjs --root isolated/source-1 --artifact $env:NSIS_ARTIFACT --output release-out/build-1 --expected-commit $env:EXPECTED_SHA --environment release-out/build-1/build-environment.json
+          node scripts/release/validate-materials.mjs release-out/build-1
+
+      - name: Install isolated frontend dependencies 2
+        working-directory: isolated/source-2/apps/desktop
+        run: npm ci --ignore-scripts
+
+      - name: Build unsigned NSIS dev package in isolation 2
+        working-directory: isolated/source-2/apps/desktop
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\vpn-hub-target-2
+        run: npm run tauri build -- --bundles nsis
+
+      - name: Locate only isolation 2 NSIS output
+        id: nsis2
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}\vpn-hub-target-2
+        run: |
+          $artifacts = @(Get-ChildItem -LiteralPath (Join-Path $env:CARGO_TARGET_DIR "release\bundle\nsis") -Filter "*-setup.exe" -File)
+          if ($artifacts.Count -ne 1) { throw "isolation 2 expected exactly one newly built NSIS setup executable" }
+          "artifact=$($artifacts[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Generate normalized materials from isolation 2
+        shell: pwsh
+        env:
+          NSIS_ARTIFACT: ${{ steps.nsis2.outputs.artifact }}
+        run: |
+          ./scripts/release/capture-build-environment.ps1 -SourceRoot isolated/source-2 -OutputPath release-out/build-2/build-environment.json
+          node scripts/release/generate-materials.mjs --root isolated/source-2 --artifact $env:NSIS_ARTIFACT --output release-out/build-2 --expected-commit $env:EXPECTED_SHA --environment release-out/build-2/build-environment.json
+          node scripts/release/validate-materials.mjs release-out/build-2
+
+      - name: Compare consecutive builds
+        run: node scripts/release/compare-builds.mjs release-out/build-1 release-out/build-2 release-out/reproducibility-diff.json
+
+      - name: Scan tracked release inputs for sensitive material
+        run: node scripts/release/sensitive-scan.mjs . release-out
+
+      - name: Fail closed when formal promotion is requested
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.request-promotion == true
+        shell: pwsh
+        run: |
+          node scripts/release/check-promotion.mjs
+
+      - name: Retain dev evidence only for non-promotion manual runs
+        if: github.event_name == 'workflow_dispatch' && inputs.request-promotion != true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vpn-hub-unsigned-dev-${{ env.EXPECTED_SHA }}
+          path: release-out/
+          if-no-files-found: error
+          retention-days: 7
