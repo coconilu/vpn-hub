@@ -113,29 +113,47 @@ export function HistoryPage({ onNotice }: HistoryPageProps) {
       <header className="history-header">
         <div><h1>历史</h1><p>只显示脱敏健康证据与 Controller 已确认的真实切换。</p></div>
         <div className="history-actions">
-          <label>保留 <input type="number" min="1" max="3650" value={retention} onChange={(event) => setRetention(Number(event.target.value))} /> 天</label>
+          <label className="retention-field">
+            <span>历史保留（天）</span>
+            <input type="number" min="1" max="3650" value={retention} onChange={(event) => setRetention(Number(event.target.value))} />
+          </label>
           <button type="button" className="secondary-button" disabled={loading} onClick={() => void saveRetention()}>保存</button>
           <button type="button" className="secondary-button" disabled={loading} onClick={() => void runExport()}><Download />导出 CSV</button>
           <button type="button" className="icon-button" aria-label="刷新历史" disabled={loading} onClick={() => void load()}><RefreshCw className={loading ? "spin" : ""} /></button>
         </div>
       </header>
 
-      <section className="history-filters" aria-label="历史筛选">
-        <select value={filter.window} onChange={(event) => update("window", event.target.value as HistoryWindow)}>
-          <option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option>
-        </select>
-        <select value={filter.outlet_id ?? ""} onChange={(event) => update("outlet_id", event.target.value || null)}>
-          <option value="">全部出口</option>{history?.outlets.map((outlet) => <option key={outlet.outlet_id} value={outlet.outlet_id}>{outlet.label}{outlet.deleted ? "（已删除）" : ""}</option>)}
-        </select>
-        <select value={filter.kind ?? ""} onChange={(event) => update("kind", (event.target.value || null) as HistoryOutletKind | null)}>
-          <option value="">全部类型</option><option value="subscription">订阅</option><option value="local_proxy">本地客户端</option><option value="unknown">旧版未知</option>
-        </select>
-        <select value={filter.status ?? ""} onChange={(event) => update("status", (event.target.value || null) as HealthStatus | null)}>
-          <option value="">全部状态</option><option value="healthy">健康</option><option value="degraded">降级</option><option value="down">故障</option><option value="unknown">未知</option>
-        </select>
-        <select value={filter.event_type ?? ""} onChange={(event) => update("event_type", (event.target.value || null) as HistoryEventType | null)}>
-          <option value="">全部事件</option><option value="probe">健康样本</option><option value="state">故障状态</option><option value="route_switch">真实切换</option>
-        </select>
+      <section className="panel-card history-filters" aria-label="历史筛选">
+        <label className="filter-field">
+          <span>时间窗口</span>
+          <select value={filter.window} onChange={(event) => update("window", event.target.value as HistoryWindow)}>
+            <option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option><option value="30d">最近 30 天</option>
+          </select>
+        </label>
+        <label className="filter-field">
+          <span>出口</span>
+          <select value={filter.outlet_id ?? ""} onChange={(event) => update("outlet_id", event.target.value || null)}>
+            <option value="">全部出口</option>{history?.outlets.map((outlet) => <option key={outlet.outlet_id} value={outlet.outlet_id}>{outlet.label}{outlet.deleted ? "（已删除）" : ""}</option>)}
+          </select>
+        </label>
+        <label className="filter-field">
+          <span>类型</span>
+          <select value={filter.kind ?? ""} onChange={(event) => update("kind", (event.target.value || null) as HistoryOutletKind | null)}>
+            <option value="">全部类型</option><option value="subscription">订阅</option><option value="local_proxy">本地客户端</option><option value="unknown">旧版未知</option>
+          </select>
+        </label>
+        <label className="filter-field">
+          <span>状态</span>
+          <select value={filter.status ?? ""} onChange={(event) => update("status", (event.target.value || null) as HealthStatus | null)}>
+            <option value="">全部状态</option><option value="healthy">健康</option><option value="degraded">降级</option><option value="down">故障</option><option value="unknown">未知</option>
+          </select>
+        </label>
+        <label className="filter-field">
+          <span>事件</span>
+          <select value={filter.event_type ?? ""} onChange={(event) => update("event_type", (event.target.value || null) as HistoryEventType | null)}>
+            <option value="">全部事件</option><option value="probe">健康样本</option><option value="state">故障状态</option><option value="route_switch">真实切换</option>
+          </select>
+        </label>
       </section>
 
       {error ? <div className="history-message error">历史加载失败：{error}</div> : null}
@@ -144,8 +162,8 @@ export function HistoryPage({ onNotice }: HistoryPageProps) {
         <>
           <section className="history-metrics">
             {history.metrics.map((metric) => (
-              <article key={metric.outlet_id}>
-                <div><strong>{metric.label}</strong>{metric.deleted ? <span>已删除</span> : null}</div>
+              <article className="metric-card" key={metric.outlet_id}>
+                <div className="metric-head"><strong>{metric.label}</strong>{metric.deleted ? <span className="deleted-tag">已删除</span> : null}</div>
                 <dl>
                   <div><dt>在线率</dt><dd>{showsProbeMetrics ? `${metric.availability_percent.toFixed(1)}%` : "—"}</dd></div>
                   <div><dt>P50 / P95</dt><dd>{showsProbeMetrics ? `${metric.p50_latency_ms ?? "—"} / ${metric.p95_latency_ms ?? "—"} ms` : "—"}</dd></div>
