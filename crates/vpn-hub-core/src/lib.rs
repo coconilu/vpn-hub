@@ -6,6 +6,7 @@
 
 mod config;
 mod controller;
+mod guardian_cycle;
 mod mihomo;
 mod model;
 mod probe;
@@ -15,6 +16,10 @@ mod store;
 
 pub use config::{ConfigError, GuardianConfig, MonitorConfig, ProbeOutletConfig};
 pub use controller::{ControllerClient, ControllerError};
+pub use guardian_cycle::{
+    GuardianCycleError, GuardianCycleOutcome, RoutingSession, RoutingStateError,
+    run_controller_guardian_cycle,
+};
 pub use mihomo::{
     CURRENT_CONFIG_VERSION, EntryConfig, FAIL_CLOSED_PROXY, MASTER_SELECTOR, OutletConfig,
     OutletConfigSummary, OutletKind, PrivateConfigError, PrivateConfigSummary,

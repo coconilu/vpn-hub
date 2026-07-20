@@ -43,6 +43,7 @@ flowchart LR
 | [Issue #3 双出口开发版](docs/issue-3-dual-outlet.md) | 私密订阅、真实 Controller 策略、多目标健康与 Fail Closed |
 | [Issue #7 动态入口与出口](docs/issue-7-dynamic-outlets.md) | 版本化配置、动态 Mihomo/Guardian/UI、兼容迁移与回滚 |
 | [Issue #6 Windows 受保护凭据](docs/issue-6-windows-secret-store.md) | 多订阅 Secret Store、旧明文迁移、状态与生命周期 |
+| [Issue #5 动态多出口隔离故障验收](docs/issue-5-dynamic-fault-acceptance.md) | 随机端口、多订阅/本地出口故障、恢复阈值与 all-down 证据 |
 | [兼容性实测](docs/compatibility/2026-07-18-chaoshihui.md) | 本地客户端 A 使用 `16666` 的首轮验证证据 |
 | [Mihomo 链路实测](docs/compatibility/2026-07-18-mihomo-chain.md) | `36666 → Mihomo → 16666` 的隔离验证证据 |
 | [Issue #3 Controller 实测](docs/compatibility/2026-07-18-issue-3-local-controller.md) | 初始 REJECT、真实选择器和 `36666 → 16666` HTTPS 证据 |

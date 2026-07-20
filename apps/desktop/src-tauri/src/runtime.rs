@@ -11,9 +11,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use vpn_hub_core::{
     ControllerClient, OutletConfigSummary, PrivateRoutingConfig, ResolvedSubscriptionUrls,
-    RouteDecision, RouteMode, RoutingEngine, SecretStore, SubscriptionCredentialStatus,
-    SubscriptionSecrets, SystemSecretStore, generate_controller_secret, generate_mihomo_config,
-    migrate_legacy_subscription,
+    RouteDecision, RouteMode, RoutingEngine, RoutingSession, RoutingStateError, SecretStore,
+    SubscriptionCredentialStatus, SubscriptionSecrets, SystemSecretStore,
+    generate_controller_secret, generate_mihomo_config, migrate_legacy_subscription,
 };
 
 const DEFAULT_GUARDIAN_CONFIG: &str = r#"database_path = "guardian-desktop.db"
@@ -83,6 +83,28 @@ struct ManagedCore {
     entry_port: u16,
     controller_port: u16,
     controller_secret: String,
+}
+
+impl RoutingSession for AppState {
+    fn evaluate_route(
+        &self,
+        now_ms: u64,
+        health: &std::collections::BTreeMap<String, vpn_hub_core::OutletHealth>,
+        policy: &vpn_hub_core::RoutingPolicy,
+    ) -> Result<Option<RouteDecision>, RoutingStateError> {
+        self.routing_engine
+            .lock()
+            .map_err(|_| RoutingStateError::Unavailable)
+            .map(|engine| engine.evaluate(now_ms, health, policy))
+    }
+
+    fn apply_route(&self, decision: &RouteDecision, now_ms: u64) -> Result<(), RoutingStateError> {
+        self.routing_engine
+            .lock()
+            .map_err(|_| RoutingStateError::Unavailable)?
+            .apply(decision, now_ms);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,26 +305,6 @@ impl AppState {
             .lock()
             .map_err(|_| "路由策略状态锁已损坏".to_string())?
             .set_mode(mode, manual_outlet);
-        Ok(())
-    }
-
-    pub fn evaluate_route(
-        &self,
-        now_ms: u64,
-        health: &std::collections::BTreeMap<String, vpn_hub_core::OutletHealth>,
-        policy: &vpn_hub_core::RoutingPolicy,
-    ) -> Result<Option<RouteDecision>, String> {
-        self.routing_engine
-            .lock()
-            .map_err(|_| "路由策略状态锁已损坏".to_string())
-            .map(|engine| engine.evaluate(now_ms, health, policy))
-    }
-
-    pub fn apply_route(&self, decision: &RouteDecision, now_ms: u64) -> Result<(), String> {
-        self.routing_engine
-            .lock()
-            .map_err(|_| "路由策略状态锁已损坏".to_string())?
-            .apply(decision, now_ms);
         Ok(())
     }
 
