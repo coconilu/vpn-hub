@@ -35,7 +35,7 @@ export function Sidebar({ active, onChange }: SidebarProps) {
       </nav>
       <div className="sidebar-safety">
         <ShieldCheck aria-hidden="true" />
-        <div><strong>安全开发模式</strong><span>6666 只读保护</span></div>
+        <div><strong>安全开发模式</strong><span>系统代理保持不变</span></div>
       </div>
     </aside>
   );

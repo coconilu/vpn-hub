@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::HealthStatus;
 
-pub const SUBSCRIPTION_OUTLET: &str = "subscription-a";
-pub const LOCAL_OUTLET: &str = "chaoshihui";
 pub const FAIL_CLOSED_OUTLET: &str = "fail-closed";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +197,9 @@ fn fastest_available(health: &BTreeMap<String, OutletHealth>) -> Option<String> 
 mod tests {
     use super::*;
 
+    const PRIMARY: &str = "outlet-primary";
+    const SECONDARY: &str = "outlet-secondary";
+
     fn health(items: &[(&str, HealthStatus, Option<u64>)]) -> BTreeMap<String, OutletHealth> {
         items
             .iter()
@@ -216,7 +217,7 @@ mod tests {
 
     fn policy() -> RoutingPolicy {
         RoutingPolicy {
-            priority: vec![SUBSCRIPTION_OUTLET.into(), LOCAL_OUTLET.into()],
+            priority: vec![PRIMARY.into(), SECONDARY.into()],
             cooldown_ms: 60_000,
             minimum_improvement_ms: 100,
         }
@@ -226,19 +227,19 @@ mod tests {
     fn priority_fails_over_immediately_and_recovers_after_cooldown() {
         let mut engine = RoutingEngine::new(RouteMode::Priority, None);
         let both = health(&[
-            (SUBSCRIPTION_OUTLET, HealthStatus::Healthy, Some(100)),
-            (LOCAL_OUTLET, HealthStatus::Healthy, Some(200)),
+            (PRIMARY, HealthStatus::Healthy, Some(100)),
+            (SECONDARY, HealthStatus::Healthy, Some(200)),
         ]);
         let first = engine.evaluate(0, &both, &policy()).expect("initial");
-        assert_eq!(first.to_outlet, SUBSCRIPTION_OUTLET);
+        assert_eq!(first.to_outlet, PRIMARY);
         engine.apply(&first, 0);
 
         let fallback = health(&[
-            (SUBSCRIPTION_OUTLET, HealthStatus::Down, None),
-            (LOCAL_OUTLET, HealthStatus::Healthy, Some(200)),
+            (PRIMARY, HealthStatus::Down, None),
+            (SECONDARY, HealthStatus::Healthy, Some(200)),
         ]);
         let failover = engine.evaluate(1, &fallback, &policy()).expect("failover");
-        assert_eq!(failover.to_outlet, LOCAL_OUTLET);
+        assert_eq!(failover.to_outlet, SECONDARY);
         engine.apply(&failover, 1);
 
         assert!(engine.evaluate(30_000, &both, &policy()).is_none());
@@ -247,7 +248,7 @@ mod tests {
                 .evaluate(60_001, &both, &policy())
                 .expect("recover")
                 .to_outlet,
-            SUBSCRIPTION_OUTLET
+            PRIMARY
         );
     }
 
@@ -255,29 +256,29 @@ mod tests {
     fn fastest_uses_hysteresis_and_cooldown() {
         let mut engine = RoutingEngine::new(RouteMode::Fastest, None);
         let initial = health(&[
-            (SUBSCRIPTION_OUTLET, HealthStatus::Healthy, Some(300)),
-            (LOCAL_OUTLET, HealthStatus::Healthy, Some(200)),
+            (PRIMARY, HealthStatus::Healthy, Some(300)),
+            (SECONDARY, HealthStatus::Healthy, Some(200)),
         ]);
         let first = engine.evaluate(0, &initial, &policy()).expect("initial");
         engine.apply(&first, 0);
-        assert_eq!(first.to_outlet, LOCAL_OUTLET);
+        assert_eq!(first.to_outlet, SECONDARY);
 
         let small_gain = health(&[
-            (SUBSCRIPTION_OUTLET, HealthStatus::Healthy, Some(150)),
-            (LOCAL_OUTLET, HealthStatus::Healthy, Some(200)),
+            (PRIMARY, HealthStatus::Healthy, Some(150)),
+            (SECONDARY, HealthStatus::Healthy, Some(200)),
         ]);
         assert!(engine.evaluate(70_000, &small_gain, &policy()).is_none());
 
         let large_gain = health(&[
-            (SUBSCRIPTION_OUTLET, HealthStatus::Healthy, Some(80)),
-            (LOCAL_OUTLET, HealthStatus::Healthy, Some(200)),
+            (PRIMARY, HealthStatus::Healthy, Some(80)),
+            (SECONDARY, HealthStatus::Healthy, Some(200)),
         ]);
         assert_eq!(
             engine
                 .evaluate(70_000, &large_gain, &policy())
                 .expect("switch")
                 .to_outlet,
-            SUBSCRIPTION_OUTLET
+            PRIMARY
         );
     }
 
@@ -285,16 +286,16 @@ mod tests {
     fn fastest_keeps_healthy_current_when_current_latency_is_missing() {
         let mut engine = RoutingEngine::new(RouteMode::Fastest, None);
         let initial = health(&[
-            (SUBSCRIPTION_OUTLET, HealthStatus::Healthy, Some(100)),
-            (LOCAL_OUTLET, HealthStatus::Healthy, Some(200)),
+            (PRIMARY, HealthStatus::Healthy, Some(100)),
+            (SECONDARY, HealthStatus::Healthy, Some(200)),
         ]);
         let first = engine.evaluate(0, &initial, &policy()).expect("initial");
         engine.apply(&first, 0);
-        assert_eq!(first.to_outlet, SUBSCRIPTION_OUTLET);
+        assert_eq!(first.to_outlet, PRIMARY);
 
         let missing_current_sample = health(&[
-            (SUBSCRIPTION_OUTLET, HealthStatus::Healthy, None),
-            (LOCAL_OUTLET, HealthStatus::Healthy, Some(50)),
+            (PRIMARY, HealthStatus::Healthy, None),
+            (SECONDARY, HealthStatus::Healthy, Some(50)),
         ]);
         assert!(
             engine
@@ -303,22 +304,22 @@ mod tests {
         );
 
         let current_is_down = health(&[
-            (SUBSCRIPTION_OUTLET, HealthStatus::Down, None),
-            (LOCAL_OUTLET, HealthStatus::Healthy, Some(50)),
+            (PRIMARY, HealthStatus::Down, None),
+            (SECONDARY, HealthStatus::Healthy, Some(50)),
         ]);
         assert_eq!(
             engine
                 .evaluate(120_001, &current_is_down, &policy())
                 .expect("failover")
                 .to_outlet,
-            LOCAL_OUTLET
+            SECONDARY
         );
     }
 
     #[test]
     fn manual_unavailable_is_fail_closed() {
-        let engine = RoutingEngine::new(RouteMode::Manual, Some(SUBSCRIPTION_OUTLET.into()));
-        let health = health(&[(SUBSCRIPTION_OUTLET, HealthStatus::Down, None)]);
+        let engine = RoutingEngine::new(RouteMode::Manual, Some(PRIMARY.into()));
+        let health = health(&[(PRIMARY, HealthStatus::Down, None)]);
         let decision = engine.evaluate(0, &health, &policy()).expect("decision");
         assert_eq!(decision.to_outlet, FAIL_CLOSED_OUTLET);
         assert_eq!(decision.reason, "manual_outlet_unavailable");
@@ -328,8 +329,8 @@ mod tests {
     fn all_unavailable_is_fail_closed() {
         let engine = RoutingEngine::new(RouteMode::Priority, None);
         let health = health(&[
-            (SUBSCRIPTION_OUTLET, HealthStatus::Down, None),
-            (LOCAL_OUTLET, HealthStatus::Down, None),
+            (PRIMARY, HealthStatus::Down, None),
+            (SECONDARY, HealthStatus::Down, None),
         ]);
         assert_eq!(
             engine
@@ -338,5 +339,42 @@ mod tests {
                 .to_outlet,
             FAIL_CLOSED_OUTLET
         );
+    }
+
+    #[test]
+    fn modes_operate_on_a_dynamic_five_outlet_collection() {
+        let health = health(&[
+            ("sub-a", HealthStatus::Healthy, Some(300)),
+            ("sub-b", HealthStatus::Down, None),
+            ("sub-c", HealthStatus::Healthy, Some(90)),
+            ("local-a", HealthStatus::Healthy, Some(180)),
+            ("local-b", HealthStatus::Degraded, Some(120)),
+        ]);
+        let policy = RoutingPolicy {
+            priority: vec![
+                "sub-b".into(),
+                "local-a".into(),
+                "sub-a".into(),
+                "sub-c".into(),
+                "local-b".into(),
+            ],
+            cooldown_ms: 60_000,
+            minimum_improvement_ms: 25,
+        };
+
+        let priority = RoutingEngine::new(RouteMode::Priority, None)
+            .evaluate(0, &health, &policy)
+            .expect("priority decision");
+        assert_eq!(priority.to_outlet, "local-a");
+
+        let fastest = RoutingEngine::new(RouteMode::Fastest, None)
+            .evaluate(0, &health, &policy)
+            .expect("fastest decision");
+        assert_eq!(fastest.to_outlet, "sub-c");
+
+        let manual = RoutingEngine::new(RouteMode::Manual, Some("local-b".into()))
+            .evaluate(0, &health, &policy)
+            .expect("manual decision");
+        assert_eq!(manual.to_outlet, "local-b");
     }
 }

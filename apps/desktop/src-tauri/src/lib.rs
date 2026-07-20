@@ -21,7 +21,6 @@ pub fn run() {
             commands::get_dashboard_snapshot,
             commands::refresh_guardian,
             commands::set_route_mode,
-            commands::save_subscription_url,
             commands::start_development_core,
             commands::stop_development_core,
         ])

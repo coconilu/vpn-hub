@@ -12,18 +12,17 @@ const statusText: Record<HealthStatus, string> = {
 };
 
 export function OutletTable({ snapshot }: { snapshot: DashboardSnapshot }) {
-  const rows = [
-    { id: "subscription-a", name: "订阅 A", port: "provider", configured: snapshot.routing.subscription_configured },
-    { id: "chaoshihui", name: "超实惠", port: "16666", configured: true },
-  ].map((definition) => {
-    const summary = snapshot.summaries.find((item) => item.outlet_id === definition.id);
-    const health: HealthStatus | "pending" = definition.configured ? summary?.last_status ?? "unknown" : "pending";
+  const rows = snapshot.routing.outlets.map((definition) => {
+    const summary = snapshot.summaries.find((item) => item.outlet_id === definition.outlet_id);
+    const active = definition.enabled && definition.configured;
+    const health: HealthStatus | "pending" = active ? summary?.last_status ?? "unknown" : "pending";
     return {
       ...definition,
       summary,
       health,
-      status: definition.configured ? statusText[summary?.last_status ?? "unknown"] : "待本机配置",
-      selected: snapshot.routing.current_outlet === definition.id,
+      access: definition.kind === "subscription" ? "Mihomo provider" : definition.endpoint ?? "—",
+      status: !definition.enabled ? "已停用" : definition.configured ? statusText[summary?.last_status ?? "unknown"] : "待凭据接入",
+      selected: snapshot.routing.current_outlet === definition.outlet_id,
     };
   });
 
@@ -34,10 +33,10 @@ export function OutletTable({ snapshot }: { snapshot: DashboardSnapshot }) {
         <table>
           <thead><tr><th>出口</th><th>状态</th><th>接入</th><th>平均延迟</th><th>历史可用率</th><th>最近检测</th><th>角色</th></tr></thead>
           <tbody>{rows.map((row) => (
-            <tr className={row.selected ? "selected" : ""} key={row.id}>
-              <td className="outlet-name">{row.name}</td>
+            <tr className={row.selected ? "selected" : ""} key={row.outlet_id}>
+              <td className="outlet-name">{row.label}</td>
               <td><span className={`status-cell ${row.health}`}><i />{row.status}</span></td>
-              <td className="mono">{row.port}</td>
+              <td className="mono">{row.access}</td>
               <td className={row.health === "down" ? "danger-text" : ""}>{row.summary?.average_latency_ms == null ? "—" : `${Math.round(row.summary.average_latency_ms)} ms`}</td>
               <td>{row.summary ? `${row.summary.availability_percent.toFixed(1)}%` : "—"}</td>
               <td>{formatTime(row.summary?.last_observed_at ?? null)}</td>

@@ -32,12 +32,12 @@ export async function startDevelopmentCore(): Promise<CoreStatus> {
       managed: true,
       pid: 32100,
       started_at: new Date().toISOString(),
-      message: "浏览器预览：已模拟启动 36666",
+      message: `浏览器预览：已模拟启动 ${browserSnapshot.entry.host}:${browserSnapshot.entry.port}`,
     };
     browserSnapshot = {
       ...browserSnapshot,
       updated_at: new Date().toISOString(),
-      development_entry: { port: 36666, reachable: true, owner_pid: status.pid },
+      entry: { ...browserSnapshot.entry, reachable: true, owner_pid: status.pid },
       mihomo: status,
     };
     return status;
@@ -52,12 +52,12 @@ export async function stopDevelopmentCore(): Promise<CoreStatus> {
       managed: false,
       pid: null,
       started_at: null,
-      message: "浏览器预览：已模拟停止 36666",
+      message: `浏览器预览：已模拟停止 ${browserSnapshot.entry.host}:${browserSnapshot.entry.port}`,
     };
     browserSnapshot = {
       ...browserSnapshot,
       updated_at: new Date().toISOString(),
-      development_entry: { port: 36666, reachable: false, owner_pid: null },
+      entry: { ...browserSnapshot.entry, reachable: false, owner_pid: null },
       mihomo: status,
     };
     return status;
@@ -75,15 +75,4 @@ export async function setRouteMode(mode: RouteMode, manualOutlet: string | null)
     return structuredClone(browserSnapshot);
   }
   return invoke<DashboardSnapshot>("set_route_mode", { mode, manualOutlet });
-}
-
-export async function saveSubscriptionUrl(subscriptionUrl: string): Promise<void> {
-  if (!isTauriRuntime()) {
-    browserSnapshot = {
-      ...browserSnapshot,
-      routing: { ...browserSnapshot.routing, subscription_configured: Boolean(subscriptionUrl) },
-    };
-    return;
-  }
-  await invoke("save_subscription_url", { subscriptionUrl });
 }

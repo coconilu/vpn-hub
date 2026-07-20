@@ -1,6 +1,7 @@
 export type HealthStatus = "unknown" | "healthy" | "degraded" | "down";
 
 export interface PortSnapshot {
+  host: string;
   port: number;
   reachable: boolean;
   owner_pid: number | null;
@@ -59,16 +60,22 @@ export interface RoutingStatus {
   current_outlet: string | null;
   manual_outlet: string | null;
   controller_ready: boolean;
-  subscription_configured: boolean;
-  provider_update_seconds: number;
+  outlets: RoutingOutlet[];
   message: string;
+}
+
+export interface RoutingOutlet {
+  outlet_id: string;
+  label: string;
+  kind: "subscription" | "local_proxy";
+  enabled: boolean;
+  endpoint: string | null;
+  configured: boolean;
 }
 
 export interface DashboardSnapshot {
   updated_at: string;
-  protected_entry: PortSnapshot;
-  development_entry: PortSnapshot;
-  upstream_entry: PortSnapshot;
+  entry: PortSnapshot;
   mihomo: CoreStatus;
   routing: RoutingStatus;
   summaries: OutletSummary[];

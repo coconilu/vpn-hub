@@ -4,7 +4,7 @@ const now = Date.now();
 const latencyValues = [182, 194, 178, 216, 228, 205, null, null, 241, 220, 201, 190, 231, 248, 226, 214, null, null, 264, 238, 217, 202, 194, 228];
 
 const samples: LatencySample[] = latencyValues.map((latency, index) => ({
-  outlet_id: "chaoshihui",
+  outlet_id: "local-a",
   observed_at: new Date(now - (latencyValues.length - 1 - index) * 60 * 60 * 1000).toISOString(),
   port_reachable: true,
   status: (latency === null ? "down" : latency > 230 ? "degraded" : "healthy") as HealthStatus,
@@ -16,9 +16,7 @@ const samples: LatencySample[] = latencyValues.map((latency, index) => ({
 
 export const mockSnapshot: DashboardSnapshot = {
   updated_at: new Date(now).toISOString(),
-  protected_entry: { port: 6666, reachable: true, owner_pid: 64908 },
-  development_entry: { port: 36666, reachable: false, owner_pid: null },
-  upstream_entry: { port: 16666, reachable: true, owner_pid: 70700 },
+  entry: { host: "127.0.0.1", port: 3666, reachable: false, owner_pid: null },
   mihomo: {
     state: "stopped",
     managed: false,
@@ -28,17 +26,22 @@ export const mockSnapshot: DashboardSnapshot = {
   },
   routing: {
     mode: "priority",
-    current_outlet: "chaoshihui",
+    current_outlet: "local-a",
     manual_outlet: null,
     controller_ready: false,
-    subscription_configured: false,
-    provider_update_seconds: 180,
+    outlets: [
+      { outlet_id: "sub-a", label: "订阅 A", kind: "subscription", enabled: true, endpoint: null, configured: true },
+      { outlet_id: "sub-b", label: "订阅 B", kind: "subscription", enabled: true, endpoint: null, configured: true },
+      { outlet_id: "sub-c", label: "订阅 C", kind: "subscription", enabled: false, endpoint: null, configured: false },
+      { outlet_id: "local-a", label: "本地客户端 A", kind: "local_proxy", enabled: true, endpoint: "socks5h://127.0.0.1:2666", configured: true },
+      { outlet_id: "local-b", label: "本地客户端 B", kind: "local_proxy", enabled: true, endpoint: "http://127.0.0.1:4666", configured: true },
+    ],
     message: "开发核心未运行，路由保持 Fail Closed",
   },
   summaries: [
     {
-      outlet_id: "chaoshihui",
-      label: "超实惠",
+      outlet_id: "local-a",
+      label: "本地客户端 A",
       samples: 72,
       successful_samples: 63,
       failed_samples: 9,
@@ -51,21 +54,21 @@ export const mockSnapshot: DashboardSnapshot = {
   samples,
   events: [
     {
-      outlet_id: "chaoshihui",
+      outlet_id: "local-a",
       occurred_at: new Date(now - 4 * 60 * 1000).toISOString(),
       from_status: "healthy",
       to_status: "down",
       reason: "request_timeout",
     },
     {
-      outlet_id: "chaoshihui",
+      outlet_id: "local-a",
       occurred_at: new Date(now - 9 * 60 * 1000).toISOString(),
       from_status: "down",
       to_status: "healthy",
       reason: "probe_result",
     },
     {
-      outlet_id: "chaoshihui",
+      outlet_id: "local-a",
       occurred_at: new Date(now - 14 * 60 * 1000).toISOString(),
       from_status: "unknown",
       to_status: "healthy",
