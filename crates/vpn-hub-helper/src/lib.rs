@@ -22,8 +22,8 @@ pub use authority::{
     AuthorityError, AuthorityFileGuard, AuthorityLease, AuthorityRegistry, SupervisorAuthority,
 };
 pub use install_plan::{
-    AccountContract, InstallAction, InstallPlan, InstallPlanError, PlanOperation,
-    ProtectedMaterialSide,
+    AccountContract, ExistingArtifactMode, InstallAction, InstallPlan, InstallPlanError,
+    PlanOperation, ProtectedMaterialSide,
 };
 pub use installation::{
     InstallationReference, InstallationReferenceError, validate_installation_location,

@@ -71,6 +71,8 @@ flowchart LR
 3. 用随机隔离 loopback 端口完成 ownership、Controller、出口、Fail Closed 与 `StagePending` 崩溃恢复；
 4. 覆盖 manual、PAC、auto-detect、空 bypass、广播失败、进程崩溃、重启和并发人工修改；
 5. 明确解决或接受 WinINet compare-then-apply 竞争窗口，并形成可重复验收证据；
-6. 验证安装、升级、卸载先由交互用户恢复未决 journal，LocalService 不越权接管。
+6. 验证升级、卸载先由交互用户恢复已存在的未决 journal，LocalService 不越权接管；旧版首次升级没有 journal 时恢复步骤安全跳过。
+
+安装计划 schema v2 将 entry-switch authority、journal 与当前用户保护存储中的 HMAC key 作为一个幂等 provisioning 操作：缺失项才创建，已有项原样保留，因此后续升级不得轮换已有 key。若补齐任一新项失败，签名安装器必须回滚本次操作新建的项，但不得删除或替换升级前已经存在的状态。
 
 默认自动化测试只使用 fake/in-memory adapter 和随机安全端口，不读取或修改真实系统代理，也不接触用户正在使用的入口。

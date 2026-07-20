@@ -23,6 +23,12 @@ pub enum ProtectedMaterialSide {
     ClientWindowsProtectedStore,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExistingArtifactMode {
+    CreateIfMissingPreserveExisting,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "operation", rename_all = "kebab-case")]
 pub enum PlanOperation {
@@ -38,9 +44,13 @@ pub enum PlanOperation {
     ProvisionEntrySwitchState {
         authority_relative_path: String,
         journal_relative_path: String,
+        hmac_key_reference_name: String,
+        hmac_key_side: ProtectedMaterialSide,
+        existing_artifact_mode: ExistingArtifactMode,
+        rollback_new_artifacts_on_failure: bool,
         principals: Vec<String>,
     },
-    RequireInteractiveUserEntrySwitchRecovery {
+    RecoverInteractiveUserEntrySwitchIfPresent {
         journal_relative_path: String,
     },
     RegisterService {
@@ -118,8 +128,7 @@ impl InstallPlan {
                         "SYSTEM".into(),
                     ],
                 },
-                entry_switch_state_operation(),
-                entry_switch_key_operation(&entry_switch_reference),
+                entry_switch_state_operation(&entry_switch_reference),
                 PlanOperation::ProvisionAuthorityLeaseFile,
                 PlanOperation::ApplyProgramDataAcl {
                     relative_path: "authority.lease".into(),
@@ -152,9 +161,10 @@ impl InstallPlan {
                 },
             ],
             InstallAction::Upgrade => vec![
-                PlanOperation::RequireInteractiveUserEntrySwitchRecovery {
+                PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent {
                     journal_relative_path: "entry-switch/entry-switch.json".into(),
                 },
+                entry_switch_state_operation(&entry_switch_reference),
                 PlanOperation::StopOwnedJob,
                 PlanOperation::VerifySignedArtifact {
                     relative_path: "bin/vpn-hub-helper.exe".into(),
@@ -171,7 +181,7 @@ impl InstallPlan {
                 PlanOperation::VerifyNoOwnedJob,
             ],
             InstallAction::Uninstall => vec![
-                PlanOperation::RequireInteractiveUserEntrySwitchRecovery {
+                PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent {
                     journal_relative_path: "entry-switch/entry-switch.json".into(),
                 },
                 PlanOperation::StopOwnedJob,
@@ -192,7 +202,7 @@ impl InstallPlan {
             ],
         };
         Ok(Self {
-            schema_version: 1,
+            schema_version: 2,
             action,
             install_id: install_id.into(),
             dry_run: true,
@@ -203,18 +213,15 @@ impl InstallPlan {
     }
 }
 
-fn entry_switch_state_operation() -> PlanOperation {
+fn entry_switch_state_operation(key_reference_name: &str) -> PlanOperation {
     PlanOperation::ProvisionEntrySwitchState {
         authority_relative_path: "entry-switch/authority.lease".into(),
         journal_relative_path: "entry-switch/entry-switch.json".into(),
+        hmac_key_reference_name: key_reference_name.into(),
+        hmac_key_side: ProtectedMaterialSide::ClientWindowsProtectedStore,
+        existing_artifact_mode: ExistingArtifactMode::CreateIfMissingPreserveExisting,
+        rollback_new_artifacts_on_failure: true,
         principals: vec!["interactive-user-sid".into(), "SYSTEM".into()],
-    }
-}
-
-fn entry_switch_key_operation(reference_name: &str) -> PlanOperation {
-    PlanOperation::WriteProtectedReference {
-        reference_name: reference_name.into(),
-        side: ProtectedMaterialSide::ClientWindowsProtectedStore,
     }
 }
 
@@ -250,6 +257,80 @@ fn validate_hash(value: &str) -> Result<(), InstallPlanError> {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct FakeEntrySwitchInstall {
+        authority_exists: bool,
+        journal_exists: bool,
+        journal_pending: bool,
+        hmac_key: Option<String>,
+        next_key: u64,
+        recoveries: usize,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FailProvisionAt {
+        Authority,
+        Journal,
+        Key,
+    }
+
+    fn apply_entry_switch_contract(
+        plan: &InstallPlan,
+        state: &mut FakeEntrySwitchInstall,
+        fail_at: Option<FailProvisionAt>,
+    ) -> Result<(), &'static str> {
+        for operation in &plan.operations {
+            match operation {
+                PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent { .. } => {
+                    if state.journal_exists {
+                        state.recoveries += 1;
+                        state.journal_pending = false;
+                    }
+                }
+                PlanOperation::ProvisionEntrySwitchState {
+                    hmac_key_side,
+                    existing_artifact_mode,
+                    rollback_new_artifacts_on_failure,
+                    ..
+                } => {
+                    assert_eq!(
+                        hmac_key_side,
+                        &ProtectedMaterialSide::ClientWindowsProtectedStore
+                    );
+                    assert_eq!(
+                        existing_artifact_mode,
+                        &ExistingArtifactMode::CreateIfMissingPreserveExisting
+                    );
+                    assert!(*rollback_new_artifacts_on_failure);
+
+                    let before = state.clone();
+                    state.authority_exists = true;
+                    if fail_at == Some(FailProvisionAt::Authority) {
+                        *state = before;
+                        return Err("injected failure after authority");
+                    }
+
+                    state.journal_exists = true;
+                    if fail_at == Some(FailProvisionAt::Journal) {
+                        *state = before;
+                        return Err("injected failure after journal");
+                    }
+
+                    if state.hmac_key.is_none() {
+                        state.next_key += 1;
+                        state.hmac_key = Some(format!("generated-key-{}", state.next_key));
+                    }
+                    if fail_at == Some(FailProvisionAt::Key) {
+                        *state = before;
+                        return Err("injected failure after key");
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn install_is_local_service_without_self_elevation() {
         let plan =
@@ -257,6 +338,7 @@ mod tests {
         assert!(plan.dry_run);
         assert!(plan.requires_elevation_by_signed_installer);
         assert!(!plan.helper_self_elevation);
+        assert_eq!(plan.schema_version, 2);
         assert!(plan.operations.iter().any(|operation| matches!(
             operation,
             PlanOperation::RegisterService {
@@ -270,15 +352,24 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_stops_owned_job_before_replacing_artifact() {
+    fn upgrade_recovers_then_provisions_before_stopping_owned_job() {
         let plan =
             InstallPlan::build(InstallAction::Upgrade, "install-a", &"b".repeat(64)).unwrap();
         assert!(matches!(
             plan.operations.first(),
-            Some(PlanOperation::RequireInteractiveUserEntrySwitchRecovery { .. })
+            Some(PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent { .. })
         ));
         assert!(matches!(
             plan.operations.get(1),
+            Some(PlanOperation::ProvisionEntrySwitchState {
+                hmac_key_side: ProtectedMaterialSide::ClientWindowsProtectedStore,
+                existing_artifact_mode: ExistingArtifactMode::CreateIfMissingPreserveExisting,
+                rollback_new_artifacts_on_failure: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            plan.operations.get(2),
             Some(PlanOperation::StopOwnedJob)
         ));
         assert!(matches!(
@@ -302,7 +393,7 @@ mod tests {
         );
         assert!(matches!(
             plan.operations.first(),
-            Some(PlanOperation::RequireInteractiveUserEntrySwitchRecovery { .. })
+            Some(PlanOperation::RecoverInteractiveUserEntrySwitchIfPresent { .. })
         ));
     }
 
@@ -314,19 +405,115 @@ mod tests {
             .operations
             .iter()
             .find_map(|operation| match operation {
-                PlanOperation::ProvisionEntrySwitchState { principals, .. } => Some(principals),
+                PlanOperation::ProvisionEntrySwitchState {
+                    principals,
+                    hmac_key_reference_name,
+                    hmac_key_side,
+                    existing_artifact_mode,
+                    rollback_new_artifacts_on_failure,
+                    ..
+                } => Some((
+                    principals,
+                    hmac_key_reference_name,
+                    hmac_key_side,
+                    existing_artifact_mode,
+                    rollback_new_artifacts_on_failure,
+                )),
                 _ => None,
             })
             .expect("entry switch state");
-        assert_eq!(state, &["interactive-user-sid", "SYSTEM"]);
+        assert_eq!(state.0, &["interactive-user-sid", "SYSTEM"]);
         assert!(
             !state
+                .0
                 .iter()
                 .any(|principal| principal.contains("LOCAL SERVICE"))
         );
-        assert!(install.operations.iter().any(|operation| matches!(operation,
-            PlanOperation::WriteProtectedReference { reference_name, side: ProtectedMaterialSide::ClientWindowsProtectedStore }
-                if reference_name == "vpn-hub/entry-switch/install-a/hmac-key"
-        )));
+        assert_eq!(state.1, "vpn-hub/entry-switch/install-a/hmac-key");
+        assert_eq!(state.2, &ProtectedMaterialSide::ClientWindowsProtectedStore);
+        assert_eq!(
+            state.3,
+            &ExistingArtifactMode::CreateIfMissingPreserveExisting
+        );
+        assert!(state.4);
+    }
+
+    #[test]
+    fn first_upgrade_from_legacy_install_creates_state_and_key() {
+        let plan = InstallPlan::build(InstallAction::Upgrade, "legacy", &"e".repeat(64)).unwrap();
+        let mut state = FakeEntrySwitchInstall::default();
+
+        apply_entry_switch_contract(&plan, &mut state, None).unwrap();
+
+        assert!(state.authority_exists);
+        assert!(state.journal_exists);
+        assert!(!state.journal_pending);
+        assert_eq!(state.hmac_key.as_deref(), Some("generated-key-1"));
+        assert_eq!(state.recoveries, 0);
+    }
+
+    #[test]
+    fn upgrade_preserves_existing_key_across_repeated_runs() {
+        let plan =
+            InstallPlan::build(InstallAction::Upgrade, "install-a", &"f".repeat(64)).unwrap();
+        let mut state = FakeEntrySwitchInstall {
+            hmac_key: Some("existing-protected-key".into()),
+            ..Default::default()
+        };
+
+        apply_entry_switch_contract(&plan, &mut state, None).unwrap();
+        apply_entry_switch_contract(&plan, &mut state, None).unwrap();
+
+        assert!(state.authority_exists);
+        assert!(state.journal_exists);
+        assert_eq!(state.hmac_key.as_deref(), Some("existing-protected-key"));
+        assert_eq!(state.next_key, 0);
+    }
+
+    #[test]
+    fn partial_state_retry_is_idempotent() {
+        let plan =
+            InstallPlan::build(InstallAction::Upgrade, "install-a", &"1".repeat(64)).unwrap();
+        let mut state = FakeEntrySwitchInstall {
+            authority_exists: true,
+            hmac_key: Some("existing-protected-key".into()),
+            ..Default::default()
+        };
+
+        apply_entry_switch_contract(&plan, &mut state, None).unwrap();
+        let completed = state.clone();
+        apply_entry_switch_contract(&plan, &mut state, None).unwrap();
+
+        assert_eq!(state.authority_exists, completed.authority_exists);
+        assert_eq!(state.journal_exists, completed.journal_exists);
+        assert_eq!(state.hmac_key, completed.hmac_key);
+        assert_eq!(state.next_key, completed.next_key);
+    }
+
+    #[test]
+    fn provisioning_failure_rolls_back_only_new_artifacts() {
+        let plan =
+            InstallPlan::build(InstallAction::Upgrade, "install-a", &"2".repeat(64)).unwrap();
+        let empty = FakeEntrySwitchInstall::default();
+        for failure in [
+            FailProvisionAt::Authority,
+            FailProvisionAt::Journal,
+            FailProvisionAt::Key,
+        ] {
+            let mut state = empty.clone();
+            assert!(apply_entry_switch_contract(&plan, &mut state, Some(failure)).is_err());
+            assert_eq!(state, empty);
+        }
+
+        let partial = FakeEntrySwitchInstall {
+            authority_exists: true,
+            hmac_key: Some("existing-protected-key".into()),
+            ..Default::default()
+        };
+        let mut state = partial.clone();
+        assert!(
+            apply_entry_switch_contract(&plan, &mut state, Some(FailProvisionAt::Journal)).is_err()
+        );
+        assert_eq!(state, partial);
     }
 }
