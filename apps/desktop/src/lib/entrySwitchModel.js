@@ -28,7 +28,7 @@ export function buildEntrySwitchFoundationPreview(current, target, applySystemPr
       "验证 Controller ownership、全部启用出口与 Fail Closed",
       "提交应用入口；旧入口在此之前保持不变",
       applySystemProxy
-        ? "使用 CAS 应用 WinINet 用户代理并回读验证；失败恢复完整 manual/PAC/auto-detect/override 快照"
+        ? "使用非原子的 query → compare → WinINet apply 并回读验证；竞争窗口解决前不会开放真实执行"
         : "不调用任何系统代理 backend",
     ],
   };

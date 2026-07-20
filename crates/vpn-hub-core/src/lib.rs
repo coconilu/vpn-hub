@@ -26,11 +26,13 @@ pub use durable::{
     durable_remove_if_exists, durable_replace, durable_write_new,
 };
 pub use entry_switch::{
-    EntryBackend, EntrySwitchConsent, EntrySwitchError, EntrySwitchJournal,
+    ConfidentialProtector, ConsentKey, EntryBackend, EntrySwitchAudit, EntrySwitchAuthorityGuard,
+    EntrySwitchConsent, EntrySwitchContext, EntrySwitchError, EntrySwitchJournal,
     EntrySwitchJournalRecord, EntrySwitchPhase, EntrySwitchPlan, EntrySwitchPlanner,
-    EntrySwitchRequest, EntrySwitchTransaction, FileEntrySwitchJournal, MemoryEntrySwitchJournal,
-    OwnedCoreIdentity, PortOwnership, ProxyBackend, ProxyCapability, SwitchVerification,
-    SystemProxySnapshot, UserProxyAuthority, WindowsProxyMode,
+    EntrySwitchRequest, EntrySwitchTransaction, MemoryEntrySwitchJournal, OwnedCoreIdentity,
+    PortOwnership, ProtectedJournalCodec, ProtectedJournalState, ProxyBackend, ProxyCapability,
+    StageDeclaration, SwitchVerification, SystemProxySnapshot, SystemTrustedClock, TrustedClock,
+    WindowsProxyMode,
 };
 pub use guardian_cycle::{
     GuardianCycleError, GuardianCycleOutcome, RoutingSession, RoutingStateError,

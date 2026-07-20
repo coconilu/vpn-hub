@@ -100,10 +100,10 @@ impl InstallPlan {
         install_id: &str,
         helper_sha256: &str,
     ) -> Result<Self, InstallPlanError> {
-        validate_id(install_id)?;
-        validate_hash(helper_sha256)?;
+        validate_install_inputs(install_id, helper_sha256)?;
         let pipe = NamedPipeContract::for_install(install_id)?;
         let protected_reference = format!("vpn-hub/helper/{install_id}/protocol-key");
+        let entry_switch_reference = format!("vpn-hub/entry-switch/{install_id}/hmac-key");
         let operations = match action {
             InstallAction::Install => vec![
                 PlanOperation::VerifySignedArtifact {
@@ -118,11 +118,8 @@ impl InstallPlan {
                         "SYSTEM".into(),
                     ],
                 },
-                PlanOperation::ProvisionEntrySwitchState {
-                    authority_relative_path: "entry-switch/authority.lease".into(),
-                    journal_relative_path: "entry-switch/entry-switch.json".into(),
-                    principals: vec!["interactive-user-sid".into(), "SYSTEM".into()],
-                },
+                entry_switch_state_operation(),
+                entry_switch_key_operation(&entry_switch_reference),
                 PlanOperation::ProvisionAuthorityLeaseFile,
                 PlanOperation::ApplyProgramDataAcl {
                     relative_path: "authority.lease".into(),
@@ -185,6 +182,9 @@ impl InstallPlan {
                 PlanOperation::RemoveProtectedReference {
                     reference_name: format!("{protected_reference}/client"),
                 },
+                PlanOperation::RemoveProtectedReference {
+                    reference_name: entry_switch_reference,
+                },
                 PlanOperation::RemoveProgramDataTree,
                 PlanOperation::VerifyNoOwnedJob,
                 PlanOperation::VerifyNoServiceRegistration,
@@ -201,6 +201,26 @@ impl InstallPlan {
             operations,
         })
     }
+}
+
+fn entry_switch_state_operation() -> PlanOperation {
+    PlanOperation::ProvisionEntrySwitchState {
+        authority_relative_path: "entry-switch/authority.lease".into(),
+        journal_relative_path: "entry-switch/entry-switch.json".into(),
+        principals: vec!["interactive-user-sid".into(), "SYSTEM".into()],
+    }
+}
+
+fn entry_switch_key_operation(reference_name: &str) -> PlanOperation {
+    PlanOperation::WriteProtectedReference {
+        reference_name: reference_name.into(),
+        side: ProtectedMaterialSide::ClientWindowsProtectedStore,
+    }
+}
+
+fn validate_install_inputs(install_id: &str, helper_sha256: &str) -> Result<(), InstallPlanError> {
+    validate_id(install_id)?;
+    validate_hash(helper_sha256)
 }
 
 fn validate_id(value: &str) -> Result<(), InstallPlanError> {
@@ -304,5 +324,9 @@ mod tests {
                 .iter()
                 .any(|principal| principal.contains("LOCAL SERVICE"))
         );
+        assert!(install.operations.iter().any(|operation| matches!(operation,
+            PlanOperation::WriteProtectedReference { reference_name, side: ProtectedMaterialSide::ClientWindowsProtectedStore }
+                if reference_name == "vpn-hub/entry-switch/install-a/hmac-key"
+        )));
     }
 }

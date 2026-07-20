@@ -1018,6 +1018,13 @@ impl AppState {
             }
         };
         if let Some(candidate) = candidate.as_ref() {
+            if candidate.entry != current.entry {
+                issues.push(ValidationIssue::new(
+                    "entry",
+                    "dedicated_entry_switch_required",
+                    "统一入口只能通过专用安全切换事务修改；普通设置不会暂存核心、应用系统代理或提交入口",
+                ));
+            }
             // Settings preview is pure and must never contact a user-entered
             // port. Exact ownership is checked only inside the separately
             // consented entry-switch transaction; startup also re-checks it.
@@ -1142,6 +1149,9 @@ impl AppState {
         let candidate = draft
             .private_candidate(&current)
             .map_err(|_| "设置候选在提交前校验失败".to_string())?;
+        if candidate.entry != current.entry {
+            return Err("统一入口只能通过专用安全切换事务修改；普通设置已拒绝该变更".into());
+        }
         let current_active = self
             .routing_engine
             .lock()
@@ -4100,7 +4110,12 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         let preview = state
             .preview_settings(&preview_request(&draft, None, false, Vec::new()))
             .expect("preview");
-        assert!(preview.issues.is_empty());
+        assert!(
+            preview
+                .issues
+                .iter()
+                .any(|issue| issue.code == "dedicated_entry_switch_required")
+        );
         lease.listener.set_nonblocking(true).expect("nonblocking");
         assert_eq!(
             lease.listener.accept().unwrap_err().kind(),

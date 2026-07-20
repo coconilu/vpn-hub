@@ -1,23 +1,29 @@
 //! Fail-closed domain model for switching the product entry.
 //!
-//! This module performs no socket, process, or Windows proxy I/O. Production
-//! callers must provide explicit adapters; tests use deterministic fakes.
+//! This module performs no socket, process, filesystem, clock, or Windows
+//! proxy I/O. Production callers must supply guarded adapters. The public
+//! audit DTO deliberately excludes confidential proxy recovery material.
 
-use std::{collections::BTreeSet, fmt, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use hmac::{Hmac, Mac as _};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::{EntryConfig, normalize_loopback_host};
 
+type HmacSha256 = Hmac<Sha256>;
 const CONSENT_LIFETIME_MS: i64 = 120_000;
-const SCHEMA_VERSION: u16 = 1;
-const NO_PROXY_SNAPSHOT: &str = "proxy-not-requested";
+const SCHEMA_VERSION: u16 = 2;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowsProxyMode {
     Direct,
     Manual,
@@ -25,9 +31,10 @@ pub enum WindowsProxyMode {
     Combined,
 }
 
-/// Lossless typed state required to restore the `WinINet` per-connection proxy.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Confidential, lossless state needed to restore `WinINet`. It intentionally
+/// does not implement `Serialize`; only an authenticated confidential journal
+/// adapter may encode it through explicit field access.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SystemProxySnapshot {
     pub mode: WindowsProxyMode,
     pub direct: bool,
@@ -35,14 +42,12 @@ pub struct SystemProxySnapshot {
     pub proxy_bypass: Option<String>,
     pub auto_config_url: Option<String>,
     pub auto_detect: bool,
-    /// Must be `None` for the deliberately supported default LAN scope.
     pub connection_name: Option<String>,
 }
 
 impl fmt::Debug for SystemProxySnapshot {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SystemProxySnapshot")
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SystemProxySnapshot")
             .field("mode", &self.mode)
             .field("direct", &self.direct)
             .field("manual_proxy_configured", &self.manual_proxy.is_some())
@@ -57,7 +62,7 @@ impl fmt::Debug for SystemProxySnapshot {
 impl SystemProxySnapshot {
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        fingerprint(self)
+        hex(&Sha256::digest(proxy_bytes(self)))
     }
 
     fn validate(&self) -> Result<(), EntrySwitchError> {
@@ -80,22 +85,19 @@ impl SystemProxySnapshot {
             || self
                 .manual_proxy
                 .as_ref()
-                .is_some_and(|value| value.is_empty() || value.len() > 4_096)
-            || self
-                .proxy_bypass
-                .as_ref()
-                .is_some_and(|value| value.len() > 16_384)
+                .is_some_and(|v| v.is_empty() || v.len() > 4_096)
+            || self.proxy_bypass.as_ref().is_some_and(|v| v.len() > 16_384)
             || self
                 .auto_config_url
                 .as_ref()
-                .is_some_and(|value| value.is_empty() || value.len() > 4_096)
+                .is_some_and(|v| v.is_empty() || v.len() > 4_096)
         {
             return Err(EntrySwitchError::UnsupportedProxyScope);
         }
         Ok(())
     }
 
-    fn for_entry(entry: &EntryConfig, original_bypass: Option<String>) -> Self {
+    fn for_entry(entry: &EntryConfig, bypass: Option<String>) -> Self {
         let host = normalize_loopback_host(&entry.host)
             .expect("validated entry")
             .to_string();
@@ -111,7 +113,7 @@ impl SystemProxySnapshot {
                 "http={host}:{};https={host}:{}",
                 entry.port, entry.port
             )),
-            proxy_bypass: original_bypass,
+            proxy_bypass: bypass,
             auto_config_url: None,
             auto_detect: false,
             connection_name: None,
@@ -119,8 +121,7 @@ impl SystemProxySnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProxyCapability {
     SupportedDefaultLanCurrentUser,
     Unsupported,
@@ -128,28 +129,70 @@ pub enum ProxyCapability {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UserProxyAuthority {
-    /// Opaque, non-secret digest of the interactive user scope.
+pub struct EntrySwitchContext {
+    pub install_id: String,
     pub user_scope_id: String,
-    pub generation: u64,
-    pub fencing_token: u64,
 }
 
-impl UserProxyAuthority {
-    fn validate(&self, generation: u64) -> Result<(), EntrySwitchError> {
-        let valid_scope = (16..=128).contains(&self.user_scope_id.len())
-            && self.user_scope_id.bytes().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-            });
-        if !valid_scope || self.generation != generation || self.fencing_token == 0 {
+impl EntrySwitchContext {
+    fn validate(&self) -> Result<(), EntrySwitchError> {
+        fn valid(value: &str) -> bool {
+            (16..=128).contains(&value.len())
+                && value.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_')
+                })
+        }
+        if !valid(&self.install_id) || !valid(&self.user_scope_id) {
             return Err(EntrySwitchError::Unauthorized);
         }
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+/// HMAC key loaded from the current-user protected store. No Debug, Clone, or
+/// serialization implementation exists, and its bytes are zeroized on drop.
+pub struct ConsentKey(Zeroizing<[u8; 32]>);
+
+impl ConsentKey {
+    #[must_use]
+    pub fn generate() -> Self {
+        let mut bytes = [0; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        Self(Zeroizing::new(bytes))
+    }
+    /// Constructs a key only after a platform adapter has unprotected it.
+    #[must_use]
+    pub fn from_protected_bytes(bytes: [u8; 32]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+}
+
+pub trait TrustedClock {
+    /// # Errors
+    /// Returns an error when a trustworthy bounded Unix timestamp is unavailable.
+    fn now_unix_ms(&self) -> Result<i64, EntrySwitchError>;
+}
+pub struct SystemTrustedClock;
+impl TrustedClock for SystemTrustedClock {
+    fn now_unix_ms(&self) -> Result<i64, EntrySwitchError> {
+        let value = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| EntrySwitchError::InvalidConsent)?
+            .as_millis();
+        i64::try_from(value).map_err(|_| EntrySwitchError::InvalidConsent)
+    }
+}
+
+/// Must represent an OS lock held continuously for the transaction lifetime.
+pub trait EntrySwitchAuthorityGuard {
+    fn context(&self) -> &EntrySwitchContext;
+    fn generation(&self) -> u64;
+    /// # Errors
+    /// Returns `Unauthorized` if the OS-backed exclusive guard is no longer held.
+    fn ensure_held(&self) -> Result<(), EntrySwitchError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PortOwnership {
     Free,
     OwnedByVpnHub(OwnedCoreIdentity),
@@ -157,21 +200,37 @@ pub enum PortOwnership {
     ThirdPartyOccupied,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OwnedCoreIdentity {
-    pub pid: u32,
-    pub creation_identity: u64,
-    pub fencing_epoch: u64,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StageDeclaration {
+    pub transaction_id: String,
+    pub ownership_token: String,
     pub generation: u64,
 }
 
+impl StageDeclaration {
+    fn valid(&self, generation: u64) -> bool {
+        self.generation == generation
+            && valid_hex(&self.transaction_id, 32)
+            && valid_hex(&self.ownership_token, 64)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedCoreIdentity {
+    pub pid: u32,
+    pub creation_identity: u64,
+    pub generation: u64,
+    pub transaction_id: String,
+    pub ownership_token: String,
+}
+
 impl OwnedCoreIdentity {
-    fn is_valid_for(&self, generation: u64) -> bool {
+    fn matches(&self, declaration: &StageDeclaration) -> bool {
         self.pid > 0
             && self.creation_identity > 0
-            && self.fencing_epoch > 0
-            && self.generation == generation
+            && self.generation == declaration.generation
+            && self.transaction_id == declaration.transaction_id
+            && self.ownership_token == declaration.ownership_token
     }
 }
 
@@ -183,25 +242,38 @@ pub struct EntrySwitchRequest {
     pub apply_system_proxy: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EntrySwitchConsent {
-    pub schema_version: u16,
-    pub config_generation: u64,
-    pub current: EntryConfig,
-    pub target: EntryConfig,
-    pub apply_system_proxy: bool,
-    pub proxy_snapshot_fingerprint: String,
-    pub plan_fingerprint: String,
+    token: String,
     pub issued_at_unix_ms: i64,
     pub expires_at_unix_ms: i64,
-    pub nonce: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+impl fmt::Debug for EntrySwitchConsent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EntrySwitchConsent")
+            .field("token_id", &self.token_id())
+            .field("issued_at_unix_ms", &self.issued_at_unix_ms)
+            .field("expires_at_unix_ms", &self.expires_at_unix_ms)
+            .finish_non_exhaustive()
+    }
+}
+
+impl EntrySwitchConsent {
+    fn token_id(&self) -> Option<&str> {
+        self.token.split_once('.').map(|v| v.0)
+    }
+    #[cfg(test)]
+    fn replace_token(&mut self, value: String) {
+        self.token = value;
+    }
+}
+
+/// Confidential plan; it deliberately has no generic serialization support.
+#[derive(Clone, PartialEq, Eq)]
 pub struct EntrySwitchPlan {
     pub schema_version: u16,
+    pub context: EntrySwitchContext,
     pub config_generation: u64,
     pub current: EntryConfig,
     pub target: EntryConfig,
@@ -211,56 +283,122 @@ pub struct EntrySwitchPlan {
     pub consent: EntrySwitchConsent,
 }
 
+impl fmt::Debug for EntrySwitchPlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EntrySwitchPlan")
+            .field("schema_version", &self.schema_version)
+            .field("context", &self.context)
+            .field("config_generation", &self.config_generation)
+            .field("current", &self.current)
+            .field("target", &self.target)
+            .field("apply_system_proxy", &self.apply_system_proxy)
+            .field("consent", &self.consent)
+            .finish_non_exhaustive()
+    }
+}
+
 impl EntrySwitchPlan {
-    /// Verifies every consent-bound field without performing external I/O.
+    /// Validates the keyed consent and trusted-clock freshness.
     ///
     /// # Errors
-    /// Returns a sanitized validation error for stale, tampered, unsupported,
-    /// or internally inconsistent plans.
-    pub fn validate(&self, now_ms: i64) -> Result<(), EntrySwitchError> {
+    /// Returns a fail-closed validation error for any stale or altered field.
+    pub fn validate(
+        &self,
+        key: &ConsentKey,
+        clock: &impl TrustedClock,
+    ) -> Result<(), EntrySwitchError> {
+        self.validate_integrity(key)?;
+        let now = clock.now_unix_ms()?;
+        if now < self.consent.issued_at_unix_ms || now > self.consent.expires_at_unix_ms {
+            return Err(EntrySwitchError::InvalidConsent);
+        }
+        Ok(())
+    }
+
+    fn validate_integrity(&self, key: &ConsentKey) -> Result<(), EntrySwitchError> {
         validate_entry(&self.current)?;
         validate_entry(&self.target)?;
+        self.context.validate()?;
+        let lifetime = self
+            .consent
+            .expires_at_unix_ms
+            .checked_sub(self.consent.issued_at_unix_ms)
+            .ok_or(EntrySwitchError::InvalidConsent)?;
         if self.schema_version != SCHEMA_VERSION
             || self.current == self.target
             || self.config_generation == 0
-            || self.consent.schema_version != SCHEMA_VERSION
-            || self.consent.config_generation != self.config_generation
-            || self.consent.current != self.current
-            || self.consent.target != self.target
-            || self.consent.apply_system_proxy != self.apply_system_proxy
-            || self.consent.issued_at_unix_ms > now_ms
-            || self.consent.expires_at_unix_ms < now_ms
-            || self.consent.expires_at_unix_ms - self.consent.issued_at_unix_ms
-                > CONSENT_LIFETIME_MS
-            || self.consent.nonce.len() != 32
-        {
-            return Err(EntrySwitchError::InvalidConsent);
-        }
-        let proxy_fingerprint = self.original_proxy.as_ref().map_or_else(
-            || NO_PROXY_SNAPSHOT.into(),
-            SystemProxySnapshot::fingerprint,
-        );
-        if proxy_fingerprint != self.consent.proxy_snapshot_fingerprint
-            || self.consent.plan_fingerprint != plan_fingerprint(self, &self.consent.nonce)
+            || self.consent.issued_at_unix_ms < 0
+            || lifetime != CONSENT_LIFETIME_MS
             || self.apply_system_proxy != self.original_proxy.is_some()
             || self.apply_system_proxy != self.desired_proxy.is_some()
         {
             return Err(EntrySwitchError::InvalidConsent);
         }
-        if let Some(snapshot) = &self.original_proxy {
-            snapshot.validate()?;
+        if let Some(v) = &self.original_proxy {
+            v.validate()?;
         }
-        if let Some(snapshot) = &self.desired_proxy {
-            snapshot.validate()?;
+        if let Some(v) = &self.desired_proxy {
+            v.validate()?;
         }
-        Ok(())
+        let (id, signature) = self
+            .consent
+            .token
+            .split_once('.')
+            .ok_or(EntrySwitchError::InvalidConsent)?;
+        if !valid_hex(id, 32) || !valid_hex(signature, 64) {
+            return Err(EntrySwitchError::InvalidConsent);
+        }
+        let signature = decode_hex_32(signature).ok_or(EntrySwitchError::InvalidConsent)?;
+        let mut mac =
+            HmacSha256::new_from_slice(&key.0[..]).map_err(|_| EntrySwitchError::InvalidConsent)?;
+        mac.update(&canonical_plan(self, id));
+        mac.verify_slice(&signature)
+            .map_err(|_| EntrySwitchError::InvalidConsent)
+    }
+
+    #[must_use]
+    pub fn audit(&self) -> EntrySwitchAudit {
+        EntrySwitchAudit {
+            schema_version: self.schema_version,
+            install_id: self.context.install_id.clone(),
+            user_scope_id: self.context.user_scope_id.clone(),
+            config_generation: self.config_generation,
+            current: self.current.clone(),
+            target: self.target.clone(),
+            apply_system_proxy: self.apply_system_proxy,
+            original_proxy_fingerprint: self
+                .original_proxy
+                .as_ref()
+                .map(SystemProxySnapshot::fingerprint),
+            desired_proxy_fingerprint: self
+                .desired_proxy
+                .as_ref()
+                .map(SystemProxySnapshot::fingerprint),
+            consent_id: self.consent.token_id().unwrap_or("invalid").into(),
+            expires_at_unix_ms: self.consent.expires_at_unix_ms,
+        }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntrySwitchAudit {
+    pub schema_version: u16,
+    pub install_id: String,
+    pub user_scope_id: String,
+    pub config_generation: u64,
+    pub current: EntryConfig,
+    pub target: EntryConfig,
+    pub apply_system_proxy: bool,
+    pub original_proxy_fingerprint: Option<String>,
+    pub desired_proxy_fingerprint: Option<String>,
+    pub consent_id: String,
+    pub expires_at_unix_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntrySwitchPhase {
     Prepared,
+    StagePending,
     Staged,
     Verified,
     EntryCommitPending,
@@ -271,13 +409,104 @@ pub enum EntrySwitchPhase {
     Restored,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EntrySwitchJournalRecord {
     pub schema_version: u16,
     pub phase: EntrySwitchPhase,
     pub plan: EntrySwitchPlan,
+    pub stage_declaration: Option<StageDeclaration>,
     pub staged_core: Option<OwnedCoreIdentity>,
+}
+
+impl EntrySwitchJournalRecord {
+    /// Validates authenticated recovery invariants against the held authority.
+    ///
+    /// # Errors
+    /// Returns a journal or authority error for an impossible or foreign record.
+    pub fn validate_recovery(
+        &self,
+        key: &ConsentKey,
+        authority: &impl EntrySwitchAuthorityGuard,
+    ) -> Result<(), EntrySwitchError> {
+        self.plan.validate_integrity(key)?;
+        if self.schema_version != SCHEMA_VERSION
+            || authority.context() != &self.plan.context
+            || authority.generation() != self.plan.config_generation
+        {
+            return Err(EntrySwitchError::Unauthorized);
+        }
+        let shape = match self.phase {
+            EntrySwitchPhase::Prepared => {
+                self.stage_declaration.is_none() && self.staged_core.is_none()
+            }
+            EntrySwitchPhase::StagePending => {
+                self.stage_declaration
+                    .as_ref()
+                    .is_some_and(|d| d.valid(self.plan.config_generation))
+                    && self.staged_core.is_none()
+            }
+            EntrySwitchPhase::RollbackRequired | EntrySwitchPhase::Restored => {
+                recovery_identity_shape(self)
+            }
+            _ => {
+                self.stage_declaration
+                    .as_ref()
+                    .is_some_and(|d| d.valid(self.plan.config_generation))
+                    && self
+                        .staged_core
+                        .as_ref()
+                        .zip(self.stage_declaration.as_ref())
+                        .is_some_and(|(core, declaration)| core.matches(declaration))
+            }
+        };
+        if !shape {
+            return Err(EntrySwitchError::Journal);
+        }
+        Ok(())
+    }
+
+    fn validate_shape(&self) -> Result<(), EntrySwitchError> {
+        let shape = match self.phase {
+            EntrySwitchPhase::Prepared => {
+                self.stage_declaration.is_none() && self.staged_core.is_none()
+            }
+            EntrySwitchPhase::StagePending => {
+                self.stage_declaration
+                    .as_ref()
+                    .is_some_and(|d| d.valid(self.plan.config_generation))
+                    && self.staged_core.is_none()
+            }
+            EntrySwitchPhase::RollbackRequired | EntrySwitchPhase::Restored => {
+                recovery_identity_shape(self)
+            }
+            _ => {
+                self.stage_declaration
+                    .as_ref()
+                    .is_some_and(|d| d.valid(self.plan.config_generation))
+                    && self
+                        .staged_core
+                        .as_ref()
+                        .zip(self.stage_declaration.as_ref())
+                        .is_some_and(|(core, declaration)| core.matches(declaration))
+            }
+        };
+        if shape {
+            Ok(())
+        } else {
+            Err(EntrySwitchError::Journal)
+        }
+    }
+}
+
+fn recovery_identity_shape(record: &EntrySwitchJournalRecord) -> bool {
+    match (&record.stage_declaration, &record.staged_core) {
+        (None, None) => true,
+        (Some(declaration), None) => declaration.valid(record.plan.config_generation),
+        (Some(declaration), Some(core)) => {
+            declaration.valid(record.plan.config_generation) && core.matches(declaration)
+        }
+        (None, Some(_)) => false,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,7 +516,6 @@ pub struct SwitchVerification {
     pub fail_closed_selected: bool,
     pub generation: u64,
 }
-
 impl SwitchVerification {
     fn validates(&self, generation: u64) -> bool {
         self.controller_owned
@@ -328,10 +556,22 @@ pub trait EntryBackend {
     fn config_generation(&self) -> Result<u64, EntrySwitchError>;
     fn current_entry(&self) -> Result<EntryConfig, EntrySwitchError>;
     fn inspect_port(&mut self, target: &EntryConfig) -> Result<PortOwnership, EntrySwitchError>;
-    fn stage(&mut self, plan: &EntrySwitchPlan) -> Result<OwnedCoreIdentity, EntrySwitchError>;
+    fn declare_stage(
+        &mut self,
+        plan: &EntrySwitchPlan,
+    ) -> Result<StageDeclaration, EntrySwitchError>;
+    fn stage(
+        &mut self,
+        plan: &EntrySwitchPlan,
+        declaration: &StageDeclaration,
+    ) -> Result<OwnedCoreIdentity, EntrySwitchError>;
     fn verify(&mut self, core: &OwnedCoreIdentity) -> Result<SwitchVerification, EntrySwitchError>;
     fn commit_entry(&mut self, plan: &EntrySwitchPlan) -> Result<(), EntrySwitchError>;
     fn restore_entry(&mut self, entry: &EntryConfig) -> Result<(), EntrySwitchError>;
+    fn stop_declared_if_owned(
+        &mut self,
+        declaration: &StageDeclaration,
+    ) -> Result<(), EntrySwitchError>;
     fn stop_if_owned(&mut self, core: &OwnedCoreIdentity) -> Result<(), EntrySwitchError>;
 }
 
@@ -339,8 +579,8 @@ pub trait EntryBackend {
 pub trait ProxyBackend {
     fn capability(&self) -> ProxyCapability;
     fn snapshot(&mut self) -> Result<SystemProxySnapshot, EntrySwitchError>;
-    /// Returns false rather than overwriting a concurrently changed snapshot.
-    fn compare_and_set(
+    /// Query followed by apply; this is not atomic and production remains blocked.
+    fn compare_then_apply(
         &mut self,
         expected_fingerprint: &str,
         replacement: &SystemProxySnapshot,
@@ -353,150 +593,438 @@ pub trait EntrySwitchJournal {
     fn load(&self) -> Result<Option<EntrySwitchJournalRecord>, EntrySwitchError>;
     fn save(&mut self, record: &EntrySwitchJournalRecord) -> Result<(), EntrySwitchError>;
     fn clear(&mut self) -> Result<(), EntrySwitchError>;
-    /// Atomically records first use. Returns false for a replay.
-    fn consume_consent(&mut self, plan_fingerprint: &str) -> Result<bool, EntrySwitchError>;
+    /// Must atomically prune only expired IDs and record this unexpired ID.
+    fn consume_consent(
+        &mut self,
+        token_id: &str,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, EntrySwitchError>;
 }
 
 #[derive(Default)]
 pub struct MemoryEntrySwitchJournal {
     record: Option<EntrySwitchJournalRecord>,
-    consumed: BTreeSet<String>,
+    consumed: BTreeMap<String, i64>,
 }
-
 impl EntrySwitchJournal for MemoryEntrySwitchJournal {
     fn load(&self) -> Result<Option<EntrySwitchJournalRecord>, EntrySwitchError> {
         Ok(self.record.clone())
     }
-
     fn save(&mut self, record: &EntrySwitchJournalRecord) -> Result<(), EntrySwitchError> {
         self.record = Some(record.clone());
         Ok(())
     }
-
     fn clear(&mut self) -> Result<(), EntrySwitchError> {
         self.record = None;
         Ok(())
     }
-
-    fn consume_consent(&mut self, plan_fingerprint: &str) -> Result<bool, EntrySwitchError> {
-        Ok(self.consumed.insert(plan_fingerprint.into()))
-    }
-}
-
-/// Durable, bounded journal. Writes use the core's atomic-save + adjacent
-/// last-known-good protocol; cleanup durably flushes the parent directory.
-pub struct FileEntrySwitchJournal {
-    path: PathBuf,
-}
-
-impl FileEntrySwitchJournal {
-    #[must_use]
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    fn read_path(path: &std::path::Path) -> Result<EntrySwitchJournalRecord, EntrySwitchError> {
-        let bytes = fs::read(path).map_err(|_| EntrySwitchError::Journal)?;
-        if bytes.is_empty() || bytes.len() > 1024 * 1024 {
-            return Err(EntrySwitchError::Journal);
-        }
-        let record: EntrySwitchJournalRecord =
-            serde_json::from_slice(&bytes).map_err(|_| EntrySwitchError::Journal)?;
-        if record.schema_version != SCHEMA_VERSION || record.plan.schema_version != SCHEMA_VERSION {
-            return Err(EntrySwitchError::Journal);
-        }
-        Ok(record)
-    }
-
-    fn consumed_path(&self) -> PathBuf {
-        self.path.with_extension("consumed.json")
-    }
-}
-
-impl EntrySwitchJournal for FileEntrySwitchJournal {
-    fn load(&self) -> Result<Option<EntrySwitchJournalRecord>, EntrySwitchError> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        match Self::read_path(&self.path) {
-            Ok(record) => Ok(Some(record)),
-            Err(_) => Self::read_path(&self.path.with_extension("json.bak")).map(Some),
-        }
-    }
-
-    fn save(&mut self, record: &EntrySwitchJournalRecord) -> Result<(), EntrySwitchError> {
-        let bytes = serde_json::to_vec(record).map_err(|_| EntrySwitchError::Journal)?;
-        crate::durable_atomic_save_with_backup(&self.path, &bytes, &crate::SystemDurableFileOps)
-            .map_err(|_| EntrySwitchError::Journal)
-    }
-
-    fn clear(&mut self) -> Result<(), EntrySwitchError> {
-        crate::durable_remove_if_exists(&self.path, &crate::SystemDurableFileOps)
-            .map_err(|_| EntrySwitchError::Journal)?;
-        crate::durable_remove_if_exists(
-            &self.path.with_extension("json.bak"),
-            &crate::SystemDurableFileOps,
-        )
-        .map_err(|_| EntrySwitchError::Journal)
-    }
-
-    fn consume_consent(&mut self, plan_fingerprint: &str) -> Result<bool, EntrySwitchError> {
-        if plan_fingerprint.len() != 64
-            || !plan_fingerprint
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err(EntrySwitchError::InvalidConsent);
-        }
-        let path = self.consumed_path();
-        let mut consumed: Vec<String> = if path.exists() {
-            let bytes = fs::read(&path).map_err(|_| EntrySwitchError::Journal)?;
-            if bytes.is_empty() || bytes.len() > 64 * 1024 {
-                return Err(EntrySwitchError::Journal);
-            }
-            serde_json::from_slice(&bytes).map_err(|_| EntrySwitchError::Journal)?
-        } else {
-            Vec::new()
-        };
-        if consumed.len() > 256
-            || consumed.iter().any(|value| {
-                value.len() != 64
-                    || !value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-            })
-        {
-            return Err(EntrySwitchError::Journal);
-        }
-        if consumed.iter().any(|value| value == plan_fingerprint) {
+    fn consume_consent(
+        &mut self,
+        id: &str,
+        expires: i64,
+        now: i64,
+    ) -> Result<bool, EntrySwitchError> {
+        self.consumed.retain(|_, expiry| *expiry >= now);
+        if self.consumed.contains_key(id) {
             return Ok(false);
         }
-        consumed.push(plan_fingerprint.into());
-        if consumed.len() > 256 {
-            consumed.drain(..consumed.len() - 256);
-        }
-        let bytes = serde_json::to_vec(&consumed).map_err(|_| EntrySwitchError::Journal)?;
-        crate::durable_atomic_save_with_backup(&path, &bytes, &crate::SystemDurableFileOps)
-            .map_err(|_| EntrySwitchError::Journal)?;
+        self.consumed.insert(id.into(), expires);
         Ok(true)
     }
 }
 
-pub struct EntrySwitchPlanner;
+/// Current-user confidentiality boundary used by the protected journal codec.
+pub trait ConfidentialProtector {
+    /// # Errors
+    /// Returns an error when current-user protection cannot be applied.
+    fn seal(&self, plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, EntrySwitchError>;
+    /// # Errors
+    /// Returns an error when current-user protection cannot be removed.
+    fn open(&self, ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, EntrySwitchError>;
+}
 
-impl EntrySwitchPlanner {
-    /// Produces a short-lived, snapshot-bound switch plan.
+/// In-memory journal state. It has no serialization implementation; encoding
+/// is possible only through `ProtectedJournalCodec`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProtectedJournalState {
+    pub record: Option<EntrySwitchJournalRecord>,
+    pub consumed: BTreeMap<String, i64>,
+}
+
+pub struct ProtectedJournalCodec<'a, P> {
+    context: EntrySwitchContext,
+    key: &'a ConsentKey,
+    protector: &'a P,
+}
+
+impl<'a, P: ConfidentialProtector> ProtectedJournalCodec<'a, P> {
+    #[must_use]
+    pub fn new(context: EntrySwitchContext, key: &'a ConsentKey, protector: &'a P) -> Self {
+        Self {
+            context,
+            key,
+            protector,
+        }
+    }
+
+    /// Authenticates and encrypts a complete journal state.
     ///
     /// # Errors
-    /// Returns a fail-closed error for an invalid entry, stale generation,
-    /// occupied port, unsupported proxy scope, or backend failure.
+    /// Returns a journal error for invalid state or protection failure.
+    pub fn seal(&self, state: &ProtectedJournalState) -> Result<Vec<u8>, EntrySwitchError> {
+        self.context.validate()?;
+        if state.consumed.len() > 4096
+            || state
+                .consumed
+                .iter()
+                .any(|(id, expiry)| !valid_hex(id, 32) || *expiry < 0)
+        {
+            return Err(EntrySwitchError::Journal);
+        }
+        if let Some(record) = &state.record {
+            record.plan.validate_integrity(self.key)?;
+            record.validate_shape()?;
+            if record.plan.context != self.context {
+                return Err(EntrySwitchError::Journal);
+            }
+        }
+        let payload = JournalPayloadWire {
+            schema_version: SCHEMA_VERSION,
+            context: self.context.clone(),
+            record: state.record.as_ref().map(RecordWire::from),
+            consumed: state.consumed.clone(),
+        };
+        let payload_bytes = serde_json::to_vec(&payload).map_err(|_| EntrySwitchError::Journal)?;
+        let mut mac =
+            HmacSha256::new_from_slice(&self.key.0[..]).map_err(|_| EntrySwitchError::Journal)?;
+        mac.update(&payload_bytes);
+        let envelope = JournalEnvelopeWire {
+            payload,
+            mac: hex(&mac.finalize().into_bytes()),
+        };
+        let plaintext = serde_json::to_vec(&envelope).map_err(|_| EntrySwitchError::Journal)?;
+        self.protector
+            .seal(&plaintext, &journal_entropy(&self.context))
+    }
+
+    /// Decrypts and authenticates a complete journal state.
+    ///
+    /// # Errors
+    /// Returns a journal error for altered, foreign, or malformed ciphertext.
+    pub fn open(&self, ciphertext: &[u8]) -> Result<ProtectedJournalState, EntrySwitchError> {
+        if ciphertext.is_empty() || ciphertext.len() > 1024 * 1024 {
+            return Err(EntrySwitchError::Journal);
+        }
+        let plaintext = self
+            .protector
+            .open(ciphertext, &journal_entropy(&self.context))?;
+        let envelope: JournalEnvelopeWire =
+            serde_json::from_slice(&plaintext).map_err(|_| EntrySwitchError::Journal)?;
+        if envelope.payload.schema_version != SCHEMA_VERSION
+            || envelope.payload.context != self.context
+            || !valid_hex(&envelope.mac, 64)
+        {
+            return Err(EntrySwitchError::Journal);
+        }
+        let payload_bytes =
+            serde_json::to_vec(&envelope.payload).map_err(|_| EntrySwitchError::Journal)?;
+        let signature = decode_hex_32(&envelope.mac).ok_or(EntrySwitchError::Journal)?;
+        let mut mac =
+            HmacSha256::new_from_slice(&self.key.0[..]).map_err(|_| EntrySwitchError::Journal)?;
+        mac.update(&payload_bytes);
+        mac.verify_slice(&signature)
+            .map_err(|_| EntrySwitchError::Journal)?;
+        if envelope.payload.consumed.len() > 4096
+            || envelope
+                .payload
+                .consumed
+                .iter()
+                .any(|(id, expiry)| !valid_hex(id, 32) || *expiry < 0)
+        {
+            return Err(EntrySwitchError::Journal);
+        }
+        let record = envelope
+            .payload
+            .record
+            .map(EntrySwitchJournalRecord::try_from)
+            .transpose()?;
+        if let Some(record) = &record {
+            record.plan.validate_integrity(self.key)?;
+            record.validate_shape()?;
+        }
+        Ok(ProtectedJournalState {
+            record,
+            consumed: envelope.payload.consumed,
+        })
+    }
+}
+
+fn journal_entropy(context: &EntrySwitchContext) -> Vec<u8> {
+    let mut bytes = b"vpn-hub/entry-switch/v2".to_vec();
+    put_str(&mut bytes, &context.install_id);
+    put_str(&mut bytes, &context.user_scope_id);
+    bytes
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalEnvelopeWire {
+    payload: JournalPayloadWire,
+    mac: String,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalPayloadWire {
+    schema_version: u16,
+    context: EntrySwitchContext,
+    record: Option<RecordWire>,
+    consumed: BTreeMap<String, i64>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordWire {
+    schema_version: u16,
+    phase: u8,
+    plan: PlanWire,
+    stage_declaration: Option<StageWire>,
+    staged_core: Option<CoreWire>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanWire {
+    schema_version: u16,
+    context: EntrySwitchContext,
+    config_generation: u64,
+    current: EntryConfig,
+    target: EntryConfig,
+    apply_system_proxy: bool,
+    original_proxy: Option<ProxyWire>,
+    desired_proxy: Option<ProxyWire>,
+    token: String,
+    issued_at_unix_ms: i64,
+    expires_at_unix_ms: i64,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyWire {
+    mode: u8,
+    direct: bool,
+    manual_proxy: Option<String>,
+    proxy_bypass: Option<String>,
+    auto_config_url: Option<String>,
+    auto_detect: bool,
+    connection_name: Option<String>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StageWire {
+    transaction_id: String,
+    ownership_token: String,
+    generation: u64,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreWire {
+    pid: u32,
+    creation_identity: u64,
+    generation: u64,
+    transaction_id: String,
+    ownership_token: String,
+}
+
+impl From<&EntrySwitchJournalRecord> for RecordWire {
+    fn from(v: &EntrySwitchJournalRecord) -> Self {
+        Self {
+            schema_version: v.schema_version,
+            phase: phase_to_u8(v.phase),
+            plan: PlanWire::from(&v.plan),
+            stage_declaration: v.stage_declaration.as_ref().map(StageWire::from),
+            staged_core: v.staged_core.as_ref().map(CoreWire::from),
+        }
+    }
+}
+impl TryFrom<RecordWire> for EntrySwitchJournalRecord {
+    type Error = EntrySwitchError;
+    fn try_from(v: RecordWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema_version: v.schema_version,
+            phase: u8_to_phase(v.phase)?,
+            plan: v.plan.try_into()?,
+            stage_declaration: v.stage_declaration.map(Into::into),
+            staged_core: v.staged_core.map(Into::into),
+        })
+    }
+}
+impl From<&EntrySwitchPlan> for PlanWire {
+    fn from(v: &EntrySwitchPlan) -> Self {
+        Self {
+            schema_version: v.schema_version,
+            context: v.context.clone(),
+            config_generation: v.config_generation,
+            current: v.current.clone(),
+            target: v.target.clone(),
+            apply_system_proxy: v.apply_system_proxy,
+            original_proxy: v.original_proxy.as_ref().map(ProxyWire::from),
+            desired_proxy: v.desired_proxy.as_ref().map(ProxyWire::from),
+            token: v.consent.token.clone(),
+            issued_at_unix_ms: v.consent.issued_at_unix_ms,
+            expires_at_unix_ms: v.consent.expires_at_unix_ms,
+        }
+    }
+}
+impl TryFrom<PlanWire> for EntrySwitchPlan {
+    type Error = EntrySwitchError;
+    fn try_from(v: PlanWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            schema_version: v.schema_version,
+            context: v.context,
+            config_generation: v.config_generation,
+            current: v.current,
+            target: v.target,
+            apply_system_proxy: v.apply_system_proxy,
+            original_proxy: v
+                .original_proxy
+                .map(SystemProxySnapshot::try_from)
+                .transpose()?,
+            desired_proxy: v
+                .desired_proxy
+                .map(SystemProxySnapshot::try_from)
+                .transpose()?,
+            consent: EntrySwitchConsent {
+                token: v.token,
+                issued_at_unix_ms: v.issued_at_unix_ms,
+                expires_at_unix_ms: v.expires_at_unix_ms,
+            },
+        })
+    }
+}
+impl From<&SystemProxySnapshot> for ProxyWire {
+    fn from(v: &SystemProxySnapshot) -> Self {
+        Self {
+            mode: match v.mode {
+                WindowsProxyMode::Direct => 0,
+                WindowsProxyMode::Manual => 1,
+                WindowsProxyMode::AutoConfig => 2,
+                WindowsProxyMode::Combined => 3,
+            },
+            direct: v.direct,
+            manual_proxy: v.manual_proxy.clone(),
+            proxy_bypass: v.proxy_bypass.clone(),
+            auto_config_url: v.auto_config_url.clone(),
+            auto_detect: v.auto_detect,
+            connection_name: v.connection_name.clone(),
+        }
+    }
+}
+impl TryFrom<ProxyWire> for SystemProxySnapshot {
+    type Error = EntrySwitchError;
+    fn try_from(v: ProxyWire) -> Result<Self, Self::Error> {
+        let value = Self {
+            mode: match v.mode {
+                0 => WindowsProxyMode::Direct,
+                1 => WindowsProxyMode::Manual,
+                2 => WindowsProxyMode::AutoConfig,
+                3 => WindowsProxyMode::Combined,
+                _ => return Err(EntrySwitchError::Journal),
+            },
+            direct: v.direct,
+            manual_proxy: v.manual_proxy,
+            proxy_bypass: v.proxy_bypass,
+            auto_config_url: v.auto_config_url,
+            auto_detect: v.auto_detect,
+            connection_name: v.connection_name,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+}
+impl From<&StageDeclaration> for StageWire {
+    fn from(v: &StageDeclaration) -> Self {
+        Self {
+            transaction_id: v.transaction_id.clone(),
+            ownership_token: v.ownership_token.clone(),
+            generation: v.generation,
+        }
+    }
+}
+impl From<StageWire> for StageDeclaration {
+    fn from(v: StageWire) -> Self {
+        Self {
+            transaction_id: v.transaction_id,
+            ownership_token: v.ownership_token,
+            generation: v.generation,
+        }
+    }
+}
+impl From<&OwnedCoreIdentity> for CoreWire {
+    fn from(v: &OwnedCoreIdentity) -> Self {
+        Self {
+            pid: v.pid,
+            creation_identity: v.creation_identity,
+            generation: v.generation,
+            transaction_id: v.transaction_id.clone(),
+            ownership_token: v.ownership_token.clone(),
+        }
+    }
+}
+impl From<CoreWire> for OwnedCoreIdentity {
+    fn from(v: CoreWire) -> Self {
+        Self {
+            pid: v.pid,
+            creation_identity: v.creation_identity,
+            generation: v.generation,
+            transaction_id: v.transaction_id,
+            ownership_token: v.ownership_token,
+        }
+    }
+}
+fn phase_to_u8(v: EntrySwitchPhase) -> u8 {
+    match v {
+        EntrySwitchPhase::Prepared => 0,
+        EntrySwitchPhase::StagePending => 1,
+        EntrySwitchPhase::Staged => 2,
+        EntrySwitchPhase::Verified => 3,
+        EntrySwitchPhase::EntryCommitPending => 4,
+        EntrySwitchPhase::EntryCommitted => 5,
+        EntrySwitchPhase::ProxyApplyPending => 6,
+        EntrySwitchPhase::ProxyApplied => 7,
+        EntrySwitchPhase::RollbackRequired => 8,
+        EntrySwitchPhase::Restored => 9,
+    }
+}
+fn u8_to_phase(v: u8) -> Result<EntrySwitchPhase, EntrySwitchError> {
+    match v {
+        0 => Ok(EntrySwitchPhase::Prepared),
+        1 => Ok(EntrySwitchPhase::StagePending),
+        2 => Ok(EntrySwitchPhase::Staged),
+        3 => Ok(EntrySwitchPhase::Verified),
+        4 => Ok(EntrySwitchPhase::EntryCommitPending),
+        5 => Ok(EntrySwitchPhase::EntryCommitted),
+        6 => Ok(EntrySwitchPhase::ProxyApplyPending),
+        7 => Ok(EntrySwitchPhase::ProxyApplied),
+        8 => Ok(EntrySwitchPhase::RollbackRequired),
+        9 => Ok(EntrySwitchPhase::Restored),
+        _ => Err(EntrySwitchError::Journal),
+    }
+}
+
+pub struct EntrySwitchPlanner;
+impl EntrySwitchPlanner {
+    /// Builds a keyed, short-lived plan without mutating entry or proxy state.
+    ///
+    /// # Errors
+    /// Returns a fail-closed error for invalid scope, occupancy, time, or state.
     pub fn preview<E: EntryBackend, P: ProxyBackend>(
         entry: &mut E,
         proxy: &mut P,
         request: &EntrySwitchRequest,
-        now_ms: i64,
+        context: EntrySwitchContext,
+        key: &ConsentKey,
+        clock: &impl TrustedClock,
     ) -> Result<EntrySwitchPlan, EntrySwitchError> {
         validate_entry(&request.target)?;
+        context.validate()?;
         let generation = entry.config_generation()?;
         if generation == 0 || generation != request.expected_config_generation {
             return Err(EntrySwitchError::StaleGeneration);
@@ -508,95 +1036,98 @@ impl EntrySwitchPlanner {
         }
         match entry.inspect_port(&request.target)? {
             PortOwnership::Free => {}
-            PortOwnership::OwnedByVpnHub(identity) if identity.is_valid_for(generation) => {}
-            PortOwnership::OwnedByVpnHub(_)
-            | PortOwnership::UnknownOccupied
-            | PortOwnership::ThirdPartyOccupied => {
-                return Err(EntrySwitchError::PortUnavailable);
-            }
+            PortOwnership::OwnedByVpnHub(identity) if identity.generation == generation => {}
+            _ => return Err(EntrySwitchError::PortUnavailable),
         }
         let original_proxy = if request.apply_system_proxy {
             if proxy.capability() != ProxyCapability::SupportedDefaultLanCurrentUser {
                 return Err(EntrySwitchError::UnsupportedProxyScope);
             }
-            let snapshot = proxy.snapshot()?;
-            snapshot.validate()?;
-            Some(snapshot)
+            let value = proxy.snapshot()?;
+            value.validate()?;
+            Some(value)
         } else {
             None
         };
-        let desired_proxy = original_proxy.as_ref().map(|snapshot| {
-            SystemProxySnapshot::for_entry(&request.target, snapshot.proxy_bypass.clone())
-        });
-        let mut nonce_bytes = [0_u8; 16];
-        rand::rng().fill_bytes(&mut nonce_bytes);
-        let nonce = hex(&nonce_bytes);
+        let desired_proxy = original_proxy
+            .as_ref()
+            .map(|v| SystemProxySnapshot::for_entry(&request.target, v.proxy_bypass.clone()));
+        let issued = clock.now_unix_ms()?;
+        if issued < 0 {
+            return Err(EntrySwitchError::InvalidConsent);
+        }
+        let expires = issued
+            .checked_add(CONSENT_LIFETIME_MS)
+            .ok_or(EntrySwitchError::InvalidConsent)?;
+        let mut id_bytes = [0; 16];
+        rand::rng().fill_bytes(&mut id_bytes);
+        let id = hex(&id_bytes);
         let mut plan = EntrySwitchPlan {
             schema_version: SCHEMA_VERSION,
+            context,
             config_generation: generation,
-            current: current.clone(),
+            current,
             target: request.target.clone(),
             apply_system_proxy: request.apply_system_proxy,
             original_proxy,
             desired_proxy,
             consent: EntrySwitchConsent {
-                schema_version: SCHEMA_VERSION,
-                config_generation: generation,
-                current,
-                target: request.target.clone(),
-                apply_system_proxy: request.apply_system_proxy,
-                proxy_snapshot_fingerprint: String::new(),
-                plan_fingerprint: String::new(),
-                issued_at_unix_ms: now_ms,
-                expires_at_unix_ms: now_ms.saturating_add(CONSENT_LIFETIME_MS),
-                nonce: nonce.clone(),
+                token: String::new(),
+                issued_at_unix_ms: issued,
+                expires_at_unix_ms: expires,
             },
         };
-        plan.consent.proxy_snapshot_fingerprint = plan.original_proxy.as_ref().map_or_else(
-            || NO_PROXY_SNAPSHOT.into(),
-            SystemProxySnapshot::fingerprint,
-        );
-        plan.consent.plan_fingerprint = plan_fingerprint(&plan, &nonce);
-        plan.validate(now_ms)?;
+        let mut mac =
+            HmacSha256::new_from_slice(&key.0[..]).map_err(|_| EntrySwitchError::InvalidConsent)?;
+        mac.update(&canonical_plan(&plan, &id));
+        plan.consent.token = format!("{id}.{}", hex(&mac.finalize().into_bytes()));
+        plan.validate(key, clock)?;
         Ok(plan)
     }
 }
 
-pub struct EntrySwitchTransaction<'a, E, P, J> {
+pub struct EntrySwitchTransaction<'a, E, P, J, A, C> {
     entry: &'a mut E,
     proxy: &'a mut P,
     journal: &'a mut J,
-    authority: UserProxyAuthority,
+    authority: &'a mut A,
+    key: &'a ConsentKey,
+    clock: &'a C,
 }
-
-impl<'a, E, P, J> EntrySwitchTransaction<'a, E, P, J>
+impl<'a, E, P, J, A, C> EntrySwitchTransaction<'a, E, P, J, A, C>
 where
     E: EntryBackend,
     P: ProxyBackend,
     J: EntrySwitchJournal,
+    A: EntrySwitchAuthorityGuard,
+    C: TrustedClock,
 {
     pub fn new(
         entry: &'a mut E,
         proxy: &'a mut P,
         journal: &'a mut J,
-        authority: UserProxyAuthority,
+        authority: &'a mut A,
+        key: &'a ConsentKey,
+        clock: &'a C,
     ) -> Self {
         Self {
             entry,
             proxy,
             journal,
             authority,
+            key,
+            clock,
         }
     }
 
-    /// Applies a valid plan in journaled fail-closed order.
+    /// Applies a journaled switch while continuously holding OS authority.
     ///
     /// # Errors
-    /// Returns a sanitized validation, authority, concurrency, journal,
-    /// verification, backend, or pending-recovery error.
-    pub fn apply(&mut self, plan: EntrySwitchPlan, now_ms: i64) -> Result<(), EntrySwitchError> {
-        plan.validate(now_ms)?;
-        self.authority.validate(plan.config_generation)?;
+    /// Returns a fail-closed error and attempts exact-owned rollback.
+    pub fn apply(&mut self, plan: EntrySwitchPlan) -> Result<(), EntrySwitchError> {
+        self.authority.ensure_held()?;
+        plan.validate(self.key, self.clock)?;
+        self.validate_authority(&plan)?;
         if self.journal.load()?.is_some() {
             return Err(EntrySwitchError::RecoveryPending);
         }
@@ -605,15 +1136,24 @@ where
         {
             return Err(EntrySwitchError::StaleGeneration);
         }
+        let now = self.clock.now_unix_ms()?;
+        let id = plan
+            .consent
+            .token_id()
+            .ok_or(EntrySwitchError::InvalidConsent)?;
         if !self
             .journal
-            .consume_consent(&plan.consent.plan_fingerprint)?
+            .consume_consent(id, plan.consent.expires_at_unix_ms, now)?
         {
             return Err(EntrySwitchError::InvalidConsent);
         }
+        self.authority.ensure_held()?;
         if plan.apply_system_proxy {
-            let current = self.proxy.snapshot()?;
-            if current.fingerprint() != plan.consent.proxy_snapshot_fingerprint {
+            let original = plan
+                .original_proxy
+                .as_ref()
+                .ok_or(EntrySwitchError::InvalidConsent)?;
+            if self.proxy.snapshot()?.fingerprint() != original.fingerprint() {
                 return Err(EntrySwitchError::ConcurrentProxyChange);
             }
         }
@@ -621,6 +1161,7 @@ where
             schema_version: SCHEMA_VERSION,
             phase: EntrySwitchPhase::Prepared,
             plan,
+            stage_declaration: None,
             staged_core: None,
         };
         self.journal.save(&record)?;
@@ -639,18 +1180,25 @@ where
         &mut self,
         record: &mut EntrySwitchJournalRecord,
     ) -> Result<(), EntrySwitchError> {
-        let core = self.entry.stage(&record.plan)?;
-        if !core.is_valid_for(record.plan.config_generation) {
+        let declaration = self.entry.declare_stage(&record.plan)?;
+        if !declaration.valid(record.plan.config_generation) {
+            return Err(EntrySwitchError::Backend);
+        }
+        record.stage_declaration = Some(declaration.clone());
+        record.phase = EntrySwitchPhase::StagePending;
+        self.journal.save(record)?;
+        let core = self.entry.stage(&record.plan, &declaration)?;
+        if !core.matches(&declaration) {
             return Err(EntrySwitchError::Backend);
         }
         record.staged_core = Some(core.clone());
         record.phase = EntrySwitchPhase::Staged;
-        if let Err(error) = self.journal.save(record) {
-            let _ = self.entry.stop_if_owned(&core);
-            return Err(error);
-        }
-        let verification = self.entry.verify(&core)?;
-        if !verification.validates(record.plan.config_generation) {
+        self.journal.save(record)?;
+        if !self
+            .entry
+            .verify(&core)?
+            .validates(record.plan.config_generation)
+        {
             return Err(EntrySwitchError::VerificationFailed);
         }
         record.phase = EntrySwitchPhase::Verified;
@@ -660,15 +1208,14 @@ where
         self.entry.commit_entry(&record.plan)?;
         record.phase = EntrySwitchPhase::EntryCommitted;
         self.journal.save(record)?;
-        if let (Some(original), Some(desired)) = (
-            record.plan.original_proxy.as_ref(),
-            record.plan.desired_proxy.as_ref(),
-        ) {
+        if let (Some(original), Some(desired)) =
+            (&record.plan.original_proxy, &record.plan.desired_proxy)
+        {
             record.phase = EntrySwitchPhase::ProxyApplyPending;
             self.journal.save(record)?;
             if !self
                 .proxy
-                .compare_and_set(&original.fingerprint(), desired)?
+                .compare_then_apply(&original.fingerprint(), desired)?
             {
                 return Err(EntrySwitchError::ConcurrentProxyChange);
             }
@@ -678,20 +1225,20 @@ where
                 return Err(EntrySwitchError::VerificationFailed);
             }
         }
-        self.journal.clear()?;
-        Ok(())
+        self.authority.ensure_held()?;
+        self.journal.clear()
     }
 
-    /// Restores an outstanding transaction, if one exists.
+    /// Recovers an authenticated outstanding transaction under the same guard.
     ///
     /// # Errors
-    /// Returns a sanitized authority, concurrency, journal, backend, or
-    /// pending-recovery error. The journal is retained on failure.
+    /// Returns a fail-closed error and retains the journal when recovery is unsafe.
     pub fn recover(&mut self) -> Result<bool, EntrySwitchError> {
+        self.authority.ensure_held()?;
         let Some(mut record) = self.journal.load()? else {
             return Ok(false);
         };
-        self.authority.validate(record.plan.config_generation)?;
+        record.validate_recovery(self.key, self.authority)?;
         self.restore_record(&mut record)?;
         Ok(true)
     }
@@ -700,20 +1247,20 @@ where
         &mut self,
         record: &mut EntrySwitchJournalRecord,
     ) -> Result<(), EntrySwitchError> {
+        self.authority.ensure_held()?;
         if matches!(
             record.phase,
             EntrySwitchPhase::ProxyApplyPending
                 | EntrySwitchPhase::ProxyApplied
                 | EntrySwitchPhase::RollbackRequired
-        ) && let (Some(original), Some(desired)) = (
-            record.plan.original_proxy.as_ref(),
-            record.plan.desired_proxy.as_ref(),
-        ) {
+        ) && let (Some(original), Some(desired)) =
+            (&record.plan.original_proxy, &record.plan.desired_proxy)
+        {
             let current = self.proxy.snapshot()?;
             if current == *desired {
                 if !self
                     .proxy
-                    .compare_and_set(&desired.fingerprint(), original)?
+                    .compare_then_apply(&desired.fingerprint(), original)?
                     || !self.proxy.verify(original)?
                 {
                     return Err(EntrySwitchError::RecoveryPending);
@@ -734,75 +1281,169 @@ where
         }
         if let Some(core) = &record.staged_core {
             self.entry.stop_if_owned(core)?;
+        } else if let Some(declaration) = &record.stage_declaration {
+            self.entry.stop_declared_if_owned(declaration)?;
         }
         record.phase = EntrySwitchPhase::Restored;
         self.journal.save(record)?;
-        self.journal.clear()?;
+        self.authority.ensure_held()?;
+        self.journal.clear()
+    }
+
+    fn validate_authority(&self, plan: &EntrySwitchPlan) -> Result<(), EntrySwitchError> {
+        if self.authority.context() != &plan.context
+            || self.authority.generation() != plan.config_generation
+        {
+            return Err(EntrySwitchError::Unauthorized);
+        }
         Ok(())
     }
 }
 
 fn validate_entry(entry: &EntryConfig) -> Result<(), EntrySwitchError> {
     if entry.port == 0 || normalize_loopback_host(&entry.host).is_none() {
-        return Err(EntrySwitchError::InvalidEntry);
+        Err(EntrySwitchError::InvalidEntry)
+    } else {
+        Ok(())
     }
-    Ok(())
 }
-
-fn plan_fingerprint(plan: &EntrySwitchPlan, nonce: &str) -> String {
-    #[derive(Serialize)]
-    struct Sealed<'a> {
-        schema_version: u16,
-        config_generation: u64,
-        current: &'a EntryConfig,
-        target: &'a EntryConfig,
-        apply_system_proxy: bool,
-        proxy_snapshot_fingerprint: &'a str,
-        issued_at_unix_ms: i64,
-        expires_at_unix_ms: i64,
-        nonce: &'a str,
+fn valid_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    if !valid_hex(value, 64) {
+        return None;
     }
-    fingerprint(&Sealed {
-        schema_version: plan.schema_version,
-        config_generation: plan.config_generation,
-        current: &plan.current,
-        target: &plan.target,
-        apply_system_proxy: plan.apply_system_proxy,
-        proxy_snapshot_fingerprint: &plan.consent.proxy_snapshot_fingerprint,
-        issued_at_unix_ms: plan.consent.issued_at_unix_ms,
-        expires_at_unix_ms: plan.consent.expires_at_unix_ms,
-        nonce,
-    })
+    let mut out = [0; 32];
+    for (i, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+        out[i] = (nibble(chunk[0])? << 4) | nibble(chunk[1])?;
+    }
+    Some(out)
 }
-
-fn fingerprint<T: Serialize>(value: &T) -> String {
-    let bytes = serde_json::to_vec(value).expect("serializable entry switch value");
-    hex(&Sha256::digest(bytes))
+fn nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        _ => None,
+    }
 }
-
+fn put(bytes: &mut Vec<u8>, value: &[u8]) {
+    bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(value);
+}
+fn put_str(bytes: &mut Vec<u8>, value: &str) {
+    put(bytes, value.as_bytes());
+}
+fn put_opt(bytes: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(v) => {
+            bytes.push(1);
+            put_str(bytes, v);
+        }
+        None => bytes.push(0),
+    }
+}
+fn proxy_bytes(v: &SystemProxySnapshot) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.push(match v.mode {
+        WindowsProxyMode::Direct => 0,
+        WindowsProxyMode::Manual => 1,
+        WindowsProxyMode::AutoConfig => 2,
+        WindowsProxyMode::Combined => 3,
+    });
+    b.push(u8::from(v.direct));
+    put_opt(&mut b, v.manual_proxy.as_deref());
+    put_opt(&mut b, v.proxy_bypass.as_deref());
+    put_opt(&mut b, v.auto_config_url.as_deref());
+    b.push(u8::from(v.auto_detect));
+    put_opt(&mut b, v.connection_name.as_deref());
+    b
+}
+fn canonical_plan(plan: &EntrySwitchPlan, id: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&plan.schema_version.to_be_bytes());
+    put_str(&mut b, &plan.context.install_id);
+    put_str(&mut b, &plan.context.user_scope_id);
+    b.extend_from_slice(&plan.config_generation.to_be_bytes());
+    put_str(&mut b, &plan.current.host);
+    b.extend_from_slice(&plan.current.port.to_be_bytes());
+    put_str(&mut b, &plan.target.host);
+    b.extend_from_slice(&plan.target.port.to_be_bytes());
+    b.push(u8::from(plan.apply_system_proxy));
+    for p in [&plan.original_proxy, &plan.desired_proxy] {
+        match p {
+            Some(v) => {
+                b.push(1);
+                put(&mut b, &proxy_bytes(v));
+            }
+            None => b.push(0),
+        }
+    }
+    b.extend_from_slice(&plan.consent.issued_at_unix_ms.to_be_bytes());
+    b.extend_from_slice(&plan.consent.expires_at_unix_ms.to_be_bytes());
+    put_str(&mut b, id);
+    b
+}
 fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut rendered = String::with_capacity(bytes.len() * 2);
+    const D: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        rendered.push(char::from(DIGITS[usize::from(byte >> 4)]));
-        rendered.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+        s.push(char::from(D[usize::from(byte >> 4)]));
+        s.push(char::from(D[usize::from(byte & 15)]));
     }
-    rendered
+    s
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[derive(Default)]
+    struct Clock(i64);
+    impl TrustedClock for Clock {
+        fn now_unix_ms(&self) -> Result<i64, EntrySwitchError> {
+            Ok(self.0)
+        }
+    }
+    struct FakeProtector(u8);
+    impl ConfidentialProtector for FakeProtector {
+        fn seal(&self, plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, EntrySwitchError> {
+            let salt = entropy.iter().fold(self.0, |a, b| a ^ b);
+            Ok(plaintext.iter().map(|b| b ^ salt).collect())
+        }
+        fn open(&self, ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, EntrySwitchError> {
+            self.seal(ciphertext, entropy)
+        }
+    }
+    struct Guard {
+        context: EntrySwitchContext,
+        generation: u64,
+        held: bool,
+    }
+    impl EntrySwitchAuthorityGuard for Guard {
+        fn context(&self) -> &EntrySwitchContext {
+            &self.context
+        }
+        fn generation(&self) -> u64 {
+            self.generation
+        }
+        fn ensure_held(&self) -> Result<(), EntrySwitchError> {
+            if self.held {
+                Ok(())
+            } else {
+                Err(EntrySwitchError::Unauthorized)
+            }
+        }
+    }
     struct FakeEntry {
         generation: u64,
         current: EntryConfig,
-        ownership: Option<PortOwnership>,
-        verification: Option<SwitchVerification>,
+        ownership: PortOwnership,
+        verification: SwitchVerification,
         events: Vec<&'static str>,
     }
-
     impl FakeEntry {
         fn ready() -> Self {
             Self {
@@ -811,18 +1452,34 @@ mod tests {
                     host: "127.0.0.9".into(),
                     port: 41_001,
                 },
-                ownership: Some(PortOwnership::Free),
-                verification: Some(SwitchVerification {
+                ownership: PortOwnership::Free,
+                verification: SwitchVerification {
                     controller_owned: true,
                     enabled_outlets_healthy: true,
                     fail_closed_selected: true,
                     generation: 7,
-                }),
-                events: Vec::new(),
+                },
+                events: vec![],
             }
         }
     }
-
+    fn declaration() -> StageDeclaration {
+        StageDeclaration {
+            transaction_id: "11".repeat(16),
+            ownership_token: "22".repeat(32),
+            generation: 7,
+        }
+    }
+    fn identity() -> OwnedCoreIdentity {
+        let d = declaration();
+        OwnedCoreIdentity {
+            pid: 42,
+            creation_identity: 88,
+            generation: 7,
+            transaction_id: d.transaction_id,
+            ownership_token: d.ownership_token,
+        }
+    }
     impl EntryBackend for FakeEntry {
         fn config_generation(&self) -> Result<u64, EntrySwitchError> {
             Ok(self.generation)
@@ -832,35 +1489,42 @@ mod tests {
         }
         fn inspect_port(&mut self, _: &EntryConfig) -> Result<PortOwnership, EntrySwitchError> {
             self.events.push("inspect");
-            Ok(self
-                .ownership
-                .clone()
-                .unwrap_or(PortOwnership::UnknownOccupied))
+            Ok(self.ownership.clone())
         }
-        fn stage(&mut self, _: &EntrySwitchPlan) -> Result<OwnedCoreIdentity, EntrySwitchError> {
+        fn declare_stage(
+            &mut self,
+            _: &EntrySwitchPlan,
+        ) -> Result<StageDeclaration, EntrySwitchError> {
+            self.events.push("declare");
+            Ok(declaration())
+        }
+        fn stage(
+            &mut self,
+            _: &EntrySwitchPlan,
+            _: &StageDeclaration,
+        ) -> Result<OwnedCoreIdentity, EntrySwitchError> {
             self.events.push("stage");
-            Ok(OwnedCoreIdentity {
-                pid: 42,
-                creation_identity: 88,
-                fencing_epoch: 3,
-                generation: self.generation,
-            })
+            Ok(identity())
         }
         fn verify(
             &mut self,
             _: &OwnedCoreIdentity,
         ) -> Result<SwitchVerification, EntrySwitchError> {
             self.events.push("verify");
-            Ok(self.verification.clone().unwrap())
+            Ok(self.verification.clone())
         }
-        fn commit_entry(&mut self, plan: &EntrySwitchPlan) -> Result<(), EntrySwitchError> {
-            self.events.push("commit_entry");
-            self.current = plan.target.clone();
+        fn commit_entry(&mut self, p: &EntrySwitchPlan) -> Result<(), EntrySwitchError> {
+            self.events.push("commit");
+            self.current = p.target.clone();
             Ok(())
         }
-        fn restore_entry(&mut self, entry: &EntryConfig) -> Result<(), EntrySwitchError> {
-            self.events.push("restore_entry");
-            self.current = entry.clone();
+        fn restore_entry(&mut self, e: &EntryConfig) -> Result<(), EntrySwitchError> {
+            self.events.push("restore");
+            self.current = e.clone();
+            Ok(())
+        }
+        fn stop_declared_if_owned(&mut self, _: &StageDeclaration) -> Result<(), EntrySwitchError> {
+            self.events.push("stop_declared");
             Ok(())
         }
         fn stop_if_owned(&mut self, _: &OwnedCoreIdentity) -> Result<(), EntrySwitchError> {
@@ -868,419 +1532,332 @@ mod tests {
             Ok(())
         }
     }
-
     struct FakeProxy {
-        capability: ProxyCapability,
         current: SystemProxySnapshot,
         calls: usize,
         events: Vec<&'static str>,
     }
-
     impl FakeProxy {
         fn ready() -> Self {
             Self {
-                capability: ProxyCapability::SupportedDefaultLanCurrentUser,
                 current: SystemProxySnapshot {
                     mode: WindowsProxyMode::Combined,
                     direct: true,
-                    manual_proxy: Some("http=old.invalid:8080".into()),
-                    proxy_bypass: Some("<local>;example.invalid".into()),
-                    auto_config_url: Some("https://pac.invalid/proxy.pac".into()),
+                    manual_proxy: Some("http=secret.invalid:8080".into()),
+                    proxy_bypass: Some("<local>;secret.invalid".into()),
+                    auto_config_url: Some("https://secret.invalid/proxy.pac".into()),
                     auto_detect: true,
                     connection_name: None,
                 },
                 calls: 0,
-                events: Vec::new(),
+                events: vec![],
             }
         }
     }
-
     impl ProxyBackend for FakeProxy {
         fn capability(&self) -> ProxyCapability {
-            self.capability
+            ProxyCapability::SupportedDefaultLanCurrentUser
         }
         fn snapshot(&mut self) -> Result<SystemProxySnapshot, EntrySwitchError> {
             self.calls += 1;
             self.events.push("snapshot");
             Ok(self.current.clone())
         }
-        fn compare_and_set(
+        fn compare_then_apply(
             &mut self,
-            expected: &str,
-            replacement: &SystemProxySnapshot,
+            e: &str,
+            r: &SystemProxySnapshot,
         ) -> Result<bool, EntrySwitchError> {
             self.calls += 1;
-            self.events.push("cas");
-            if self.current.fingerprint() != expected {
+            self.events.push("compare_then_apply");
+            if self.current.fingerprint() != e {
                 return Ok(false);
             }
-            self.current = replacement.clone();
+            self.current = r.clone();
             Ok(true)
         }
-        fn verify(&mut self, expected: &SystemProxySnapshot) -> Result<bool, EntrySwitchError> {
+        fn verify(&mut self, e: &SystemProxySnapshot) -> Result<bool, EntrySwitchError> {
             self.calls += 1;
             self.events.push("verify_proxy");
-            Ok(&self.current == expected)
+            Ok(self.current == *e)
         }
     }
-
-    fn request(apply_system_proxy: bool) -> EntrySwitchRequest {
+    fn context() -> EntrySwitchContext {
+        EntrySwitchContext {
+            install_id: "install_0123456789".into(),
+            user_scope_id: "user_01234567890".into(),
+        }
+    }
+    fn guard() -> Guard {
+        Guard {
+            context: context(),
+            generation: 7,
+            held: true,
+        }
+    }
+    fn request(proxy: bool) -> EntrySwitchRequest {
         EntrySwitchRequest {
             expected_config_generation: 7,
             target: EntryConfig {
                 host: "127.0.0.8".into(),
                 port: 41_002,
             },
-            apply_system_proxy,
+            apply_system_proxy: proxy,
         }
     }
-
-    fn authority() -> UserProxyAuthority {
-        UserProxyAuthority {
-            user_scope_id: "0123456789abcdef".into(),
-            generation: 7,
-            fencing_token: 9,
-        }
+    fn plan(
+        proxy: bool,
+        key: &ConsentKey,
+        clock: &Clock,
+    ) -> (FakeEntry, FakeProxy, EntrySwitchPlan) {
+        let mut e = FakeEntry::ready();
+        let mut p = FakeProxy::ready();
+        let plan =
+            EntrySwitchPlanner::preview(&mut e, &mut p, &request(proxy), context(), key, clock)
+                .unwrap();
+        (e, p, plan)
     }
 
     #[test]
-    fn opt_out_never_calls_proxy_backend() {
-        let mut entry = FakeEntry::ready();
-        let mut proxy = FakeProxy::ready();
-        let plan =
-            EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(false), 1_000).unwrap();
-        assert_eq!(proxy.calls, 0);
-        let mut journal = MemoryEntrySwitchJournal::default();
-        EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-            .apply(plan, 1_001)
+    fn opt_out_never_calls_proxy() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let clock = Clock(1_000);
+        let (mut e, mut p, plan) = plan(false, &key, &clock);
+        let mut j = MemoryEntrySwitchJournal::default();
+        let mut a = guard();
+        EntrySwitchTransaction::new(&mut e, &mut p, &mut j, &mut a, &key, &clock)
+            .apply(plan)
             .unwrap();
-        assert_eq!(proxy.calls, 0);
-        assert_eq!(entry.events, ["inspect", "stage", "verify", "commit_entry"]);
+        assert_eq!(p.calls, 0);
     }
-
     #[test]
-    fn proxy_apply_occurs_only_after_fail_closed_verification_and_entry_commit() {
-        let mut entry = FakeEntry::ready();
-        let mut proxy = FakeProxy::ready();
-        let plan =
-            EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(true), 1_000).unwrap();
-        let original = plan.original_proxy.clone().unwrap();
-        let mut journal = MemoryEntrySwitchJournal::default();
-        EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-            .apply(plan, 1_001)
+    fn proxy_is_after_verified_entry_commit() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let clock = Clock(1_000);
+        let (mut e, mut p, plan) = plan(true, &key, &clock);
+        let mut j = MemoryEntrySwitchJournal::default();
+        let mut a = guard();
+        EntrySwitchTransaction::new(&mut e, &mut p, &mut j, &mut a, &key, &clock)
+            .apply(plan)
             .unwrap();
-        assert_eq!(entry.current.port, 41_002);
-        assert_ne!(proxy.current, original);
-        assert_eq!(entry.events, ["inspect", "stage", "verify", "commit_entry"]);
         assert_eq!(
-            proxy.events,
-            ["snapshot", "snapshot", "cas", "verify_proxy"]
+            e.events,
+            ["inspect", "declare", "stage", "verify", "commit"]
+        );
+        assert_eq!(
+            p.events,
+            ["snapshot", "snapshot", "compare_then_apply", "verify_proxy"]
         );
     }
-
     #[test]
-    fn unknown_and_third_party_occupants_fail_closed_without_staging_or_stop() {
-        for ownership in [
-            PortOwnership::UnknownOccupied,
-            PortOwnership::ThirdPartyOccupied,
-        ] {
-            let mut entry = FakeEntry::ready();
-            entry.ownership = Some(ownership);
-            let mut proxy = FakeProxy::ready();
+    fn keyed_consent_binds_every_sensitive_field_and_time() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let other = ConsentKey::from_protected_bytes([8; 32]);
+        let clock = Clock(1_000);
+        let (_, _, plan) = plan(true, &key, &clock);
+        assert_eq!(
+            plan.validate(&other, &clock),
+            Err(EntrySwitchError::InvalidConsent)
+        );
+        let mut cases = vec![];
+        let mut v = plan.clone();
+        v.context.install_id.push('x');
+        cases.push(v);
+        let mut v = plan.clone();
+        v.context.user_scope_id.push('x');
+        cases.push(v);
+        let mut v = plan.clone();
+        v.current.port += 1;
+        cases.push(v);
+        let mut v = plan.clone();
+        v.target.port += 1;
+        cases.push(v);
+        let mut v = plan.clone();
+        v.original_proxy.as_mut().unwrap().manual_proxy = Some("attacker".into());
+        cases.push(v);
+        let mut v = plan.clone();
+        v.desired_proxy.as_mut().unwrap().proxy_bypass = Some("attacker".into());
+        cases.push(v);
+        let mut v = plan.clone();
+        v.config_generation += 1;
+        cases.push(v);
+        for v in cases {
             assert_eq!(
-                EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(false), 1_000),
-                Err(EntrySwitchError::PortUnavailable)
+                v.validate(&key, &clock),
+                Err(EntrySwitchError::InvalidConsent)
             );
-            assert_eq!(entry.events, ["inspect"]);
         }
-    }
-
-    #[test]
-    fn consent_seals_generation_snapshot_expiry_and_is_one_shot() {
-        let mut entry = FakeEntry::ready();
-        let mut proxy = FakeProxy::ready();
-        let plan =
-            EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(true), 1_000).unwrap();
-        let mut expired = plan.clone();
         assert_eq!(
-            expired.validate(121_001),
+            plan.validate(&key, &Clock(121_001)),
             Err(EntrySwitchError::InvalidConsent)
         );
-        expired = plan.clone();
-        expired.target.port += 1;
         assert_eq!(
-            expired.validate(1_001),
+            plan.validate(&key, &Clock(999)),
             Err(EntrySwitchError::InvalidConsent)
         );
-
-        let mut journal = MemoryEntrySwitchJournal::default();
-        EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-            .apply(plan.clone(), 1_001)
-            .unwrap();
+        let mut fake = plan.clone();
+        let digest = hex(&Sha256::digest(canonical_plan(
+            &fake,
+            "00".repeat(16).as_str(),
+        )));
+        fake.consent
+            .replace_token(format!("{}.{}", "00".repeat(16), digest));
         assert_eq!(
-            EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-                .apply(plan, 1_002),
-            Err(EntrySwitchError::StaleGeneration)
+            fake.validate(&key, &clock),
+            Err(EntrySwitchError::InvalidConsent)
         );
     }
-
     #[test]
-    fn failed_verification_restores_entry_and_never_applies_proxy() {
-        let mut entry = FakeEntry::ready();
-        let mut proxy = FakeProxy::ready();
-        let plan =
-            EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(true), 1_000).unwrap();
-        entry.verification.as_mut().unwrap().fail_closed_selected = false;
-        let original_entry = entry.current.clone();
-        let original_proxy = proxy.current.clone();
-        let mut journal = MemoryEntrySwitchJournal::default();
+    fn clock_overflow_and_extremes_fail_closed() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let mut e = FakeEntry::ready();
+        let mut p = FakeProxy::ready();
         assert_eq!(
-            EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-                .apply(plan.clone(), 1_001),
-            Err(EntrySwitchError::VerificationFailed)
+            EntrySwitchPlanner::preview(
+                &mut e,
+                &mut p,
+                &request(false),
+                context(),
+                &key,
+                &Clock(i64::MAX)
+            ),
+            Err(EntrySwitchError::InvalidConsent)
         );
-        assert_eq!(entry.current, original_entry);
-        assert_eq!(proxy.current, original_proxy);
-        assert!(entry.events.ends_with(&["stop_owned"]));
         assert_eq!(
-            EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-                .apply(plan, 1_002),
-            Err(EntrySwitchError::InvalidConsent),
-            "a failed attempt still consumes its consent"
+            EntrySwitchPlanner::preview(
+                &mut e,
+                &mut p,
+                &request(false),
+                context(),
+                &key,
+                &Clock(-1)
+            ),
+            Err(EntrySwitchError::InvalidConsent)
         );
     }
-
     #[test]
-    fn recovery_uses_proxy_cas_and_never_overwrites_manual_user_change() {
-        let mut entry = FakeEntry::ready();
-        let mut proxy = FakeProxy::ready();
-        let plan =
-            EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(true), 1_000).unwrap();
-        let desired = plan.desired_proxy.clone().unwrap();
-        let core = OwnedCoreIdentity {
-            pid: 42,
-            creation_identity: 88,
-            fencing_epoch: 3,
-            generation: 7,
-        };
-        entry.current = plan.target.clone();
-        proxy.current = desired;
-        let mut journal = MemoryEntrySwitchJournal {
+    fn stage_pending_recovery_stops_declared_effect() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let clock = Clock(1_000);
+        let (mut e, mut p, plan) = plan(false, &key, &clock);
+        let mut j = MemoryEntrySwitchJournal {
             record: Some(EntrySwitchJournalRecord {
                 schema_version: SCHEMA_VERSION,
-                phase: EntrySwitchPhase::ProxyApplied,
-                plan: plan.clone(),
-                staged_core: Some(core),
-            }),
-            ..MemoryEntrySwitchJournal::default()
-        };
-        EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-            .recover()
-            .unwrap();
-        assert_eq!(entry.current, plan.current);
-        assert_eq!(proxy.current, plan.original_proxy.unwrap());
-
-        let mut entry = FakeEntry::ready();
-        let mut proxy = FakeProxy::ready();
-        let plan =
-            EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(true), 2_000).unwrap();
-        proxy.current = SystemProxySnapshot {
-            manual_proxy: Some("user-change.invalid:9000".into()),
-            ..proxy.current.clone()
-        };
-        let mut journal = MemoryEntrySwitchJournal {
-            record: Some(EntrySwitchJournalRecord {
-                schema_version: SCHEMA_VERSION,
-                phase: EntrySwitchPhase::ProxyApplied,
+                phase: EntrySwitchPhase::StagePending,
                 plan,
+                stage_declaration: Some(declaration()),
                 staged_core: None,
             }),
-            ..MemoryEntrySwitchJournal::default()
+            ..Default::default()
         };
-        assert_eq!(
-            EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-                .recover(),
-            Err(EntrySwitchError::ConcurrentProxyChange)
-        );
-        assert!(journal.load().unwrap().is_some());
+        let mut a = guard();
+        EntrySwitchTransaction::new(&mut e, &mut p, &mut j, &mut a, &key, &clock)
+            .recover()
+            .unwrap();
+        assert!(e.events.ends_with(&["stop_declared"]));
+        assert!(j.load().unwrap().is_none());
     }
-
     #[test]
-    fn pending_intents_recover_whether_or_not_each_effect_happened() {
-        for entry_effect_happened in [false, true] {
-            let mut entry = FakeEntry::ready();
-            let mut proxy = FakeProxy::ready();
-            let plan = EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(false), 3_000)
-                .unwrap();
-            if entry_effect_happened {
-                entry.current = plan.target.clone();
-            }
-            let core = OwnedCoreIdentity {
-                pid: 42,
-                creation_identity: 88,
-                fencing_epoch: 3,
-                generation: 7,
-            };
-            let mut journal = MemoryEntrySwitchJournal {
-                record: Some(EntrySwitchJournalRecord {
-                    schema_version: SCHEMA_VERSION,
-                    phase: EntrySwitchPhase::EntryCommitPending,
-                    plan: plan.clone(),
-                    staged_core: Some(core),
-                }),
-                ..MemoryEntrySwitchJournal::default()
-            };
-            EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-                .recover()
-                .unwrap();
-            assert_eq!(entry.current, plan.current);
-            assert!(journal.load().unwrap().is_none());
-        }
-
-        for proxy_effect_happened in [false, true] {
-            let mut entry = FakeEntry::ready();
-            let mut proxy = FakeProxy::ready();
-            let plan =
-                EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(true), 4_000).unwrap();
-            entry.current = plan.target.clone();
-            if proxy_effect_happened {
-                proxy.current = plan.desired_proxy.clone().unwrap();
-            }
-            let mut journal = MemoryEntrySwitchJournal {
-                record: Some(EntrySwitchJournalRecord {
-                    schema_version: SCHEMA_VERSION,
-                    phase: EntrySwitchPhase::ProxyApplyPending,
-                    plan: plan.clone(),
-                    staged_core: None,
-                }),
-                ..MemoryEntrySwitchJournal::default()
-            };
-            EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-                .recover()
-                .unwrap();
-            assert_eq!(entry.current, plan.current);
-            assert_eq!(proxy.current, plan.original_proxy.unwrap());
-            assert!(journal.load().unwrap().is_none());
-        }
-    }
-
-    struct PhaseFailJournal {
-        inner: MemoryEntrySwitchJournal,
-        fail_once_at: EntrySwitchPhase,
-        failed: bool,
-    }
-
-    impl EntrySwitchJournal for PhaseFailJournal {
-        fn load(&self) -> Result<Option<EntrySwitchJournalRecord>, EntrySwitchError> {
-            self.inner.load()
-        }
-        fn save(&mut self, record: &EntrySwitchJournalRecord) -> Result<(), EntrySwitchError> {
-            if !self.failed && record.phase == self.fail_once_at {
-                self.failed = true;
-                return Err(EntrySwitchError::Journal);
-            }
-            self.inner.save(record)
-        }
-        fn clear(&mut self) -> Result<(), EntrySwitchError> {
-            self.inner.clear()
-        }
-        fn consume_consent(&mut self, plan_fingerprint: &str) -> Result<bool, EntrySwitchError> {
-            self.inner.consume_consent(plan_fingerprint)
-        }
-    }
-
-    #[test]
-    fn effect_followed_by_journal_failure_is_observed_and_rolled_back() {
-        for failed_phase in [
-            EntrySwitchPhase::EntryCommitted,
-            EntrySwitchPhase::ProxyApplied,
-        ] {
-            let mut entry = FakeEntry::ready();
-            let original_entry = entry.current.clone();
-            let mut proxy = FakeProxy::ready();
-            let original_proxy = proxy.current.clone();
-            let plan =
-                EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(true), 5_000).unwrap();
-            let mut journal = PhaseFailJournal {
-                inner: MemoryEntrySwitchJournal::default(),
-                fail_once_at: failed_phase,
-                failed: false,
-            };
-            assert_eq!(
-                EntrySwitchTransaction::new(&mut entry, &mut proxy, &mut journal, authority())
-                    .apply(plan, 5_001),
-                Err(EntrySwitchError::Journal)
-            );
-            assert_eq!(entry.current, original_entry);
-            assert_eq!(proxy.current, original_proxy);
-            assert!(journal.load().unwrap().is_none());
-        }
-    }
-
-    #[test]
-    fn serialized_contract_has_no_process_arguments_or_business_targets() {
-        let mut entry = FakeEntry::ready();
-        let mut proxy = FakeProxy::ready();
-        let plan =
-            EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(true), 1_000).unwrap();
-        let fields = serde_json::to_value(plan).unwrap();
-        let keys = collect_keys(&fields);
-        for forbidden in ["command_line", "arguments", "probe_target", "secret", "url"] {
-            assert!(!keys.contains(forbidden), "forbidden field: {forbidden}");
-        }
-    }
-
-    #[test]
-    fn file_journal_is_durable_bounded_and_recovers_from_backup() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("entry-switch.json");
-        let mut entry = FakeEntry::ready();
-        let mut proxy = FakeProxy::ready();
-        let plan =
-            EntrySwitchPlanner::preview(&mut entry, &mut proxy, &request(false), 1_000).unwrap();
-        let first = EntrySwitchJournalRecord {
+    fn invalid_phase_shape_and_authority_fail_closed() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let clock = Clock(1_000);
+        let (_, _, plan) = plan(false, &key, &clock);
+        let record = EntrySwitchJournalRecord {
             schema_version: SCHEMA_VERSION,
-            phase: EntrySwitchPhase::Prepared,
-            plan: plan.clone(),
+            phase: EntrySwitchPhase::Staged,
+            plan,
+            stage_declaration: Some(declaration()),
             staged_core: None,
         };
-        let second = EntrySwitchJournalRecord {
-            phase: EntrySwitchPhase::Verified,
-            ..first.clone()
-        };
-        let mut journal = FileEntrySwitchJournal::new(path.clone());
-        journal.save(&first).unwrap();
-        journal.save(&second).unwrap();
-        assert_eq!(journal.load().unwrap(), Some(second.clone()));
-        fs::write(&path, b"corrupt").unwrap();
-        assert_eq!(journal.load().unwrap(), Some(second));
-        let fingerprint = first.plan.consent.plan_fingerprint.as_str();
-        assert!(journal.consume_consent(fingerprint).unwrap());
-        assert!(!journal.consume_consent(fingerprint).unwrap());
-        journal.clear().unwrap();
-        assert_eq!(journal.load().unwrap(), None);
-        assert!(!journal.consume_consent(fingerprint).unwrap());
+        assert_eq!(
+            record.validate_recovery(&key, &guard()),
+            Err(EntrySwitchError::Journal)
+        );
+        let mut bad = guard();
+        bad.context.user_scope_id = "other_01234567890".into();
+        let mut valid = record.clone();
+        valid.staged_core = Some(identity());
+        assert_eq!(
+            valid.validate_recovery(&key, &bad),
+            Err(EntrySwitchError::Unauthorized)
+        );
     }
-
-    fn collect_keys(value: &serde_json::Value) -> BTreeSet<&str> {
-        fn visit<'a>(value: &'a serde_json::Value, keys: &mut BTreeSet<&'a str>) {
-            match value {
-                serde_json::Value::Object(map) => {
-                    for (key, value) in map {
-                        keys.insert(key);
-                        visit(value, keys);
-                    }
-                }
-                serde_json::Value::Array(values) => {
-                    for value in values {
-                        visit(value, keys);
-                    }
-                }
-                _ => {}
-            }
+    #[test]
+    fn failed_verification_rolls_back_and_consumes_once() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let clock = Clock(1_000);
+        let (mut e, mut p, plan) = plan(true, &key, &clock);
+        e.verification.fail_closed_selected = false;
+        let mut j = MemoryEntrySwitchJournal::default();
+        let mut a = guard();
+        assert_eq!(
+            EntrySwitchTransaction::new(&mut e, &mut p, &mut j, &mut a, &key, &clock)
+                .apply(plan.clone()),
+            Err(EntrySwitchError::VerificationFailed)
+        );
+        assert_eq!(
+            EntrySwitchTransaction::new(&mut e, &mut p, &mut j, &mut a, &key, &clock).apply(plan),
+            Err(EntrySwitchError::InvalidConsent)
+        );
+    }
+    #[test]
+    fn consumed_ids_prune_only_after_expiry() {
+        let mut j = MemoryEntrySwitchJournal::default();
+        assert!(j.consume_consent("a", 200, 100).unwrap());
+        assert!(!j.consume_consent("a", 200, 150).unwrap());
+        assert!(j.consume_consent("b", 300, 201).unwrap());
+        assert!(j.consume_consent("a", 400, 201).unwrap());
+    }
+    #[test]
+    fn audit_serialization_does_not_leak_proxy_recovery_values() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let clock = Clock(1_000);
+        let (_, _, plan) = plan(true, &key, &clock);
+        let json = serde_json::to_string(&plan.audit()).unwrap();
+        for secret in ["secret.invalid:8080", "<local>;secret.invalid", "proxy.pac"] {
+            assert!(!json.contains(secret));
         }
-        let mut keys = BTreeSet::new();
-        visit(value, &mut keys);
-        keys
+        assert!(json.contains("original_proxy_fingerprint"));
+    }
+    #[test]
+    fn protected_journal_is_confidential_authenticated_and_context_bound() {
+        let key = ConsentKey::from_protected_bytes([7; 32]);
+        let wrong = ConsentKey::from_protected_bytes([8; 32]);
+        let clock = Clock(1_000);
+        let (_, _, plan) = plan(true, &key, &clock);
+        let state = ProtectedJournalState {
+            record: Some(EntrySwitchJournalRecord {
+                schema_version: SCHEMA_VERSION,
+                phase: EntrySwitchPhase::StagePending,
+                plan,
+                stage_declaration: Some(declaration()),
+                staged_core: None,
+            }),
+            consumed: BTreeMap::from([("aa".repeat(16), 121_000)]),
+        };
+        let protector = FakeProtector(0x5a);
+        let codec = ProtectedJournalCodec::new(context(), &key, &protector);
+        let bytes = codec.seal(&state).unwrap();
+        let rendered = String::from_utf8_lossy(&bytes);
+        for secret in ["secret.invalid:8080", "<local>;secret.invalid", "proxy.pac"] {
+            assert!(!rendered.contains(secret));
+        }
+        assert_eq!(codec.open(&bytes).unwrap(), state);
+        assert!(
+            ProtectedJournalCodec::new(context(), &wrong, &protector)
+                .open(&bytes)
+                .is_err()
+        );
+        let mut other = context();
+        other.install_id = "other_install_0123".into();
+        assert!(
+            ProtectedJournalCodec::new(other, &key, &protector)
+                .open(&bytes)
+                .is_err()
+        );
+        let mut tampered = bytes;
+        let midpoint = tampered.len() / 2;
+        tampered[midpoint] ^= 1;
+        assert!(codec.open(&tampered).is_err());
     }
 }

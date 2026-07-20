@@ -5,14 +5,19 @@
 //! for a service, RAS/VPN, named connection, or multi-connection context.
 #![allow(dead_code)] // Compiled now; wiring stays disabled until isolated acceptance.
 
+use std::{fs, path::PathBuf};
+
 use vpn_hub_core::{
-    EntrySwitchError, ProxyBackend, ProxyCapability, SystemProxySnapshot, UserProxyAuthority,
-    WindowsProxyMode,
+    ConfidentialProtector, ConsentKey, EntrySwitchAuthorityGuard, EntrySwitchContext,
+    EntrySwitchError, EntrySwitchJournal, EntrySwitchJournalRecord, ProtectedJournalCodec,
+    ProtectedJournalState, ProxyBackend, ProxyCapability, SystemDurableFileOps,
+    SystemProxySnapshot, WindowsProxyMode, durable_atomic_save_with_backup,
 };
 use vpn_hub_helper::{AuthorityFileGuard, InstallationReference, SupervisorAuthority};
 use vpn_hub_windows_security::{
-    WinInetLanProxySnapshot, query_current_user_default_lan_proxy,
-    set_current_user_default_lan_proxy,
+    ProtectedPathPolicy, WinInetLanProxySnapshot, open_verified_file, protect_current_user_data,
+    query_current_user_default_lan_proxy, set_current_user_default_lan_proxy,
+    unprotect_current_user_data, validate_protected_installation, verified_file_identity,
 };
 
 const PROXY_TYPE_DIRECT: u32 = 1;
@@ -35,7 +40,8 @@ pub(crate) struct WinInetUserProxyAdapter {
 
 pub(crate) struct EntrySwitchDesktopAuthorityGuard {
     _file_guard: AuthorityFileGuard,
-    authority: UserProxyAuthority,
+    context: EntrySwitchContext,
+    generation: u64,
 }
 
 impl EntrySwitchDesktopAuthorityGuard {
@@ -46,7 +52,7 @@ impl EntrySwitchDesktopAuthorityGuard {
         installation: &InstallationReference,
         user_scope_id: String,
         generation: u64,
-        fencing_token: u64,
+        _fencing_token: u64,
     ) -> Result<Self, EntrySwitchError> {
         let file_guard = AuthorityFileGuard::acquire_existing(
             &installation.entry_switch_authority_path(),
@@ -54,19 +60,178 @@ impl EntrySwitchDesktopAuthorityGuard {
             generation,
         )
         .map_err(|_| EntrySwitchError::Unauthorized)?;
-        let authority = UserProxyAuthority {
+        let context = EntrySwitchContext {
+            install_id: installation.install_id.clone(),
             user_scope_id,
-            generation,
-            fencing_token,
         };
         Ok(Self {
             _file_guard: file_guard,
-            authority,
+            context,
+            generation,
+        })
+    }
+}
+
+impl EntrySwitchAuthorityGuard for EntrySwitchDesktopAuthorityGuard {
+    fn context(&self) -> &EntrySwitchContext {
+        &self.context
+    }
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+    fn ensure_held(&self) -> Result<(), EntrySwitchError> {
+        Ok(())
+    }
+}
+
+struct CurrentUserDpapi;
+
+impl ConfidentialProtector for CurrentUserDpapi {
+    fn seal(&self, plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, EntrySwitchError> {
+        protect_current_user_data(plaintext, entropy).map_err(|_| EntrySwitchError::Journal)
+    }
+
+    fn open(&self, ciphertext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, EntrySwitchError> {
+        unprotect_current_user_data(ciphertext, entropy).map_err(|_| EntrySwitchError::Journal)
+    }
+}
+
+/// Fixed-path journal. Construction revalidates the installation root, exact
+/// mutable state file and authority lease against the interactive-user DACL.
+/// It is private and cannot accept a caller-controlled path.
+struct ProtectedFileEntrySwitchJournal<'a> {
+    installation: InstallationReference,
+    interactive_user_sid: String,
+    context: EntrySwitchContext,
+    key: &'a ConsentKey,
+    protector: CurrentUserDpapi,
+}
+
+impl<'a> ProtectedFileEntrySwitchJournal<'a> {
+    fn open(
+        installation: &InstallationReference,
+        interactive_user_sid: String,
+        user_scope_id: String,
+        key: &'a ConsentKey,
+    ) -> Result<Self, EntrySwitchError> {
+        let journal = Self {
+            installation: installation.clone(),
+            interactive_user_sid,
+            context: EntrySwitchContext {
+                install_id: installation.install_id.clone(),
+                user_scope_id,
+            },
+            key,
+            protector: CurrentUserDpapi,
+        };
+        journal.validate_fixed_storage()?;
+        Ok(journal)
+    }
+
+    fn path(&self) -> PathBuf {
+        self.installation.entry_switch_journal_path()
+    }
+
+    fn validate_fixed_storage(&self) -> Result<(), EntrySwitchError> {
+        let mut paths = vec![
+            (
+                self.installation.program_data_root.join("entry-switch"),
+                ProtectedPathPolicy::MutableDirectory,
+            ),
+            (
+                self.installation.entry_switch_authority_path(),
+                ProtectedPathPolicy::Mutable,
+            ),
+            (self.path(), ProtectedPathPolicy::Mutable),
+        ];
+        let backup = self.path().with_extension("json.bak");
+        if backup.exists() {
+            paths.push((backup, ProtectedPathPolicy::Mutable));
+        }
+        validate_protected_installation(
+            &self.installation.program_data_root,
+            &paths,
+            &self.interactive_user_sid,
+        )
+        .map_err(|_| EntrySwitchError::Unauthorized)
+    }
+
+    fn read_exact_file(&self, path: &std::path::Path) -> Result<Option<Vec<u8>>, EntrySwitchError> {
+        let primary = self.path();
+        if path != primary && path != primary.with_extension("json.bak") {
+            return Err(EntrySwitchError::Journal);
+        }
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.validate_fixed_storage()?;
+        let (guard, identity) = open_verified_file(path).map_err(|_| EntrySwitchError::Journal)?;
+        let bytes = fs::read(path).map_err(|_| EntrySwitchError::Journal)?;
+        if bytes.len() > 1024 * 1024
+            || verified_file_identity(path).map_err(|_| EntrySwitchError::Journal)? != identity
+        {
+            return Err(EntrySwitchError::Journal);
+        }
+        drop(guard);
+        Ok(Some(bytes))
+    }
+
+    fn load_state(&self) -> Result<ProtectedJournalState, EntrySwitchError> {
+        let codec = ProtectedJournalCodec::new(self.context.clone(), self.key, &self.protector);
+        let Some(bytes) = self.read_exact_file(&self.path())? else {
+            return Err(EntrySwitchError::Journal);
+        };
+        if bytes.is_empty() {
+            return Ok(ProtectedJournalState::default());
+        }
+        codec.open(&bytes).or_else(|_| {
+            let backup = self.path().with_extension("json.bak");
+            self.read_exact_file(&backup)?
+                .ok_or(EntrySwitchError::Journal)
+                .and_then(|value| codec.open(&value))
         })
     }
 
-    pub(crate) fn authority(&self) -> UserProxyAuthority {
-        self.authority.clone()
+    fn save_state(&self, state: &ProtectedJournalState) -> Result<(), EntrySwitchError> {
+        self.validate_fixed_storage()?;
+        let codec = ProtectedJournalCodec::new(self.context.clone(), self.key, &self.protector);
+        let bytes = codec.seal(state)?;
+        durable_atomic_save_with_backup(&self.path(), &bytes, &SystemDurableFileOps)
+            .map_err(|_| EntrySwitchError::Journal)?;
+        self.validate_fixed_storage()?;
+        let _ = open_verified_file(&self.path()).map_err(|_| EntrySwitchError::Journal)?;
+        Ok(())
+    }
+}
+
+impl EntrySwitchJournal for ProtectedFileEntrySwitchJournal<'_> {
+    fn load(&self) -> Result<Option<EntrySwitchJournalRecord>, EntrySwitchError> {
+        Ok(self.load_state()?.record)
+    }
+    fn save(&mut self, record: &EntrySwitchJournalRecord) -> Result<(), EntrySwitchError> {
+        let mut state = self.load_state()?;
+        state.record = Some(record.clone());
+        self.save_state(&state)
+    }
+    fn clear(&mut self) -> Result<(), EntrySwitchError> {
+        let mut state = self.load_state()?;
+        state.record = None;
+        self.save_state(&state)
+    }
+    fn consume_consent(
+        &mut self,
+        token_id: &str,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<bool, EntrySwitchError> {
+        let mut state = self.load_state()?;
+        state.consumed.retain(|_, expiry| *expiry >= now_ms);
+        if state.consumed.contains_key(token_id) {
+            return Ok(false);
+        }
+        state.consumed.insert(token_id.to_owned(), expires_at_ms);
+        self.save_state(&state)?;
+        Ok(true)
     }
 }
 
@@ -108,7 +273,7 @@ impl ProxyBackend for WinInetUserProxyAdapter {
         self.query()
     }
 
-    fn compare_and_set(
+    fn compare_then_apply(
         &mut self,
         expected_fingerprint: &str,
         replacement: &SystemProxySnapshot,
@@ -234,6 +399,8 @@ mod tests {
     #[test]
     #[ignore = "requires an isolated disposable Windows user and explicit live-network acceptance; mutates that user's WinINet default LAN proxy"]
     fn isolated_live_round_trip_scaffold() {
-        panic!("run only from the dedicated acceptance harness with snapshot/CAS/restore guards")
+        panic!(
+            "run only from the dedicated acceptance harness with snapshot/compare-then-apply/restore guards"
+        )
     }
 }

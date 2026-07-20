@@ -43,7 +43,7 @@ mod windows {
         file_index: u64,
     }
     use windows_sys::Win32::{
-        Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, FILETIME},
+        Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, FILETIME, LocalFree},
         NetworkManagement::IpHelper::{
             GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
         },
@@ -55,7 +55,12 @@ mod windows {
             INTERNET_PER_CONN_PROXY_SERVER, InternetQueryOptionW, InternetSetOptionW,
             PROXY_TYPE_AUTO_DETECT, PROXY_TYPE_AUTO_PROXY_URL, PROXY_TYPE_DIRECT, PROXY_TYPE_PROXY,
         },
-        Security::SECURITY_ATTRIBUTES,
+        Security::{
+            Cryptography::{
+                CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+            },
+            SECURITY_ATTRIBUTES,
+        },
         Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_READ,
@@ -229,6 +234,90 @@ mod windows {
             ));
         }
         Ok(())
+    }
+
+    /// Encrypts bytes for the current Windows user with UI disabled. No
+    /// machine-scope flag is used, so service identities cannot decrypt it.
+    ///
+    /// # Errors
+    /// Returns an OS or bounds error when current-user protection fails.
+    pub fn protect_current_user_data(plaintext: &[u8], entropy: &[u8]) -> io::Result<Vec<u8>> {
+        crypt_data(plaintext, entropy, true)
+    }
+
+    /// Decrypts bytes protected for the current Windows user with UI disabled.
+    ///
+    /// # Errors
+    /// Returns an OS, bounds, or integrity error when unprotection fails.
+    pub fn unprotect_current_user_data(ciphertext: &[u8], entropy: &[u8]) -> io::Result<Vec<u8>> {
+        crypt_data(ciphertext, entropy, false)
+    }
+
+    fn crypt_data(input: &[u8], entropy: &[u8], protect: bool) -> io::Result<Vec<u8>> {
+        if input.is_empty()
+            || input.len() > 1024 * 1024
+            || entropy.is_empty()
+            || entropy.len() > 4096
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DPAPI input is outside bounds",
+            ));
+        }
+        let mut input_blob = CRYPT_INTEGER_BLOB {
+            cbData: u32::try_from(input.len()).map_err(io::Error::other)?,
+            pbData: input.as_ptr().cast_mut(),
+        };
+        let mut entropy_blob = CRYPT_INTEGER_BLOB {
+            cbData: u32::try_from(entropy.len()).map_err(io::Error::other)?,
+            pbData: entropy.as_ptr().cast_mut(),
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        // SAFETY: all input slices remain live for the call; output is initialized
+        // by DPAPI and released with LocalFree below. UI is explicitly forbidden.
+        let ok = unsafe {
+            if protect {
+                CryptProtectData(
+                    &raw mut input_blob,
+                    std::ptr::null(),
+                    &raw mut entropy_blob,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &raw mut output,
+                )
+            } else {
+                CryptUnprotectData(
+                    &raw mut input_blob,
+                    std::ptr::null_mut(),
+                    &raw mut entropy_blob,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    CRYPTPROTECT_UI_FORBIDDEN,
+                    &raw mut output,
+                )
+            }
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if output.pbData.is_null() || output.cbData == 0 || output.cbData > 1024 * 1024 {
+            if !output.pbData.is_null() {
+                unsafe { LocalFree(output.pbData.cast()) };
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DPAPI output is outside bounds",
+            ));
+        }
+        // SAFETY: DPAPI returned exactly cbData initialized bytes.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(output.pbData, output.cbData as usize) }.to_vec();
+        unsafe { LocalFree(output.pbData.cast()) };
+        Ok(bytes)
     }
 
     fn option_number(option: u32) -> INTERNET_PER_CONN_OPTIONW {
@@ -890,6 +979,18 @@ mod windows {
         }
 
         #[test]
+        fn current_user_dpapi_round_trip_is_entropy_bound() {
+            let plaintext = b"entry-switch-test-payload";
+            let ciphertext = protect_current_user_data(plaintext, b"install-a/user-a").unwrap();
+            assert_ne!(ciphertext, plaintext);
+            assert_eq!(
+                unprotect_current_user_data(&ciphertext, b"install-a/user-a").unwrap(),
+                plaintext
+            );
+            assert!(unprotect_current_user_data(&ciphertext, b"install-b/user-a").is_err());
+        }
+
+        #[test]
         fn user_writable_executable_acl_is_rejected() {
             let account = std::env::var("USERNAME").unwrap();
             let sid = lookup_local_account_sid(&account).unwrap();
@@ -993,6 +1094,7 @@ mod windows {
 pub use windows::{
     FileIdentity, ProtectedPathPolicy, WinInetLanProxySnapshot, create_restricted_named_pipe,
     lookup_local_account_sid, network_state_records, open_verified_file, process_creation_identity,
-    query_current_user_default_lan_proxy, set_current_user_default_lan_proxy,
+    protect_current_user_data, query_current_user_default_lan_proxy,
+    set_current_user_default_lan_proxy, unprotect_current_user_data,
     validate_protected_installation, verified_file_identity,
 };
