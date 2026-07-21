@@ -18,10 +18,17 @@ confirmation.
 
 When a managed core is running, a `live_apply` change that affects the
 authenticated Controller stays in the journal's runtime-validation-pending
-phase until the Controller cycle succeeds. A rejected cycle restores the
-previous private and Guardian files plus the exact in-memory routing snapshot,
-cleans the journal, and requires a fresh preview ticket before retrying. A
-configuration-reload signal then schedules a compensating Guardian cycle.
+phase until both the Controller cycle and final database commit succeed. Before
+the transaction starts, the desktop reads the authoritative current members of
+both `VPN-HUB-MASTER` and `VPN-HUB-UDP` in one authenticated Controller
+snapshot. A rejected cycle or failed finalization enters the same compensation
+path: restore the previous private and Guardian files, the exact in-memory
+routing snapshot, and both Controller selections with authoritative readback;
+then clean the journal and require a fresh preview ticket before retrying. If
+the old selections cannot be confirmed, both selectors are set to `REJECT` and
+read back, the in-memory current route is cleared, and the result is terminal
+recovery rather than a retryable success. Failure to confirm even that state is
+reported as unconfirmed terminal recovery.
 
 `system_proxy`, `tun`, and `service` are not ordinary settings fields. Unknown
 draft fields are rejected during deserialization, while the known `entry` field

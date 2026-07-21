@@ -240,6 +240,11 @@ pub struct DeferredSettingsApply {
     previous_routing: RoutingEngine,
 }
 
+struct ControllerSelectorSnapshot {
+    master: String,
+    udp: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum JournalSecretAction {
@@ -554,6 +559,10 @@ pub struct AppState {
     entry_switch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     settings_validation_hook: Mutex<Option<SettingsValidationHook>>,
+    #[cfg(test)]
+    settings_finalize_hook: Mutex<Option<SettingsFinalizeHook>>,
+    #[cfg(test)]
+    controller_client_override: Mutex<Option<ControllerClient>>,
 }
 
 enum SupervisorRoute {
@@ -569,6 +578,9 @@ enum SupervisorRoute {
 
 #[cfg(test)]
 type SettingsValidationHook = Box<dyn Fn(&Path, &Path) -> Result<(), String> + Send>;
+
+#[cfg(test)]
+type SettingsFinalizeHook = Box<dyn Fn() -> Result<(), String> + Send>;
 
 #[derive(Default)]
 struct RoutingTransaction {
@@ -966,6 +978,10 @@ impl AppState {
             entry_switch_hook: Mutex::new(None),
             #[cfg(test)]
             settings_validation_hook: Mutex::new(None),
+            #[cfg(test)]
+            settings_finalize_hook: Mutex::new(None),
+            #[cfg(test)]
+            controller_client_override: Mutex::new(None),
         }
     }
 
@@ -993,6 +1009,25 @@ impl AppState {
             .settings_validation_hook
             .lock()
             .expect("settings validation hook") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_settings_finalize_hook_for_test(
+        &self,
+        hook: impl Fn() -> Result<(), String> + Send + 'static,
+    ) {
+        *self
+            .settings_finalize_hook
+            .lock()
+            .expect("settings finalize hook") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_controller_client_for_test(&self, controller: ControllerClient) {
+        *self
+            .controller_client_override
+            .lock()
+            .expect("Controller override") = Some(controller);
     }
 
     #[must_use]
@@ -1266,17 +1301,126 @@ impl AppState {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(), String>>,
     {
+        let selector_snapshot = self.capture_controller_selector_snapshot().await?;
         let mut pending = self.apply_settings_deferred(request)?;
-        match validate().await {
-            Ok(()) => self.finalize_deferred_settings(&mut pending, false),
-            Err(validation_error) => match self.rollback_deferred_settings(&pending) {
-                Ok(()) => Err(format!(
-                    "Controller 在线应用未确认；已恢复旧配置与路由状态，可重新提交：{validation_error}"
-                )),
-                Err(rollback_error) => Err(format!(
-                    "Controller 在线应用未确认且设置回滚未完成；保持 Fail Closed：{validation_error}；{rollback_error}"
-                )),
+        let failure = match validate().await {
+            Ok(()) => match self.finalize_deferred_settings(&mut pending, false) {
+                Ok(result) => return Ok(result),
+                Err(error) => format!("设置最终提交失败：{error}"),
             },
+            Err(error) => format!("Controller 在线应用未确认：{error}"),
+        };
+        Err(self
+            .compensate_failed_live_settings(&pending, &selector_snapshot, &failure)
+            .await)
+    }
+
+    async fn capture_controller_selector_snapshot(
+        &self,
+    ) -> Result<ControllerSelectorSnapshot, String> {
+        let controller = self
+            .controller_client()?
+            .ok_or_else(|| "受鉴权 Controller 不可用，无法开始在线设置事务".to_string())?;
+        let selectors = vec![MASTER_SELECTOR.to_string(), UDP_SELECTOR.to_string()];
+        let snapshots = controller
+            .selector_nodes_for(&selectors)
+            .await
+            .map_err(|_| "无法读取 Controller selector 权威快照".to_string())?;
+        let master = snapshots
+            .get(MASTER_SELECTOR)
+            .and_then(|snapshot| snapshot.current_node.clone())
+            .ok_or_else(|| "Controller MASTER selector 快照不完整".to_string())?;
+        let udp = snapshots
+            .get(UDP_SELECTOR)
+            .and_then(|snapshot| snapshot.current_node.clone())
+            .ok_or_else(|| "Controller UDP selector 快照不完整".to_string())?;
+        Ok(ControllerSelectorSnapshot { master, udp })
+    }
+
+    async fn controller_targets_are(
+        controller: &ControllerClient,
+        master: &str,
+        udp: &str,
+    ) -> Result<bool, String> {
+        let selectors = vec![MASTER_SELECTOR.to_string(), UDP_SELECTOR.to_string()];
+        let snapshots = controller
+            .selector_nodes_for(&selectors)
+            .await
+            .map_err(|_| "Controller selector 恢复后无法权威回读".to_string())?;
+        Ok(snapshots
+            .get(MASTER_SELECTOR)
+            .and_then(|snapshot| snapshot.current_node.as_deref())
+            == Some(master)
+            && snapshots
+                .get(UDP_SELECTOR)
+                .and_then(|snapshot| snapshot.current_node.as_deref())
+                == Some(udp))
+    }
+
+    async fn select_and_confirm_controller_targets(
+        controller: &ControllerClient,
+        master: &str,
+        udp: &str,
+    ) -> Result<(), String> {
+        let _master_result = controller.select(MASTER_SELECTOR, master).await;
+        let _udp_result = controller.select(UDP_SELECTOR, udp).await;
+        if Self::controller_targets_are(controller, master, udp).await? {
+            Ok(())
+        } else {
+            Err("Controller selector 恢复回读不一致".into())
+        }
+    }
+
+    fn clear_current_route_for_terminal_recovery(&self) -> Result<(), String> {
+        self.routing_engine
+            .lock()
+            .map_err(|_| "路由策略状态锁已损坏".to_string())?
+            .restore_current(None, None);
+        Ok(())
+    }
+
+    async fn force_controller_fail_closed(&self) -> Result<(), String> {
+        let controller = self
+            .controller_client()?
+            .ok_or_else(|| "受鉴权 Controller 不可用，无法确认 Fail Closed".to_string())?;
+        Self::select_and_confirm_controller_targets(
+            &controller,
+            FAIL_CLOSED_PROXY,
+            FAIL_CLOSED_PROXY,
+        )
+        .await?;
+        self.clear_current_route_for_terminal_recovery()
+    }
+
+    async fn compensate_failed_live_settings(
+        &self,
+        pending: &DeferredSettingsApply,
+        selectors: &ControllerSelectorSnapshot,
+        failure: &str,
+    ) -> String {
+        let rollback = self.rollback_deferred_settings(pending);
+        if rollback.is_ok()
+            && let Ok(Some(controller)) = self.controller_client()
+            && Self::select_and_confirm_controller_targets(
+                &controller,
+                &selectors.master,
+                &selectors.udp,
+            )
+            .await
+            .is_ok()
+        {
+            return format!("{failure}；已恢复旧配置、路由状态与 Controller selectors，可重新提交");
+        }
+
+        if self.force_controller_fail_closed().await.is_ok() {
+            format!(
+                "terminal_recovery_fail_closed：{failure}；旧状态无法完整恢复，MASTER/UDP 已权威确认 Fail Closed"
+            )
+        } else {
+            let _ = self.clear_current_route_for_terminal_recovery();
+            format!(
+                "terminal_recovery_unconfirmed：{failure}；旧状态无法完整恢复，MASTER/UDP Fail Closed 也无法权威确认"
+            )
         }
     }
 
@@ -1639,6 +1783,15 @@ impl AppState {
             .secret_store
             .as_ref()
             .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .settings_finalize_hook
+            .lock()
+            .map_err(|_| "设置最终提交测试钩子锁已损坏".to_string())?
+            .as_ref()
+        {
+            hook()?;
+        }
         let removed = finish_committed_settings_with_operations(
             &self.runtime_directory,
             &self.private_config_path,
@@ -1666,7 +1819,7 @@ impl AppState {
         if journal.transaction_id != pending.transaction_id {
             return Err("待回滚设置事务与运行时验证结果不匹配".into());
         }
-        rollback_settings_transaction(
+        rollback_deferred_settings_transaction(
             &self.runtime_directory,
             &self.private_config_path,
             &self.guardian_config_path,
@@ -2403,6 +2556,15 @@ impl AppState {
     }
 
     pub fn controller_client(&self) -> Result<Option<ControllerClient>, String> {
+        #[cfg(test)]
+        if let Some(controller) = self
+            .controller_client_override
+            .lock()
+            .map_err(|_| "Controller 测试替身锁已损坏".to_string())?
+            .clone()
+        {
+            return Ok(Some(controller));
+        }
         if !matches!(self.supervisor_route, SupervisorRoute::DesktopOwned { .. }) {
             return Ok(None);
         }
@@ -3435,6 +3597,31 @@ fn rollback_settings_transaction<S: SecretStore + ?Sized>(
     guardian_path: &Path,
     store: &S,
 ) -> Result<(), String> {
+    rollback_settings_transaction_inner(
+        runtime_directory,
+        private_path,
+        guardian_path,
+        store,
+        false,
+    )
+}
+
+fn rollback_deferred_settings_transaction<S: SecretStore + ?Sized>(
+    runtime_directory: &Path,
+    private_path: &Path,
+    guardian_path: &Path,
+    store: &S,
+) -> Result<(), String> {
+    rollback_settings_transaction_inner(runtime_directory, private_path, guardian_path, store, true)
+}
+
+fn rollback_settings_transaction_inner<S: SecretStore + ?Sized>(
+    runtime_directory: &Path,
+    private_path: &Path,
+    guardian_path: &Path,
+    store: &S,
+    allow_finalized: bool,
+) -> Result<(), String> {
     let primary = settings_journal_path(runtime_directory);
     let backup = settings_journal_backup_path(runtime_directory);
     if !primary.exists() && !backup.exists() {
@@ -3443,12 +3630,16 @@ fn rollback_settings_transaction<S: SecretStore + ?Sized>(
     let mut journal = read_settings_journal(runtime_directory)?;
     match journal.phase {
         SettingsTransactionPhase::Prepared | SettingsTransactionPhase::RolledBack => {}
+        SettingsTransactionPhase::Finalized if !allow_finalized => {
+            return Err("已完成的设置事务不能作为待验证事务回滚".into());
+        }
         SettingsTransactionPhase::BackupsReady
         | SettingsTransactionPhase::CredentialsStaged
         | SettingsTransactionPhase::PrivateCommitted
         | SettingsTransactionPhase::GuardianCommitted
         | SettingsTransactionPhase::CommitDecided
-        | SettingsTransactionPhase::RuntimeValidationPending => {
+        | SettingsTransactionPhase::RuntimeValidationPending
+        | SettingsTransactionPhase::Finalized => {
             let files = settings_transaction_files(private_path, guardian_path);
             restore_settings_files_with_operations(
                 runtime_directory,
@@ -3457,9 +3648,6 @@ fn rollback_settings_transaction<S: SecretStore + ?Sized>(
                 &SystemDurableFileOps,
             )?;
             restore_settings_credentials(&journal, store)?;
-        }
-        SettingsTransactionPhase::Finalized => {
-            return Err("已完成的设置事务不能作为待验证事务回滚".into());
         }
     }
     journal.phase = SettingsTransactionPhase::RolledBack;
@@ -3736,11 +3924,13 @@ mod tests {
     use crate::lifecycle::{DesktopCoordinator, LifecycleEvent};
     use std::{
         collections::BTreeMap,
-        io,
+        io::{self, Read, Write},
+        net::TcpListener,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        thread::{self, JoinHandle},
         time::Instant,
     };
     use vpn_hub_core::{
@@ -3782,6 +3972,181 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    const OLD_MASTER: &str = "vpn-hub-outlet-local-a";
+    const OLD_UDP: &str = "vpn-hub-outlet-local-a";
+    const NEW_MASTER: &str = "vpn-hub-outlet-local-b";
+    const NEW_UDP: &str = "vpn-hub-outlet-local-b";
+    static SELECTOR_COMPENSATION_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    struct FakeSelectorController {
+        port: u16,
+        selected: Arc<Mutex<(String, String)>>,
+        stop: Arc<AtomicBool>,
+        server: Option<JoinHandle<()>>,
+    }
+
+    impl FakeSelectorController {
+        fn start(fail_new_udp_once: bool, fail_old_restore: bool) -> Self {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("fake Controller");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("Controller address").port();
+            let selected = Arc::new(Mutex::new((OLD_MASTER.into(), OLD_UDP.into())));
+            let server_selected = Arc::clone(&selected);
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let server = thread::spawn(move || {
+                let mut reject_new_udp = fail_new_udp_once;
+                while !server_stop.load(Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    if server_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let request = read_fake_controller_request(&mut stream);
+                    assert!(request.contains("authorization: Bearer test-secret"));
+                    if request.starts_with("GET /proxies ") {
+                        let (master, udp) = server_selected.lock().expect("selected").clone();
+                        write_fake_controller_json(
+                            &mut stream,
+                            &serde_json::json!({
+                                "proxies": {
+                                    (MASTER_SELECTOR): {
+                                        "type": "Selector",
+                                        "now": master,
+                                        "all": [OLD_MASTER, NEW_MASTER, FAIL_CLOSED_PROXY]
+                                    },
+                                    (UDP_SELECTOR): {
+                                        "type": "Selector",
+                                        "now": udp,
+                                        "all": [OLD_UDP, NEW_UDP, FAIL_CLOSED_PROXY]
+                                    },
+                                    (OLD_MASTER): {"type": "Direct", "alive": true},
+                                    (NEW_MASTER): {"type": "Direct", "alive": true},
+                                    (FAIL_CLOSED_PROXY): {"type": "Reject", "alive": true}
+                                }
+                            }),
+                        );
+                        continue;
+                    }
+                    let target = request
+                        .split("\r\n\r\n")
+                        .nth(1)
+                        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+                        .and_then(|body| {
+                            body.get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .expect("selection target");
+                    if request.starts_with(&format!("PUT /proxies/{UDP_SELECTOR} ")) {
+                        if (reject_new_udp && target == NEW_UDP)
+                            || (fail_old_restore && target == OLD_UDP)
+                        {
+                            reject_new_udp = false;
+                            write_fake_controller_status(&mut stream, "500 Internal Server Error");
+                        } else {
+                            server_selected.lock().expect("selected").1 = target;
+                            write_fake_controller_status(&mut stream, "204 No Content");
+                        }
+                    } else if request.starts_with(&format!("PUT /proxies/{MASTER_SELECTOR} ")) {
+                        if fail_old_restore && target == OLD_MASTER {
+                            write_fake_controller_status(&mut stream, "500 Internal Server Error");
+                        } else {
+                            server_selected.lock().expect("selected").0 = target;
+                            write_fake_controller_status(&mut stream, "204 No Content");
+                        }
+                    } else {
+                        write_fake_controller_status(&mut stream, "404 Not Found");
+                    }
+                }
+            });
+            Self {
+                port,
+                selected,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn selected(&self) -> (String, String) {
+            self.selected.lock().expect("selected").clone()
+        }
+    }
+
+    impl Drop for FakeSelectorController {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
+            if let Some(server) = self.server.take() {
+                server.join().expect("fake Controller server");
+            }
+        }
+    }
+
+    fn read_fake_controller_request(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 2_048];
+        loop {
+            let read = stream.read(&mut buffer).expect("Controller request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("content-length: ")
+                        .or_else(|| line.strip_prefix("Content-Length: "))
+                })
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or_default();
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("UTF-8 HTTP request")
+    }
+
+    fn write_fake_controller_json(stream: &mut TcpStream, body: &serde_json::Value) {
+        let body = serde_json::to_vec(body).expect("Controller response");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("response headers");
+        stream.write_all(&body).expect("response body");
+    }
+
+    fn write_fake_controller_status(stream: &mut TcpStream, status: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("status response");
+    }
+
+    fn install_fake_controller_client(state: &AppState, controller_port: u16) {
+        let controller = ControllerClient::new(
+            &format!("http://127.0.0.1:{controller_port}"),
+            "test-secret".into(),
+            2_000,
+        )
+        .expect("fake Controller client");
+        state.set_controller_client_for_test(controller);
     }
 
     fn install_fake_owned_controller(state: &AppState, lifetime_ms: u64) -> u32 {
@@ -4952,11 +5317,133 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     }
 
     #[tokio::test]
-    async fn failed_live_runtime_validation_restores_snapshot_and_allows_a_fresh_preview() {
+    #[allow(clippy::too_many_lines)]
+    async fn udp_validation_failure_restores_files_engine_and_both_controller_selectors() {
+        let _serial = SELECTOR_COMPENSATION_TEST_LOCK.lock().await;
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
         let state = AppState::new_for_test(workspace_root, directory.path());
         state.set_settings_validation_hook_for_test(|_, _| Ok(()));
+        let fake_controller = FakeSelectorController::start(true, false);
+        install_fake_controller_client(&state, fake_controller.port);
+
+        let mut config = state.private_config().expect("private");
+        config.route_mode = RouteMode::Manual;
+        config.manual_outlet = Some("local-a".into());
+        config.outlets = vec![
+            OutletConfig {
+                id: "local-a".into(),
+                label: "Local A".into(),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: "socks5h://127.0.0.1:45112".into(),
+                },
+            },
+            OutletConfig {
+                id: "local-b".into(),
+                label: "Local B".into(),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: "socks5h://127.0.0.1:45113".into(),
+                },
+            },
+        ];
+        config.save(&state.private_config_path).expect("config");
+        {
+            let mut engine = state.routing_engine.lock().expect("engine");
+            engine.set_mode(RouteMode::Manual, Some("local-a".into()));
+            engine.apply(
+                &RouteDecision {
+                    from_outlet: None,
+                    to_outlet: "local-a".into(),
+                    reason: "test-only-current-state".into(),
+                },
+                123,
+            );
+        }
+        let previous_engine = state.routing_engine.lock().expect("engine").clone();
+        let previous_private = fs::read(&state.private_config_path).expect("private bytes");
+        let previous_guardian = fs::read(&state.guardian_config_path).expect("guardian bytes");
+
+        let mut draft = state.settings_view().expect("settings").draft;
+        draft.route_mode = RouteMode::Fastest;
+        draft.manual_outlet = None;
+        let preview = state
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+            .expect("preview");
+        assert!(preview.can_apply);
+        assert!(preview.diff.has_impact(SettingsImpact::LiveApply));
+        let error = state
+            .apply_settings_with_runtime_validation(
+                SettingsApplyRequest {
+                    draft: draft.clone(),
+                    credential_mutations: Vec::new(),
+                    active_outlet_replacement: None,
+                    fail_closed_on_removed_active: false,
+                    preview_fingerprint: preview.request_fingerprint,
+                },
+                || async {
+                    let controller = state
+                        .controller_client()?
+                        .ok_or_else(|| "missing fake Controller".to_string())?;
+                    controller
+                        .select(MASTER_SELECTOR, NEW_MASTER)
+                        .await
+                        .map_err(|_| "synthetic MASTER failure".to_string())?;
+                    controller
+                        .select(UDP_SELECTOR, NEW_UDP)
+                        .await
+                        .map_err(|_| "synthetic UDP failure".to_string())?;
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("Controller rejection must rollback settings");
+
+        assert!(error.contains("synthetic UDP failure"));
+        assert!(error.contains("可重新提交"));
+        assert_eq!(
+            fs::read(&state.private_config_path).expect("restored private"),
+            previous_private
+        );
+        assert_eq!(
+            fs::read(&state.guardian_config_path).expect("restored guardian"),
+            previous_guardian
+        );
+        assert_eq!(
+            *state.routing_engine.lock().expect("restored engine"),
+            previous_engine
+        );
+        assert!(!settings_journal_path(&state.runtime_directory).exists());
+        assert_eq!(
+            fake_controller.selected(),
+            (OLD_MASTER.into(), OLD_UDP.into())
+        );
+
+        let retry = state
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+            .expect("fresh retry preview");
+        assert!(retry.can_apply);
+        assert!(
+            retry
+                .diff
+                .changes
+                .iter()
+                .any(|change| change.code == "route_policy_changed")
+        );
+        assert_ne!(retry.request_fingerprint, "");
+    }
+
+    #[tokio::test]
+    async fn finalize_failure_uses_the_same_rollback_and_selector_compensation() {
+        let _serial = SELECTOR_COMPENSATION_TEST_LOCK.lock().await;
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        state.set_settings_validation_hook_for_test(|_, _| Ok(()));
+        state.set_settings_finalize_hook_for_test(|| Err("synthetic database failure".into()));
+        let fake_controller = FakeSelectorController::start(false, false);
+        install_fake_controller_client(&state, fake_controller.port);
 
         let mut config = state.private_config().expect("private");
         config.route_mode = RouteMode::Manual;
@@ -4992,8 +5479,6 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         let preview = state
             .preview_settings(&preview_request(&draft, None, false, Vec::new()))
             .expect("preview");
-        assert!(preview.can_apply);
-        assert!(preview.diff.has_impact(SettingsImpact::LiveApply));
         let error = state
             .apply_settings_with_runtime_validation(
                 SettingsApplyRequest {
@@ -5003,12 +5488,25 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                     fail_closed_on_removed_active: false,
                     preview_fingerprint: preview.request_fingerprint,
                 },
-                || async { Err("synthetic Controller failure".to_string()) },
+                || async {
+                    let controller = state
+                        .controller_client()?
+                        .ok_or_else(|| "missing fake Controller".to_string())?;
+                    controller
+                        .select(MASTER_SELECTOR, NEW_MASTER)
+                        .await
+                        .map_err(|_| "synthetic MASTER failure".to_string())?;
+                    controller
+                        .select(UDP_SELECTOR, NEW_UDP)
+                        .await
+                        .map_err(|_| "synthetic UDP failure".to_string())?;
+                    Ok(())
+                },
             )
             .await
-            .expect_err("Controller rejection must rollback settings");
+            .expect_err("finalize failure must rollback settings");
 
-        assert!(error.contains("synthetic Controller failure"));
+        assert!(error.contains("synthetic database failure"));
         assert!(error.contains("可重新提交"));
         assert_eq!(
             fs::read(&state.private_config_path).expect("restored private"),
@@ -5023,19 +5521,95 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             previous_engine
         );
         assert!(!settings_journal_path(&state.runtime_directory).exists());
-
+        assert_eq!(
+            fake_controller.selected(),
+            (OLD_MASTER.into(), OLD_UDP.into())
+        );
         let retry = state
             .preview_settings(&preview_request(&draft, None, false, Vec::new()))
             .expect("fresh retry preview");
         assert!(retry.can_apply);
-        assert!(
-            retry
-                .diff
-                .changes
-                .iter()
-                .any(|change| change.code == "route_policy_changed")
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_old_selectors_enter_terminal_confirmed_fail_closed() {
+        let _serial = SELECTOR_COMPENSATION_TEST_LOCK.lock().await;
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        state.set_settings_validation_hook_for_test(|_, _| Ok(()));
+        let fake_controller = FakeSelectorController::start(true, true);
+        install_fake_controller_client(&state, fake_controller.port);
+
+        let mut config = state.private_config().expect("private");
+        config.outlets = vec![OutletConfig {
+            id: "local-a".into(),
+            label: "Local A".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "socks5h://127.0.0.1:45112".into(),
+            },
+        }];
+        config.save(&state.private_config_path).expect("config");
+        state.routing_engine.lock().expect("engine").apply(
+            &RouteDecision {
+                from_outlet: None,
+                to_outlet: "local-a".into(),
+                reason: "test-only-current-state".into(),
+            },
+            123,
         );
-        assert_ne!(retry.request_fingerprint, "");
+        let previous_private = fs::read(&state.private_config_path).expect("private bytes");
+        let mut draft = state.settings_view().expect("settings").draft;
+        draft.minimum_improvement_ms += 1;
+        let preview = state
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+            .expect("preview");
+        let error = state
+            .apply_settings_with_runtime_validation(
+                SettingsApplyRequest {
+                    draft,
+                    credential_mutations: Vec::new(),
+                    active_outlet_replacement: None,
+                    fail_closed_on_removed_active: false,
+                    preview_fingerprint: preview.request_fingerprint,
+                },
+                || async {
+                    let controller = state
+                        .controller_client()?
+                        .ok_or_else(|| "missing fake Controller".to_string())?;
+                    controller
+                        .select(MASTER_SELECTOR, NEW_MASTER)
+                        .await
+                        .map_err(|_| "synthetic MASTER failure".to_string())?;
+                    controller
+                        .select(UDP_SELECTOR, NEW_UDP)
+                        .await
+                        .map_err(|_| "synthetic UDP failure".to_string())?;
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("unrestorable selectors must become terminal");
+
+        assert!(error.starts_with("terminal_recovery_fail_closed"));
+        assert_eq!(
+            fs::read(&state.private_config_path).expect("restored private"),
+            previous_private
+        );
+        assert!(
+            state
+                .routing_engine
+                .lock()
+                .expect("engine")
+                .current_outlet()
+                .is_none()
+        );
+        assert_eq!(
+            fake_controller.selected(),
+            (FAIL_CLOSED_PROXY.into(), FAIL_CLOSED_PROXY.into())
+        );
+        assert!(!settings_journal_path(&state.runtime_directory).exists());
     }
 
     #[tokio::test]
