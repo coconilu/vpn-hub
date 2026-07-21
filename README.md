@@ -91,14 +91,13 @@ npm install
 npm run tauri dev
 ```
 
-构建 Windows 安装包：
+在仓库根目录构建 Windows 主程序和安装包：
 
 ```powershell
-cd apps/desktop
-npm run tauri build -- --bundles nsis
+npm run build
 ```
 
-安装包输出到 `target/release/bundle/nsis/`。Mihomo 二进制不提交到仓库；在当前开发阶段，启动开发核心前仍需先运行 `scripts/fetch-mihomo.ps1`。
+主程序输出到 `target/release/vpn-hub-desktop.exe`，安装包输出到 `target/release/bundle/nsis/`。根目录脚本会调用 `apps/desktop` 中锁定的 Tauri CLI。Mihomo 二进制不提交到仓库；在当前开发阶段，启动开发核心前仍需先运行 `scripts/fetch-mihomo.ps1`。
 
 真实订阅地址只能通过桌面总览的密码输入框写入 `%LOCALAPPDATA%\VPN Hub`。不要把它放入仓库配置、命令行、日志、Issue 或 PR。
 

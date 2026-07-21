@@ -1,0 +1,8 @@
+{
+  "name": "vpn-hub-workspace",
+  "private": true,
+  "packageManager": "npm@11.12.1",
+  "scripts": {
+    "build": "npm --prefix apps/desktop run tauri -- build --bundles nsis"
+  }
+}
