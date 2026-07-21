@@ -48,7 +48,7 @@ pub use mihomo::{
     PrivateRoutingConfig, ResolvedSubscriptionUrls, RuntimeConfigSummary, UDP_SELECTOR,
     UdpCapabilityMap, generate_controller_secret, generate_mihomo_config,
     generate_mihomo_config_with_udp_capabilities, generate_mihomo_startup_config,
-    normalize_loopback_host, outlet_proxy_name, validate_subscription_url,
+    normalize_loopback_host, outlet_proxy_name, provider_name, validate_subscription_url,
 };
 pub use model::{
     HealthStatus, LatencySample, OutletSummary, ProbeResult, RouteSwitchEvent, StateEvent,

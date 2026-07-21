@@ -1,19 +1,38 @@
 import {
   CheckCircle2,
   CircleAlert,
+  Gauge,
   Network,
   RefreshCw,
   Search,
   ShieldCheck,
+  Square,
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { getSubscriptionNodeCatalog, selectSubscriptionNode } from "./lib/bridge";
 import {
+  cancelSubscriptionNodeLatencyBatch,
+  getSubscriptionNodeCatalog,
+  selectSubscriptionNode,
+  testSubscriptionNodeLatencies,
+  testSubscriptionNodeLatency,
+} from "./lib/bridge";
+import {
+  batchStartingLatencyStates,
   filterSubscriptionNodes,
+  initialNodeLatencyState,
+  latencyResultToView,
+  mergeBatchLatencyResults,
+  nodeLatencyKey,
   replaceSubscriptionNodeGroup,
 } from "./lib/subscriptionNodesModel";
-import type { SubscriptionNodeCatalog, SubscriptionNodeGroup } from "./types";
+import type {
+  NodeLatencyErrorCode,
+  NodeLatencyViewState,
+  SubscriptionNode,
+  SubscriptionNodeCatalog,
+  SubscriptionNodeGroup,
+} from "./types";
 
 function groupStateMessage(group: SubscriptionNodeGroup) {
   if (group.state === "core_unavailable") {
@@ -25,12 +44,35 @@ function groupStateMessage(group: SubscriptionNodeGroup) {
   return null;
 }
 
+const errorLabel: Record<NodeLatencyErrorCode, string> = {
+  core_unavailable: "核心未启动",
+  provider_unavailable: "Provider 未就绪",
+  node_disappeared: "节点已消失",
+  timeout: "测速超时",
+  controller_error: "Controller 异常",
+  cancelled: "已取消",
+};
+
+function latencyPresentation(node: SubscriptionNode, state?: NodeLatencyViewState) {
+  const current = state ?? initialNodeLatencyState(node);
+  if (current.status === "success") return { className: "is-success", label: `${current.latency_ms} ms`, detail: "本次测试" };
+  if (current.status === "running") return { className: "is-running", label: "测试中", detail: "正在使用受控探测目标" };
+  if (current.status === "failure") return { className: "is-failure", label: current.error_code ? errorLabel[current.error_code] : "测试失败", detail: current.message };
+  if (current.status === "cancelled") return { className: "is-cancelled", label: "已取消", detail: current.message };
+  if (current.status === "stale") return { className: "is-stale", label: current.latency_ms === null ? "已过期" : `${current.latency_ms} ms`, detail: "最近状态 · 已过期" };
+  return { className: "is-waiting", label: "等待首次测试", detail: current.message };
+}
+
 export function NodesPage() {
   const [catalog, setCatalog] = useState<SubscriptionNodeCatalog | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [selecting, setSelecting] = useState<string | null>(null);
+  const [testingNode, setTestingNode] = useState<string | null>(null);
+  const [batchOperation, setBatchOperation] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [latencyStates, setLatencyStates] = useState<Record<string, NodeLatencyViewState>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -41,6 +83,19 @@ export function NodesPage() {
     try {
       const next = await getSubscriptionNodeCatalog();
       setCatalog(next);
+      setLatencyStates((current) => {
+        const refreshed: Record<string, NodeLatencyViewState> = {};
+        for (const group of next.subscriptions) {
+          for (const node of group.nodes) {
+            const key = nodeLatencyKey(group.subscription_id, node.name);
+            const previous = current[key];
+            refreshed[key] = previous && previous.status !== "waiting"
+              ? { ...previous, status: "stale", message: "刷新状态后需要重新主动测速" }
+              : initialNodeLatencyState(node);
+          }
+        }
+        return refreshed;
+      });
       setActiveId((current) => (
         next.subscriptions.some((group) => group.subscription_id === current)
           ? current
@@ -65,9 +120,11 @@ export function NodesPage() {
     [activeGroup, query],
   );
   const stateMessage = activeGroup ? groupStateMessage(activeGroup) : null;
+  const testing = testingNode !== null || batchOperation !== null;
+  const busy = loading || selecting !== null || testing;
 
   const chooseNode = async (nodeName: string) => {
-    if (!activeGroup || nodeName === activeGroup.current_node) return;
+    if (!activeGroup || nodeName === activeGroup.current_node || testing) return;
     setSelecting(nodeName);
     setError(null);
     setNotice(null);
@@ -84,28 +141,114 @@ export function NodesPage() {
     }
   };
 
+  const testOne = async (nodeName: string) => {
+    if (!activeGroup || busy) return;
+    const subscriptionId = activeGroup.subscription_id;
+    const key = nodeLatencyKey(subscriptionId, nodeName);
+    setTestingNode(nodeName);
+    setError(null);
+    setNotice(null);
+    setLatencyStates((current) => ({
+      ...current,
+      [key]: { status: "running", latency_ms: null, tested_at: null, error_code: null, message: "正在测试" },
+    }));
+    try {
+      const result = await testSubscriptionNodeLatency(subscriptionId, nodeName);
+      setLatencyStates((current) => ({ ...current, [key]: latencyResultToView(result) }));
+      setNotice(result.message);
+    } catch (testError) {
+      setLatencyStates((current) => ({
+        ...current,
+        [key]: { status: "failure", latency_ms: null, tested_at: new Date().toISOString(), error_code: "controller_error", message: "Controller 响应异常，测速结果已拒绝" },
+      }));
+      setError(String(testError));
+    } finally {
+      setTestingNode(null);
+    }
+  };
+
+  const testAll = async () => {
+    if (!activeGroup || busy || activeGroup.state !== "available") return;
+    const subscriptionId = activeGroup.subscription_id;
+    const operationId = crypto.randomUUID();
+    const nodes = activeGroup.nodes;
+    const starting = batchStartingLatencyStates(nodes);
+    setBatchOperation(operationId);
+    setError(null);
+    setNotice(null);
+    setLatencyStates((current) => {
+      const next = { ...current };
+      for (const node of nodes) next[nodeLatencyKey(subscriptionId, node.name)] = starting[node.name];
+      return next;
+    });
+    try {
+      const result = await testSubscriptionNodeLatencies(subscriptionId, operationId);
+      const merged = mergeBatchLatencyResults(nodes, result);
+      setLatencyStates((current) => {
+        const next = { ...current };
+        for (const node of nodes) next[nodeLatencyKey(subscriptionId, node.name)] = merged[node.name];
+        return next;
+      });
+      setNotice(result.message);
+    } catch (batchError) {
+      setLatencyStates((current) => {
+        const next = { ...current };
+        for (const node of nodes) {
+          next[nodeLatencyKey(subscriptionId, node.name)] = { status: "failure", latency_ms: null, tested_at: new Date().toISOString(), error_code: "controller_error", message: "Controller 响应异常，测速结果已拒绝" };
+        }
+        return next;
+      });
+      setError(String(batchError));
+    } finally {
+      setBatchOperation(null);
+      setCancelling(false);
+    }
+  };
+
+  const cancelBatch = async () => {
+    if (!batchOperation || cancelling) return;
+    setCancelling(true);
+    setError(null);
+    try {
+      const accepted = await cancelSubscriptionNodeLatencyBatch(batchOperation);
+      if (!accepted) setError("批量测速已经结束，无需取消");
+    } catch (cancelError) {
+      setError(String(cancelError));
+      setCancelling(false);
+    }
+  };
+
   return (
     <main className="nodes-view">
       <header className="nodes-header">
         <div>
           <span className="eyebrow">SUBSCRIPTION RUNTIME</span>
           <h1>节点选择</h1>
-          <p>只管理 VPN Hub 自管 Mihomo 中的订阅节点；节点信息仅停留在当前运行时界面。</p>
+          <p>主动测速不会切换节点；结果与节点名称只停留在当前运行时界面。</p>
         </div>
-        <button className="secondary-button" disabled={loading || selecting !== null} onClick={() => void load()} type="button">
-          <RefreshCw aria-hidden="true" className={loading ? "spin" : ""} />
-          刷新列表
-        </button>
+        <div className="nodes-header-actions">
+          {batchOperation ? (
+            <button className="danger-button" disabled={cancelling} onClick={() => void cancelBatch()} type="button">
+              <Square aria-hidden="true" />{cancelling ? "正在取消…" : "取消批量测速"}
+            </button>
+          ) : (
+            <button className="primary-button" disabled={busy || !activeGroup || activeGroup.state !== "available"} onClick={() => void testAll()} type="button">
+              <Gauge aria-hidden="true" />测试全部
+            </button>
+          )}
+          <button className="secondary-button" disabled={busy} onClick={() => void load()} type="button">
+            <RefreshCw aria-hidden="true" className={loading ? "spin" : ""} />刷新状态
+          </button>
+        </div>
       </header>
 
       {catalog && (
         <div className={`node-privacy-note ${catalog.controller_ready ? "is-ready" : ""}`}>
-          <ShieldCheck aria-hidden="true" />
-          <span>{catalog.message}</span>
+          <ShieldCheck aria-hidden="true" /><span>{catalog.message}</span>
         </div>
       )}
       {error && <div className="node-feedback is-error" role="alert"><CircleAlert aria-hidden="true" />{error}</div>}
-      {notice && <div className="node-feedback is-success" role="status"><CheckCircle2 aria-hidden="true" />{notice}</div>}
+      {notice && <div aria-live="polite" className="node-feedback is-success" role="status"><CheckCircle2 aria-hidden="true" />{notice}</div>}
 
       {loading && !catalog ? (
         <div className="node-empty"><RefreshCw aria-hidden="true" className="spin" /><p>正在读取本机订阅节点…</p></div>
@@ -116,26 +259,20 @@ export function NodesPage() {
           <section className="node-toolbar" aria-label="节点筛选">
             <label className="node-subscription-field">
               <span>订阅出口</span>
-              <select value={activeGroup?.subscription_id ?? ""} onChange={(event) => {
+              <select disabled={testing} value={activeGroup?.subscription_id ?? ""} onChange={(event) => {
                 setActiveId(event.target.value);
                 setQuery("");
                 setError(null);
                 setNotice(null);
               }}>
-                {catalog.subscriptions.map((group) => (
-                  <option key={group.subscription_id} value={group.subscription_id}>{group.label}</option>
-                ))}
+                {catalog.subscriptions.map((group) => <option key={group.subscription_id} value={group.subscription_id}>{group.label}</option>)}
               </select>
             </label>
             <label className="node-search-field">
-              <Search aria-hidden="true" />
-              <span className="sr-only">搜索节点</span>
+              <Search aria-hidden="true" /><span className="sr-only">搜索节点</span>
               <input onChange={(event) => setQuery(event.target.value)} placeholder="搜索节点名称或协议" type="search" value={query} />
             </label>
-            <div className="node-current-summary">
-              <span>当前节点</span>
-              <strong>{activeGroup?.current_node ?? "尚未选择"}</strong>
-            </div>
+            <div className="node-current-summary"><span>当前节点（测速不会改变）</span><strong>{activeGroup?.current_node ?? "尚未选择"}</strong></div>
           </section>
 
           {stateMessage ? (
@@ -146,29 +283,27 @@ export function NodesPage() {
             <section className="node-grid" aria-label={`${activeGroup?.label ?? "订阅"}节点列表`}>
               {visibleNodes.map((node) => {
                 const selected = node.name === activeGroup?.current_node;
-                const busy = selecting === node.name;
-                const healthClass = node.alive === true ? "is-healthy" : node.alive === false ? "is-down" : "is-unknown";
-                const healthLabel = node.alive === true ? "可用" : node.alive === false ? "不可用" : "未探测";
+                const selectingThis = selecting === node.name;
+                const state = latencyStates[nodeLatencyKey(activeGroup!.subscription_id, node.name)];
+                const latency = latencyPresentation(node, state);
+                const testedAt = state?.tested_at ? new Date(state.tested_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : null;
                 return (
-                  <button
-                    aria-pressed={selected}
-                    className={`node-card ${selected ? "is-selected" : ""}`}
-                    disabled={selecting !== null}
-                    key={node.name}
-                    onClick={() => void chooseNode(node.name)}
-                    type="button"
-                  >
-                    <span className="node-card-head">
-                      <span className={`node-health ${healthClass}`}><i />{healthLabel}</span>
+                  <article className={`node-card ${selected ? "is-selected" : ""}`} key={node.name}>
+                    <div className="node-card-head">
+                      <span className={`node-latency-state ${latency.className}`}><i />{latency.label}</span>
                       {selected && <span className="node-selected-mark"><CheckCircle2 aria-hidden="true" />当前</span>}
-                    </span>
+                    </div>
                     <strong title={node.name}>{node.name}</strong>
-                    <span className="node-card-meta">
-                      <span>{node.proxy_type}</span>
-                      <span><Zap aria-hidden="true" />{node.latency_ms === null ? "未测速" : `${node.latency_ms} ms`}</span>
-                    </span>
-                    <span className="node-card-action">{busy ? "正在确认…" : selected ? "已选择" : "选择此节点"}</span>
-                  </button>
+                    <div className="node-card-meta"><span>{node.proxy_type}</span><span title={latency.detail}><Zap aria-hidden="true" />{testedAt ?? latency.detail}</span></div>
+                    <div className="node-card-actions">
+                      <button aria-label={`重测 ${node.name}`} className="secondary-button node-test-button" disabled={busy} onClick={() => void testOne(node.name)} type="button">
+                        <Gauge aria-hidden="true" />{testingNode === node.name ? "测试中…" : "单节点重测"}
+                      </button>
+                      <button aria-pressed={selected} className="node-select-button" disabled={busy || selected} onClick={() => void chooseNode(node.name)} type="button">
+                        {selectingThis ? "正在确认…" : selected ? "已选择" : "选择此节点"}
+                      </button>
+                    </div>
+                  </article>
                 );
               })}
             </section>

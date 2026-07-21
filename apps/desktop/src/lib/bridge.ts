@@ -7,6 +7,8 @@ import type {
   HistoryExport,
   HistoryFilter,
   HistoryResponse,
+  NodeLatencyBatchResult,
+  NodeLatencyResult,
   RouteMode,
   SafeSettingsView,
   SettingsTerminalStatus,
@@ -137,6 +139,20 @@ let browserNodeCatalog: SubscriptionNodeCatalog = {
     },
   ],
   message: "浏览器预览：以下为合成节点数据，不会连接 Mihomo 或修改系统网络。",
+};
+const browserNodeLatencyActive = new Set<string>();
+const browserNodeLatencyCancelled = new Set<string>();
+
+const syntheticLatencyResult = (nodeName: string): NodeLatencyResult => {
+  const testedAt = new Date().toISOString();
+  if (nodeName.includes("03")) {
+    return { node_name: nodeName, status: "failure", latency_ms: null, tested_at: testedAt, error_code: "node_disappeared", message: "节点已从 provider 中消失，请刷新状态", selection_unchanged: true };
+  }
+  if (nodeName.includes("04")) {
+    return { node_name: nodeName, status: "failure", latency_ms: null, tested_at: testedAt, error_code: "timeout", message: "节点测速超时", selection_unchanged: true };
+  }
+  const latency = 38 + (Array.from(nodeName).reduce((sum, character) => sum + character.codePointAt(0)!, 0) % 92);
+  return { node_name: nodeName, status: "success", latency_ms: latency, tested_at: testedAt, error_code: null, message: "本次延迟测试成功；权威当前节点保持不变", selection_unchanged: true };
 };
 
 export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
@@ -287,6 +303,76 @@ export async function selectSubscriptionNode(
     subscriptionId,
     nodeName,
   });
+}
+
+export async function testSubscriptionNodeLatency(
+  subscriptionId: string,
+  nodeName: string,
+): Promise<NodeLatencyResult> {
+  if (!isTauriRuntime()) {
+    const group = browserNodeCatalog.subscriptions.find(
+      (item) => item.subscription_id === subscriptionId,
+    );
+    if (!group) {
+      return { node_name: nodeName, status: "failure", latency_ms: null, tested_at: new Date().toISOString(), error_code: "provider_unavailable", message: "订阅 provider 尚未就绪", selection_unchanged: true };
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
+    return syntheticLatencyResult(nodeName);
+  }
+  return invoke<NodeLatencyResult>("test_subscription_node_latency", {
+    subscriptionId,
+    nodeName,
+  });
+}
+
+export async function testSubscriptionNodeLatencies(
+  subscriptionId: string,
+  operationId: string,
+): Promise<NodeLatencyBatchResult> {
+  if (!isTauriRuntime()) {
+    const group = browserNodeCatalog.subscriptions.find(
+      (item) => item.subscription_id === subscriptionId,
+    );
+    if (!group) {
+      return { subscription_id: subscriptionId, results: [], cancelled: false, selection_unchanged: true, error_code: "provider_unavailable", message: "订阅 provider 尚未就绪" };
+    }
+    browserNodeLatencyActive.add(operationId);
+    const results: NodeLatencyResult[] = [];
+    for (let index = 0; index < group.nodes.length; index += 4) {
+      await new Promise((resolve) => window.setTimeout(resolve, 260));
+      for (const node of group.nodes.slice(index, index + 4)) {
+        if (browserNodeLatencyCancelled.has(operationId)) {
+          results.push({ node_name: node.name, status: "cancelled", latency_ms: null, tested_at: new Date().toISOString(), error_code: "cancelled", message: "未开始的节点测速已取消", selection_unchanged: true });
+        } else {
+          results.push(syntheticLatencyResult(node.name));
+        }
+      }
+    }
+    const cancelled = browserNodeLatencyCancelled.has(operationId);
+    browserNodeLatencyActive.delete(operationId);
+    browserNodeLatencyCancelled.delete(operationId);
+    return {
+      subscription_id: subscriptionId,
+      results,
+      cancelled,
+      selection_unchanged: true,
+      error_code: null,
+      message: cancelled ? "批量测速已取消；已完成的结果仍保留在当前界面" : "批量测速完成；部分节点失败，其他成功结果已保留",
+    };
+  }
+  return invoke<NodeLatencyBatchResult>("test_subscription_node_latencies", {
+    subscriptionId,
+    operationId,
+  });
+}
+
+export async function cancelSubscriptionNodeLatencyBatch(operationId: string): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    if (!browserNodeLatencyActive.has(operationId)) return false;
+    browserNodeLatencyCancelled.add(operationId);
+    return true;
+  }
+  return invoke<boolean>("cancel_subscription_node_latency_batch", { operationId });
 }
 
 export async function previewSettings(request: SettingsPreviewRequest): Promise<SettingsPreview> {

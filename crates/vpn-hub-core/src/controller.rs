@@ -18,12 +18,16 @@ pub enum ControllerError {
     InvalidAddress,
     #[error("controller request failed")]
     Request,
+    #[error("controller request timed out")]
+    Timeout,
     #[error("controller returned HTTP {0}")]
     Http(StatusCode),
     #[error("controller response was invalid")]
     Response,
     #[error("selector target is unavailable")]
     TargetUnavailable,
+    #[error("proxy provider is unavailable")]
+    ProviderUnavailable,
     #[error("selector update could not be confirmed")]
     SelectionUnconfirmed,
 }
@@ -258,57 +262,71 @@ impl ControllerClient {
         Ok(after)
     }
 
-    /// Measures a selected proxy-provider member through Mihomo's provider API.
+    /// Measures an explicitly named proxy-provider member without selecting it.
     ///
-    /// Provider member names remain internal and are never returned or
-    /// persisted. Mihomo exposes provider members through a distinct
-    /// healthcheck route rather than the inline-proxy delay route.
+    /// The member must exist in the authenticated selector snapshot. The
+    /// selector is read again after the healthcheck and the call fails closed
+    /// unless the authoritative current selection is unchanged. Provider
+    /// member names remain transient and callers must not persist or log them.
     ///
     /// # Errors
     ///
     /// Returns sanitized transport, HTTP, or response errors.
-    pub async fn delay_selected_provider_member(
+    pub async fn delay_provider_member_preserving_selection(
         &self,
-        group: &str,
+        selector: &str,
         provider: &str,
+        member: &str,
         target: &str,
         timeout_ms: u64,
     ) -> Result<u64, ControllerError> {
-        let url = self.endpoint(&["proxies", group])?;
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(&self.secret)
-            .send()
-            .await
-            .map_err(|_| ControllerError::Request)?;
-        if !response.status().is_success() {
-            return Err(ControllerError::Http(response.status()));
+        let before = self.selector_nodes(selector).await?;
+        if before.nodes.is_empty() || before.current_node.is_none() {
+            return Err(ControllerError::ProviderUnavailable);
         }
-        let member = response
-            .json::<ProxySelectionResponse>()
-            .await
-            .map_err(|_| ControllerError::Response)?
-            .now;
-        let mut url = self.endpoint(&["providers", "proxies", provider, &member, "healthcheck"])?;
+        if !before.nodes.iter().any(|node| node.name == member) {
+            return Err(ControllerError::TargetUnavailable);
+        }
+
+        let mut url = self.endpoint(&["providers", "proxies", provider, member, "healthcheck"])?;
         url.query_pairs_mut()
             .append_pair("timeout", &timeout_ms.to_string())
             .append_pair("url", target);
-        let response = self
+        let probe = self
             .client
             .get(url)
             .bearer_auth(&self.secret)
+            .timeout(Duration::from_millis(timeout_ms))
             .send()
             .await
-            .map_err(|_| ControllerError::Request)?;
-        if !response.status().is_success() {
-            return Err(ControllerError::Http(response.status()));
-        }
-        response
-            .json::<DelayResponse>()
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ControllerError::Timeout
+                } else {
+                    ControllerError::Request
+                }
+            });
+        let probe = match probe {
+            Ok(response) if response.status().is_success() => response
+                .json::<DelayResponse>()
+                .await
+                .map(|body| body.delay)
+                .map_err(|_| ControllerError::Response),
+            Ok(response) => Err(ControllerError::Http(response.status())),
+            Err(error) => Err(error),
+        };
+
+        let after = self
+            .selector_nodes(selector)
             .await
-            .map(|body| body.delay)
-            .map_err(|_| ControllerError::Response)
+            .map_err(|_| ControllerError::SelectionUnconfirmed)?;
+        if after.current_node != before.current_node {
+            return Err(ControllerError::SelectionUnconfirmed);
+        }
+        if !after.nodes.iter().any(|node| node.name == member) {
+            return Err(ControllerError::TargetUnavailable);
+        }
+        probe
     }
 
     /// Confirms that the authenticated loopback Controller is a Mihomo API.
@@ -727,6 +745,109 @@ mod tests {
             .select_selector_node("vpn-hub-outlet-demo", "Synthetic Beta")
             .await
             .expect_err("mismatched readback must not report success");
+        assert!(matches!(error, ControllerError::SelectionUnconfirmed));
+        server.join().expect("Controller server");
+    }
+
+    #[tokio::test]
+    async fn measures_named_provider_member_without_changing_authoritative_selection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback Controller");
+        let address = listener.local_addr().expect("Controller address");
+        let server = thread::spawn(move || {
+            for step in 0..3 {
+                let (mut stream, _) = listener.accept().expect("Controller connection");
+                let request = read_request(&mut stream);
+                assert!(request.contains("authorization: Bearer test-secret"));
+                if step == 1 {
+                    assert!(request.starts_with(
+                        "GET /providers/proxies/vpn-hub-provider-demo/Synthetic%20Beta/healthcheck?"
+                    ));
+                    assert!(request.contains("timeout=1500"));
+                    assert!(request.contains("url=https%3A%2F%2Fprobe.invalid%2Fhealth"));
+                    write_json_response(&mut stream, &serde_json::json!({"delay": 57}));
+                    continue;
+                }
+                assert!(request.starts_with("GET /proxies "));
+                write_json_response(
+                    &mut stream,
+                    &serde_json::json!({
+                        "proxies": {
+                            "vpn-hub-outlet-demo": {
+                                "type": "URLTest",
+                                "now": "Synthetic Alpha",
+                                "all": ["Synthetic Alpha", "Synthetic Beta"]
+                            },
+                            "Synthetic Alpha": {"type": "Vless", "alive": true},
+                            "Synthetic Beta": {"type": "Trojan", "alive": true}
+                        }
+                    }),
+                );
+            }
+        });
+        let client =
+            ControllerClient::new(&format!("http://{address}"), "test-secret".into(), 2_000)
+                .expect("Controller client");
+
+        let latency = client
+            .delay_provider_member_preserving_selection(
+                "vpn-hub-outlet-demo",
+                "vpn-hub-provider-demo",
+                "Synthetic Beta",
+                "https://probe.invalid/health",
+                1_500,
+            )
+            .await
+            .expect("provider member latency");
+        assert_eq!(latency, 57);
+        server.join().expect("Controller server");
+    }
+
+    #[tokio::test]
+    async fn rejects_latency_when_authoritative_selection_changes_during_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback Controller");
+        let address = listener.local_addr().expect("Controller address");
+        let server = thread::spawn(move || {
+            for step in 0..3 {
+                let (mut stream, _) = listener.accept().expect("Controller connection");
+                let _request = read_request(&mut stream);
+                if step == 1 {
+                    write_json_response(&mut stream, &serde_json::json!({"delay": 57}));
+                    continue;
+                }
+                let current = if step == 0 {
+                    "Synthetic Alpha"
+                } else {
+                    "Synthetic Beta"
+                };
+                write_json_response(
+                    &mut stream,
+                    &serde_json::json!({
+                        "proxies": {
+                            "vpn-hub-outlet-demo": {
+                                "now": current,
+                                "all": ["Synthetic Alpha", "Synthetic Beta"]
+                            },
+                            "Synthetic Alpha": {"type": "Vless"},
+                            "Synthetic Beta": {"type": "Trojan"}
+                        }
+                    }),
+                );
+            }
+        });
+        let client =
+            ControllerClient::new(&format!("http://{address}"), "test-secret".into(), 2_000)
+                .expect("Controller client");
+
+        let error = client
+            .delay_provider_member_preserving_selection(
+                "vpn-hub-outlet-demo",
+                "vpn-hub-provider-demo",
+                "Synthetic Beta",
+                "https://probe.invalid/health",
+                1_500,
+            )
+            .await
+            .expect_err("changed selection must reject latency");
         assert!(matches!(error, ControllerError::SelectionUnconfirmed));
         server.join().expect("Controller server");
     }
