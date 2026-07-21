@@ -241,6 +241,7 @@ export async function previewSettings(request: SettingsPreviewRequest): Promise<
       can_apply: issues.length === 0
         && (JSON.stringify(draft) !== JSON.stringify(browserSettings.draft)
           || request.credential_intents.length > 0),
+      requires_managed_core_restart: false,
       request_fingerprint: fingerprint,
       tun_plan: {
         requested_enabled: false,
@@ -314,6 +315,7 @@ export async function applySettings(request: SettingsApplyRequest): Promise<Sett
         retention_changed: true,
       },
       removed_history_rows: 0,
+      managed_core_restarted: false,
     };
   }
   return invoke<SettingsApplyResult>("apply_settings", { request });

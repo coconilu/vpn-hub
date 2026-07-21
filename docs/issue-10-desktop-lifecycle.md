@@ -11,7 +11,7 @@
 | 托盘“停止核心 / 取消恢复” | durable `pending_stop` → bounded retry → `StopOwnedCore` | 取消手动启动、自动恢复和退避；只停止 `AppState` 当前持有或迟到发布的 owned child |
 | 明确退出 / OS shutdown | cancel + bounded join → durable stop → permit exit | 每次等待与清理尝试都有 3 秒硬边界；若事务忙则保持事件循环并重试，确认 owned child 已清理后才允许退出 |
 | owned child 意外退出 | 通知 → 有界退避 → restart → full Guardian | 独立 PID watcher 以 250ms 周期核对同一 owned PID |
-| 配置提交 | `RefreshTray` → restart（按需）→ full Guardian | 提交后立即刷新动态投影，探测异步执行 |
+| 配置提交 | 普通变更：`RefreshTray` → probe；运行时变更：受控 stop → restart → full Guardian | 运行时变更只有在新核心 PID、Controller ownership 和首次 Guardian 全部确认后才完成提交 |
 | 手动路由模式 / 出口变更成功 | `RefreshTray` → collect transitions | Guardian 决策成功后立即刷新并发送一次跃迁通知，不追加 probe |
 | 睡眠间隔 / 网络 fingerprint 变化 | coalesce → full Guardian | 保留数据库阈值、路由 cooldown 和 Fail Closed 状态机 |
 

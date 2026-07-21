@@ -142,6 +142,7 @@ pub struct SettingsPreview {
     pub diff: SettingsDiff,
     pub issues: Vec<ValidationIssue>,
     pub can_apply: bool,
+    pub requires_managed_core_restart: bool,
     pub request_fingerprint: String,
     pub tun_plan: SafeTunPlanPreview,
 }
@@ -216,6 +217,7 @@ pub struct SettingsApplyResult {
     pub settings: SafeSettingsView,
     pub diff: SettingsDiff,
     pub removed_history_rows: u64,
+    pub managed_core_restarted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,8 +229,14 @@ enum SettingsTransactionPhase {
     PrivateCommitted,
     GuardianCommitted,
     CommitDecided,
+    RuntimeValidationPending,
     RolledBack,
     Finalized,
+}
+
+pub struct DeferredSettingsApply {
+    result: SettingsApplyResult,
+    transaction_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,6 +354,36 @@ fn validate_credential_intents(
             ));
         }
     }
+}
+
+fn validate_credential_mutations(
+    candidate: &PrivateRoutingConfig,
+    mutations: &[CredentialMutation],
+) -> Result<(), String> {
+    let subscriptions = candidate
+        .outlets
+        .iter()
+        .filter(|outlet| matches!(outlet.kind, OutletKind::Subscription { .. }))
+        .map(|outlet| outlet.id.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    for mutation in mutations {
+        if !subscriptions.contains(mutation.subscription_id.as_str()) {
+            return Err("凭据变更引用了未知订阅".into());
+        }
+        if !seen.insert(mutation.subscription_id.as_str()) {
+            return Err("同一订阅不能在一次应用中提交多个凭据动作".into());
+        }
+        if mutation.action == CredentialMutationAction::Set {
+            let credential = mutation
+                .credential
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "覆盖订阅凭据时必须提供新值".to_string())?;
+            validate_subscription_url(credential).map_err(|_| "订阅凭据格式无效".to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn settings_routing_action(
@@ -508,6 +546,7 @@ pub struct AppState {
     routing_engine: Mutex<RoutingEngine>,
     settings_preview_ticket: Mutex<Option<String>>,
     routing_transaction: RoutingTransaction,
+    settings_apply_transaction: RoutingTransaction,
     initialization_error: Option<String>,
     supervisor_route: SupervisorRoute,
     #[cfg(test)]
@@ -919,6 +958,7 @@ impl AppState {
             routing_engine: Mutex::new(routing_engine),
             settings_preview_ticket: Mutex::new(None),
             routing_transaction: RoutingTransaction::default(),
+            settings_apply_transaction: RoutingTransaction::default(),
             initialization_error,
             supervisor_route,
             #[cfg(test)]
@@ -1063,9 +1103,23 @@ impl AppState {
         ))
     }
 
+    #[cfg(test)]
     pub fn preview_settings(
         &self,
         request: &SettingsPreviewRequest,
+    ) -> Result<SettingsPreview, String> {
+        let managed_core_running = self
+            .managed_core
+            .lock()
+            .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?
+            .is_some();
+        self.preview_settings_with_core_state(request, managed_core_running)
+    }
+
+    pub fn preview_settings_with_core_state(
+        &self,
+        request: &SettingsPreviewRequest,
+        managed_core_running: bool,
     ) -> Result<SettingsPreview, String> {
         let fingerprint = settings_request_fingerprint(
             &request.draft,
@@ -1082,6 +1136,7 @@ impl AppState {
             request.active_outlet_replacement.as_deref(),
             request.fail_closed_on_removed_active,
             &fingerprint,
+            managed_core_running,
         )?;
         *self
             .settings_preview_ticket
@@ -1098,6 +1153,7 @@ impl AppState {
         active_outlet_replacement: Option<&str>,
         fail_closed_on_removed_active: bool,
         request_fingerprint: &str,
+        managed_core_running: bool,
     ) -> Result<SettingsPreview, String> {
         let current = self.private_config()?;
         let guardian = GuardianConfig::load(&self.guardian_config_path)
@@ -1150,23 +1206,14 @@ impl AppState {
                 ));
             }
         }
-        let managed_core_running = self
-            .managed_core
-            .lock()
-            .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?
-            .is_some();
-        if managed_core_running && diff.runtime_changed {
-            issues.push(ValidationIssue::new(
-                "runtime",
-                "managed_core_stop_required",
-                "影响 Mihomo 的设置只能在停止本应用自管核心后应用；当前核心与最后有效配置保持不变",
-            ));
-        }
+        let requires_managed_core_restart =
+            managed_core_running && (diff.runtime_changed || !credential_intents.is_empty());
         Ok(SettingsPreview {
             can_apply: issues.is_empty()
                 && (!diff.changes.is_empty() || !credential_intents.is_empty()),
             diff,
             issues,
+            requires_managed_core_restart,
             request_fingerprint: request_fingerprint.into(),
             tun_plan: safe_tun_plan_preview(draft, request_fingerprint),
         })
@@ -1177,6 +1224,129 @@ impl AppState {
         &self,
         request: SettingsApplyRequest,
     ) -> Result<SettingsApplyResult, String> {
+        self.apply_settings_inner(request, false)
+            .map(|(result, _)| result)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn apply_settings_deferred(
+        &self,
+        request: SettingsApplyRequest,
+    ) -> Result<DeferredSettingsApply, String> {
+        let (result, pending) = self.apply_settings_inner(request, true)?;
+        let transaction_id = pending
+            .map(|journal| journal.transaction_id)
+            .ok_or_else(|| "设置事务未进入运行时验证阶段".to_string())?;
+        Ok(DeferredSettingsApply {
+            result,
+            transaction_id,
+        })
+    }
+
+    pub fn preflight_settings_apply(
+        &self,
+        request: &SettingsApplyRequest,
+        managed_core_running: bool,
+    ) -> Result<SettingsPreview, String> {
+        let credential_intents = request
+            .credential_mutations
+            .iter()
+            .map(|mutation| CredentialMutationIntent {
+                subscription_id: mutation.subscription_id.clone(),
+                action: mutation.action,
+            })
+            .collect::<Vec<_>>();
+        let fingerprint = settings_request_fingerprint(
+            &request.draft,
+            request.active_outlet_replacement.as_deref(),
+            request.fail_closed_on_removed_active,
+            &credential_intents,
+        )?;
+        if fingerprint != request.preview_fingerprint {
+            return Err("应用内容与最后一次预览不匹配".into());
+        }
+        let ticket_matches = self
+            .settings_preview_ticket
+            .lock()
+            .map_err(|_| "设置预览状态锁已损坏".to_string())?
+            .as_deref()
+            == Some(fingerprint.as_str());
+        if !ticket_matches {
+            return Err("设置预览已失效或已被使用，请重新预览".into());
+        }
+        let preview = self.evaluate_settings(
+            &request.draft,
+            &credential_intents,
+            request.active_outlet_replacement.as_deref(),
+            request.fail_closed_on_removed_active,
+            &fingerprint,
+            managed_core_running,
+        )?;
+        if !preview.issues.is_empty() {
+            return Err(format!(
+                "设置校验失败：{}",
+                preview
+                    .issues
+                    .iter()
+                    .map(|issue| issue.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("；")
+            ));
+        }
+        if preview.diff.changes.is_empty() && credential_intents.is_empty() {
+            return Err("设置没有可应用的变更".into());
+        }
+        let current = self.private_config()?;
+        let candidate = request
+            .draft
+            .private_candidate(&current)
+            .map_err(|_| "设置候选在停止核心前校验失败".to_string())?;
+        if candidate.entry != current.entry {
+            return Err("统一入口只能通过专用安全切换事务修改；普通设置已拒绝该变更".into());
+        }
+        validate_credential_mutations(&candidate, &request.credential_mutations)?;
+        let current_guardian = GuardianConfig::load(&self.guardian_config_path)
+            .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
+        request
+            .draft
+            .guardian_candidate(&current_guardian)
+            .validate()
+            .map_err(|error| format!("Guardian 候选校验失败：{error}"))?;
+        self.validate_settings_candidate_before_stop(&candidate)?;
+        Ok(preview)
+    }
+
+    fn validate_settings_candidate_before_stop(
+        &self,
+        candidate: &PrivateRoutingConfig,
+    ) -> Result<(), String> {
+        let (yaml, summary) = generate_secret_free_validation_config(candidate)?;
+        if summary.has_direct_fallback || yaml.lines().any(|line| line.trim() == "DIRECT") {
+            return Err("候选 Mihomo 配置违反 Fail Closed 边界".into());
+        }
+        let validation_id = &generate_controller_secret()[..16];
+        let validation_directory =
+            settings_validation_directory(&self.runtime_directory, validation_id);
+        fs::create_dir_all(&validation_directory)
+            .map_err(|_| "无法创建隔离设置验证目录".to_string())?;
+        harden_private_path(&validation_directory)?;
+        let candidate_path = validation_directory.join("mihomo.yaml");
+        let operations = SystemDurableFileOps;
+        durable_write_new(&candidate_path, yaml.as_bytes(), &operations)
+            .map_err(|_| "无法持久化隔离候选配置".to_string())?;
+        harden_private_path(&candidate_path)?;
+        let validation =
+            self.run_settings_candidate_validation(&validation_directory, &candidate_path);
+        let cleanup = remove_validation_directory(&validation_directory, &operations);
+        validation.and(cleanup)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_settings_inner(
+        &self,
+        request: SettingsApplyRequest,
+        defer_runtime_validation: bool,
+    ) -> Result<(SettingsApplyResult, Option<SettingsTransactionJournal>), String> {
         let SettingsApplyRequest {
             draft,
             credential_mutations,
@@ -1225,6 +1395,10 @@ impl AppState {
             active_outlet_replacement.as_deref(),
             fail_closed_on_removed_active,
             &fingerprint,
+            self.managed_core
+                .lock()
+                .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?
+                .is_some(),
         )?;
         if !credential_intents.is_empty() {
             preview.diff.changes.push(vpn_hub_core::SettingsChange {
@@ -1297,18 +1471,55 @@ impl AppState {
                 return Err(error);
             }
         };
-        let transaction_result =
-            self.execute_settings_transaction(journal, &pending, &candidate, &candidate_guardian);
+        let transaction_result = self.execute_settings_transaction(
+            journal,
+            &pending,
+            &candidate,
+            &candidate_guardian,
+            defer_runtime_validation,
+        );
         match transaction_result {
-            Ok(removed_history_rows) => {
-                self.apply_committed_routing_state(&candidate, &routing_action)?;
-                Ok(SettingsApplyResult {
-                    settings: self.settings_view()?,
-                    diff: preview.diff,
-                    removed_history_rows,
-                })
+            Ok((removed_history_rows, pending_journal)) => {
+                let result = (|| {
+                    self.apply_committed_routing_state(&candidate, &routing_action)?;
+                    Ok::<SettingsApplyResult, String>(SettingsApplyResult {
+                        settings: self.settings_view()?,
+                        diff: preview.diff,
+                        removed_history_rows,
+                        managed_core_restarted: false,
+                    })
+                })();
+                match result {
+                    Ok(result) => Ok((result, pending_journal)),
+                    Err(error) if defer_runtime_validation => {
+                        rollback_settings_transaction(
+                            &self.runtime_directory,
+                            &self.private_config_path,
+                            &self.guardian_config_path,
+                            self.secret_store
+                                .as_ref()
+                                .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?,
+                        )?;
+                        Err(error)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             Err(error) => {
+                if defer_runtime_validation {
+                    rollback_settings_transaction(
+                        &self.runtime_directory,
+                        &self.private_config_path,
+                        &self.guardian_config_path,
+                        self.secret_store
+                            .as_ref()
+                            .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?,
+                    )
+                    .map_err(|_| {
+                        "设置提交失败且持久化回滚未完成；开发核心保持 Fail Closed".to_string()
+                    })?;
+                    return Err(error);
+                }
                 let committed = read_settings_journal(&self.runtime_directory)
                     .ok()
                     .is_some_and(|journal| {
@@ -1337,11 +1548,15 @@ impl AppState {
                             .as_ref()
                             .unwrap_or(&JournalRoutingAction::FailClosed),
                     )?;
-                    return Ok(SettingsApplyResult {
-                        settings: self.settings_view()?,
-                        diff: preview.diff,
-                        removed_history_rows: 0,
-                    });
+                    return Ok((
+                        SettingsApplyResult {
+                            settings: self.settings_view()?,
+                            diff: preview.diff,
+                            removed_history_rows: 0,
+                            managed_core_restarted: false,
+                        },
+                        None,
+                    ));
                 }
                 Err(error)
             }
@@ -1376,6 +1591,59 @@ impl AppState {
             engine.restore_current(None, None);
         }
         Ok(())
+    }
+
+    pub fn finalize_deferred_settings(
+        &self,
+        pending: &mut DeferredSettingsApply,
+    ) -> Result<SettingsApplyResult, String> {
+        let mut journal = read_settings_journal(&self.runtime_directory)?;
+        if journal.transaction_id != pending.transaction_id
+            || journal.phase != SettingsTransactionPhase::RuntimeValidationPending
+        {
+            return Err("待确认设置事务与运行时验证结果不匹配".into());
+        }
+        let store = self
+            .secret_store
+            .as_ref()
+            .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?;
+        let removed = finish_committed_settings_with_operations(
+            &self.runtime_directory,
+            &self.private_config_path,
+            &self.guardian_config_path,
+            &mut journal,
+            store,
+            &SystemDurableFileOps,
+        )?;
+        let _cleanup = cleanup_settings_transaction_with_operations(
+            &self.runtime_directory,
+            &journal,
+            store,
+            &SystemDurableFileOps,
+        );
+        pending.result.removed_history_rows = removed;
+        pending.result.managed_core_restarted = true;
+        Ok(pending.result.clone())
+    }
+
+    pub fn rollback_deferred_settings(
+        &self,
+        pending: &DeferredSettingsApply,
+    ) -> Result<(), String> {
+        let journal = read_settings_journal(&self.runtime_directory)?;
+        if journal.transaction_id != pending.transaction_id {
+            return Err("待回滚设置事务与运行时验证结果不匹配".into());
+        }
+        rollback_settings_transaction(
+            &self.runtime_directory,
+            &self.private_config_path,
+            &self.guardian_config_path,
+            self.secret_store
+                .as_ref()
+                .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?,
+        )?;
+        let restored = self.private_config()?;
+        self.apply_committed_routing_state(&restored, &JournalRoutingAction::FailClosed)
     }
 
     fn prepare_secret_operations(
@@ -1490,7 +1758,7 @@ impl AppState {
         let files =
             settings_transaction_files(&self.private_config_path, &self.guardian_config_path);
         let mut journal = SettingsTransactionJournal {
-            version: 2,
+            version: 3,
             transaction_id,
             phase: SettingsTransactionPhase::Prepared,
             file_existed: std::array::from_fn(|index| files[index].exists()),
@@ -1532,12 +1800,14 @@ impl AppState {
         pending: &[PendingSecretOperation],
         candidate: &PrivateRoutingConfig,
         candidate_guardian: &GuardianConfig,
-    ) -> Result<u64, String> {
+        defer_runtime_validation: bool,
+    ) -> Result<(u64, Option<SettingsTransactionJournal>), String> {
         self.execute_settings_transaction_with_operations(
             journal,
             pending,
             candidate,
             candidate_guardian,
+            defer_runtime_validation,
             &SystemDurableFileOps,
         )
     }
@@ -1548,8 +1818,9 @@ impl AppState {
         pending: &[PendingSecretOperation],
         candidate: &PrivateRoutingConfig,
         candidate_guardian: &GuardianConfig,
+        defer_runtime_validation: bool,
         operations: &O,
-    ) -> Result<u64, String> {
+    ) -> Result<(u64, Option<SettingsTransactionJournal>), String> {
         let store = self
             .secret_store
             .as_ref()
@@ -1590,7 +1861,12 @@ impl AppState {
         remove_validation_directory(&validation_directory, operations)?;
         validation_result?;
 
-        journal = persist_candidate_settings_and_commit_decision(
+        journal.phase = if defer_runtime_validation {
+            SettingsTransactionPhase::RuntimeValidationPending
+        } else {
+            SettingsTransactionPhase::CommitDecided
+        };
+        journal = persist_candidate_settings(
             &self.runtime_directory,
             &self.private_config_path,
             &self.guardian_config_path,
@@ -1599,6 +1875,16 @@ impl AppState {
             candidate_guardian,
             operations,
         )?;
+        if defer_runtime_validation {
+            for operation in pending {
+                if operation.journal.action == JournalSecretAction::Delete {
+                    store
+                        .delete(&operation.journal.current_ref)
+                        .map_err(|_| "无法暂存已提交的凭据删除".to_string())?;
+                }
+            }
+            return Ok((0, Some(journal)));
+        }
         for operation in pending {
             if operation.journal.action == JournalSecretAction::Delete {
                 store
@@ -1616,7 +1902,7 @@ impl AppState {
             store,
             operations,
         )?;
-        Ok(removed)
+        Ok((removed, None))
     }
 
     fn run_settings_candidate_validation(
@@ -2050,6 +2336,15 @@ impl AppState {
         self.routing_transaction.lock().await
     }
 
+    pub async fn lock_settings_apply(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.settings_apply_transaction.lock().await
+    }
+
+    pub fn settings_recovery_pending(&self) -> bool {
+        settings_journal_path(&self.runtime_directory).exists()
+            || settings_journal_backup_path(&self.runtime_directory).exists()
+    }
+
     pub fn set_route_mode(
         &self,
         mode: RouteMode,
@@ -2150,17 +2445,25 @@ impl AppState {
             });
         }
         let config = self.private_config()?;
-        if is_endpoint_reachable(&config.entry.host, config.entry.port) {
+        let entry_address = loopback_socket_address(&config.entry.host, config.entry.port);
+        let controller_address =
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.controller_port);
+        let entry_reachable = is_endpoint_reachable(&config.entry.host, config.entry.port);
+        let controller_reachable = is_endpoint_reachable("127.0.0.1", config.controller_port);
+        if entry_reachable || controller_reachable {
             return Ok(CoreStatus {
                 state: "external".into(),
                 managed: false,
-                pid: loopback_socket_address(&config.entry.host, config.entry.port)
-                    .and_then(listening_owner_pid),
+                pid: entry_address
+                    .filter(|_| entry_reachable)
+                    .and_then(listening_owner_pid)
+                    .or_else(|| {
+                        controller_reachable
+                            .then(|| listening_owner_pid(controller_address))
+                            .flatten()
+                    }),
                 started_at: None,
-                message: format!(
-                    "{}:{} 已被其他进程占用，本应用不会停止它",
-                    config.entry.host, config.entry.port
-                ),
+                message: "配置入口或 Controller 已被其他进程占用，本应用不会停止它".into(),
             });
         }
         Ok(CoreStatus {
@@ -2851,7 +3154,7 @@ fn settings_transaction_files(private_path: &Path, guardian_path: &Path) -> [Pat
     ]
 }
 
-fn persist_candidate_settings_and_commit_decision<O: DurableFileOps + ?Sized>(
+fn persist_candidate_settings<O: DurableFileOps + ?Sized>(
     runtime_directory: &Path,
     private_path: &Path,
     guardian_path: &Path,
@@ -2860,6 +3163,14 @@ fn persist_candidate_settings_and_commit_decision<O: DurableFileOps + ?Sized>(
     candidate_guardian: &GuardianConfig,
     operations: &O,
 ) -> Result<SettingsTransactionJournal, String> {
+    let completion_phase = journal.phase;
+    if !matches!(
+        completion_phase,
+        SettingsTransactionPhase::CommitDecided
+            | SettingsTransactionPhase::RuntimeValidationPending
+    ) {
+        return Err("设置事务完成阶段无效".into());
+    }
     candidate
         .save_with_operations(private_path, operations)
         .map_err(|_| "无法持久化提交私密路由配置".to_string())?;
@@ -2874,9 +3185,11 @@ fn persist_candidate_settings_and_commit_decision<O: DurableFileOps + ?Sized>(
     journal.phase = SettingsTransactionPhase::GuardianCommitted;
     write_settings_journal_with_operations(runtime_directory, &journal, operations)?;
 
-    // The commit point is written only after both config main files, both
+    // The final phase is written only after both config main files, both
     // adjacent backups, and their parent-directory metadata are durable.
-    journal.phase = SettingsTransactionPhase::CommitDecided;
+    // Reloads go directly to RuntimeValidationPending so a crash cannot expose
+    // an unverified candidate as committed.
+    journal.phase = completion_phase;
     write_settings_journal_with_operations(runtime_directory, &journal, operations)?;
     Ok(journal)
 }
@@ -2918,7 +3231,7 @@ fn read_settings_journal(runtime_directory: &Path) -> Result<SettingsTransaction
                 .transaction_id
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit());
-        if matches!(journal.version, 1 | 2) && valid_id {
+        if matches!(journal.version, 1..=3) && valid_id {
             return Ok(journal);
         }
     }
@@ -3015,7 +3328,7 @@ fn finish_committed_settings_with_operations<
     journal: &mut SettingsTransactionJournal,
     store: &S,
     operations: &O,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     for operation in &journal.secret_operations {
         if operation.action == JournalSecretAction::Delete {
             store
@@ -3027,9 +3340,10 @@ fn finish_committed_settings_with_operations<
         .map_err(|_| "无法读取已提交的 Guardian 配置".to_string())?;
     let private = PrivateRoutingConfig::load(private_path)
         .map_err(|_| "无法读取已提交的私密路由配置".to_string())?;
-    finish_settings_database(&private, &guardian, journal.target_retention_days)?;
+    let removed = finish_settings_database(&private, &guardian, journal.target_retention_days)?;
     journal.phase = SettingsTransactionPhase::Finalized;
-    write_settings_journal_with_operations(runtime_directory, journal, operations)
+    write_settings_journal_with_operations(runtime_directory, journal, operations)?;
+    Ok(removed)
 }
 
 fn cleanup_settings_transaction_with_operations<
@@ -3080,6 +3394,49 @@ fn recover_settings_transaction<S: SecretStore + ?Sized>(
     )
 }
 
+fn rollback_settings_transaction<S: SecretStore + ?Sized>(
+    runtime_directory: &Path,
+    private_path: &Path,
+    guardian_path: &Path,
+    store: &S,
+) -> Result<(), String> {
+    let primary = settings_journal_path(runtime_directory);
+    let backup = settings_journal_backup_path(runtime_directory);
+    if !primary.exists() && !backup.exists() {
+        return Ok(());
+    }
+    let mut journal = read_settings_journal(runtime_directory)?;
+    match journal.phase {
+        SettingsTransactionPhase::Prepared | SettingsTransactionPhase::RolledBack => {}
+        SettingsTransactionPhase::BackupsReady
+        | SettingsTransactionPhase::CredentialsStaged
+        | SettingsTransactionPhase::PrivateCommitted
+        | SettingsTransactionPhase::GuardianCommitted
+        | SettingsTransactionPhase::CommitDecided
+        | SettingsTransactionPhase::RuntimeValidationPending => {
+            let files = settings_transaction_files(private_path, guardian_path);
+            restore_settings_files_with_operations(
+                runtime_directory,
+                &journal,
+                &files,
+                &SystemDurableFileOps,
+            )?;
+            restore_settings_credentials(&journal, store)?;
+        }
+        SettingsTransactionPhase::Finalized => {
+            return Err("已完成的设置事务不能作为待验证事务回滚".into());
+        }
+    }
+    journal.phase = SettingsTransactionPhase::RolledBack;
+    write_settings_journal_with_operations(runtime_directory, &journal, &SystemDurableFileOps)?;
+    cleanup_settings_transaction_with_operations(
+        runtime_directory,
+        &journal,
+        store,
+        &SystemDurableFileOps,
+    )
+}
+
 fn recover_settings_transaction_with_operations<
     S: SecretStore + ?Sized,
     O: DurableFileOps + ?Sized,
@@ -3100,7 +3457,7 @@ fn recover_settings_transaction_with_operations<
     match journal.phase {
         SettingsTransactionPhase::CommitDecided => {
             committed_action = Some(journal.routing_action.clone());
-            finish_committed_settings_with_operations(
+            let _ = finish_committed_settings_with_operations(
                 runtime_directory,
                 private_path,
                 guardian_path,
@@ -3120,7 +3477,8 @@ fn recover_settings_transaction_with_operations<
         SettingsTransactionPhase::BackupsReady
         | SettingsTransactionPhase::CredentialsStaged
         | SettingsTransactionPhase::PrivateCommitted
-        | SettingsTransactionPhase::GuardianCommitted => {
+        | SettingsTransactionPhase::GuardianCommitted
+        | SettingsTransactionPhase::RuntimeValidationPending => {
             let files = settings_transaction_files(private_path, guardian_path);
             restore_settings_files_with_operations(
                 runtime_directory,
@@ -4025,7 +4383,8 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 fail_at,
                 operation: AtomicUsize::new(0),
             };
-            let result = persist_candidate_settings_and_commit_decision(
+            journal.phase = SettingsTransactionPhase::CommitDecided;
+            let result = persist_candidate_settings(
                 &runtime,
                 &private_path,
                 &guardian_path,
@@ -4159,6 +4518,101 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
 
         recover_settings_transaction(&runtime, &private, &guardian, &store).expect("recovery");
         assert_eq!(store.get(current_ref).expect("secret"), None);
+    }
+
+    #[test]
+    fn runtime_validation_pending_crash_restores_last_valid_files_and_secret() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runtime = directory.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("runtime");
+        let private = directory.path().join("private-routing.toml");
+        let guardian = directory.path().join("guardian.toml");
+        let mut original_private = PrivateRoutingConfig::default();
+        original_private.cooldown_seconds = 60;
+        original_private.save(&private).expect("private");
+        let original_guardian = GuardianConfig {
+            database_path: directory.path().join("history.db"),
+            monitor: MonitorConfig {
+                interval_seconds: 180,
+                connect_timeout_ms: 1_500,
+                request_timeout_ms: 8_000,
+                failure_threshold: 2,
+                recovery_threshold: 3,
+            },
+            outlets: Vec::new(),
+        };
+        original_guardian.save(&guardian).expect("guardian");
+        let files = settings_transaction_files(&private, &guardian);
+        let store = TestSecretStore::default();
+        store.set("settings.sub", "old-secret").expect("old secret");
+        store
+            .set("rollback.settings.abcdef1234567890.0", "old-secret")
+            .expect("rollback secret");
+        let mut journal = test_journal(
+            "abcdef1234567890",
+            SettingsTransactionPhase::Prepared,
+            &files,
+            JournalSecretOperation {
+                current_ref: "settings.sub".into(),
+                rollback_ref: "rollback.settings.abcdef1234567890.0".into(),
+                previous_present: true,
+                backup_ready: true,
+                action: JournalSecretAction::Set,
+            },
+        );
+        journal.version = 3;
+        write_settings_journal(&runtime, &journal).expect("journal");
+        backup_settings_files(&runtime, &journal, &files).expect("snapshots");
+        store
+            .set("settings.sub", "candidate-secret")
+            .expect("candidate secret");
+        let mut candidate_private = original_private.clone();
+        candidate_private.cooldown_seconds = 123;
+        let mut candidate_guardian = original_guardian.clone();
+        candidate_guardian.monitor.interval_seconds = 181;
+        journal.phase = SettingsTransactionPhase::RuntimeValidationPending;
+        let pending = persist_candidate_settings(
+            &runtime,
+            &private,
+            &guardian,
+            journal,
+            &candidate_private,
+            &candidate_guardian,
+            &SystemDurableFileOps,
+        )
+        .expect("pending candidate");
+        assert_eq!(
+            pending.phase,
+            SettingsTransactionPhase::RuntimeValidationPending
+        );
+        assert_eq!(
+            read_settings_journal(&runtime)
+                .expect("journal phase")
+                .phase,
+            SettingsTransactionPhase::RuntimeValidationPending
+        );
+
+        let recovered = recover_settings_transaction(&runtime, &private, &guardian, &store)
+            .expect("startup recovery");
+        assert_eq!(recovered, None);
+        assert_eq!(
+            PrivateRoutingConfig::load(&private)
+                .expect("private restored")
+                .cooldown_seconds,
+            60
+        );
+        assert_eq!(
+            GuardianConfig::load(&guardian)
+                .expect("guardian restored")
+                .monitor
+                .interval_seconds,
+            180
+        );
+        assert_eq!(
+            store.get("settings.sub").expect("secret restored"),
+            Some("old-secret".into())
+        );
+        assert!(!settings_journal_path(&runtime).exists());
     }
 
     #[test]
@@ -4380,6 +4834,50 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             std::io::ErrorKind::WouldBlock,
             "preview must not connect to or probe the candidate entry"
         );
+    }
+
+    #[test]
+    fn running_owned_core_requires_restart_but_does_not_block_valid_preview() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let mut config = state.private_config().expect("private");
+        config.outlets = vec![OutletConfig {
+            id: "local-a".into(),
+            label: "Local A".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "socks5h://127.0.0.1:45112".into(),
+            },
+        }];
+        config.save(&state.private_config_path).expect("config");
+        let pid = install_fake_owned_controller(&state, 30_000);
+        let mut draft = state.settings_view().expect("settings").draft;
+        draft.minimum_improvement_ms += 1;
+        let preview = state
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+            .expect("preview");
+        assert!(preview.can_apply);
+        assert!(preview.requires_managed_core_restart);
+        assert!(preview.issues.is_empty());
+        assert!(state.stop_owned_core_if_pid(pid).expect("exact stop"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_settings_apply_gate_serializes_callers() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(AppState::new_for_test(workspace_root, directory.path()));
+        let first = state.lock_settings_apply().await;
+        let second_state = Arc::clone(&state);
+        let second = tokio::spawn(async move {
+            let _second = second_state.lock_settings_apply().await;
+            true
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!second.is_finished());
+        drop(first);
+        assert!(second.await.expect("second caller"));
     }
 
     #[test]
@@ -4744,6 +5242,30 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             &[lease.address()]
         ));
         assert!(!owns_loopback_listeners(u32::MAX, &[lease.address()]));
+    }
+
+    #[test]
+    fn unknown_controller_listener_is_external_and_never_assumed_owned() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let controller = ProbePortLease::reserve().expect("unknown controller listener");
+        let entry = ProbePortLease::reserve_excluding(&[controller.port()]).expect("entry port");
+        let mut config = state.private_config().expect("private");
+        config.entry.port = entry.port();
+        config.controller_port = controller.port();
+        config.save(&state.private_config_path).expect("config");
+        drop(entry);
+
+        let status = state.core_status().expect("status");
+        assert_eq!(status.state, "external");
+        assert!(!status.managed);
+        assert!(state.owned_core_pid().is_none());
+        assert!(
+            state
+                .stop_owned_core_if_pid(status.pid.unwrap_or(u32::MAX))
+                .is_ok_and(|stopped| !stopped)
+        );
     }
 
     #[test]

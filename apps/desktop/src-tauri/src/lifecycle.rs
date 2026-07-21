@@ -739,6 +739,11 @@ impl DesktopCoordinator {
     }
 
     #[must_use]
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.pending_stop()
+    }
+
+    #[must_use]
     fn stop_available(&self) -> bool {
         self.stop_available.load(Ordering::Acquire)
     }
@@ -798,6 +803,10 @@ impl Default for DesktopCoordinator {
 
 pub fn dispatch(app: &AppHandle, event: LifecycleEvent) {
     app.state::<DesktopCoordinator>().dispatch(event);
+}
+
+pub async fn dispatch_stop_and_wait(app: &AppHandle) -> StopRequestResult {
+    app.state::<DesktopCoordinator>().request_stop().await
 }
 
 pub fn install_tray(app: &App) -> tauri::Result<()> {

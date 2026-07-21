@@ -15,8 +15,9 @@ use vpn_hub_core::{
     GuardianConfig, GuardianStore, HealthStatus, HistoryExport, HistoryFilter, HistoryOutletKind,
     HistoryOutletSnapshot, HistoryResponse, LatencySample, OutletConfig, OutletKind, OutletSummary,
     ProbeOutletConfig, ProbeResult, RouteMode, RouteSwitchEvent, StateEvent,
-    SubscriptionCredentialStatus, UdpCapabilityEvidence, UdpProbeTarget, is_current_udp_evidence,
-    probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle, unknown_udp_evidence,
+    SubscriptionCredentialStatus, UdpCapabilityEvidence, UdpProbeTarget, ValidationIssue,
+    is_current_udp_evidence, probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle,
+    unknown_udp_evidence,
 };
 
 use crate::{
@@ -230,28 +231,211 @@ pub async fn preview_settings(
     request: SettingsPreviewRequest,
 ) -> Result<SettingsPreview, String> {
     let _transaction = state.lock_routing_transaction().await;
-    state.preview_settings(&request)
+    let core_status = state.core_status_authoritative().await?;
+    let managed_core_running = core_status.managed && core_status.pid.is_some();
+    let mut preview = state.preview_settings_with_core_state(&request, managed_core_running)?;
+    if core_status.state == "external"
+        && (preview.diff.runtime_changed || !request.credential_intents.is_empty())
+    {
+        preview.issues.push(ValidationIssue::new(
+            "runtime",
+            "external_core_ownership_unproven",
+            "入口或 Controller 由未知进程持有；不会停止、重启或改写其运行配置",
+        ));
+        preview.can_apply = false;
+    }
+    if helper_settings_deployment_required(
+        state.uses_helper_authority(),
+        preview.diff.runtime_changed,
+        !request.credential_intents.is_empty(),
+    ) {
+        preview.issues.push(ValidationIssue::new(
+            "runtime",
+            "helper_settings_deployment_required",
+            "Helper 核心使用受保护的 ProgramData 配置；当前设置事务不会越权改写该运行配置",
+        ));
+        preview.can_apply = false;
+    }
+    Ok(preview)
 }
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
 pub async fn apply_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     request: SettingsApplyRequest,
 ) -> Result<SettingsApplyResult, String> {
-    let _transaction = state.lock_routing_transaction().await;
-    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
-    let result = after_successful_settings_commit(state.apply_settings(request), || {
-        coordinator.prepare_config_reload();
-    })?;
-    lifecycle::dispatch(
-        &app,
-        LifecycleEvent::ConfigReload {
-            now_ms: unix_time_ms(),
-        },
-    );
-    Ok(result)
+    let _settings_apply = state.lock_settings_apply().await;
+    let preflight = {
+        let _transaction = state.lock_routing_transaction().await;
+        let core_status = state.core_status_authoritative().await?;
+        let managed_core_running = core_status.managed && core_status.pid.is_some();
+        let preview = state.preflight_settings_apply(&request, managed_core_running)?;
+        if helper_settings_deployment_required(
+            state.uses_helper_authority(),
+            preview.diff.runtime_changed,
+            !request.credential_mutations.is_empty(),
+        ) {
+            return Err(
+                "Helper 核心使用受保护的 ProgramData 配置；拒绝把用户设置误报为已应用".into(),
+            );
+        }
+        if core_status.state == "external"
+            && (preview.diff.runtime_changed || !request.credential_mutations.is_empty())
+        {
+            return Err(
+                "入口或 Controller ownership 不可证明；不会停止、重启或改写未知核心".into(),
+            );
+        }
+        preview
+    };
+    if !preflight.requires_managed_core_restart {
+        let _transaction = state.lock_routing_transaction().await;
+        let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+        let result = after_successful_settings_commit(state.apply_settings(request), || {
+            coordinator.prepare_config_reload();
+        })?;
+        lifecycle::dispatch(
+            &app,
+            LifecycleEvent::ConfigReload {
+                now_ms: unix_time_ms(),
+            },
+        );
+        return Ok(result);
+    }
+
+    let owned_pid = state
+        .owned_core_pid_authoritative()
+        .await?
+        .ok_or_else(|| "预览中的自管核心已停止，请重新预览后应用".to_string())?;
+    if !state
+        .owned_core_controller_is_running_authoritative(owned_pid)
+        .await?
+    {
+        return Err("无法同时证明 PID 与 Controller ownership；不会停止或改写未知核心".into());
+    }
+    if lifecycle::dispatch_stop_and_wait(&app).await != lifecycle::StopRequestResult::Stopped
+        || state.owned_core_pid_authoritative().await?.is_some()
+    {
+        return Err("未能确认精确 owned core 已停止；当前配置保持不变".into());
+    }
+
+    let pending_result = {
+        let _transaction = state.lock_routing_transaction().await;
+        state.apply_settings_deferred(request)
+    };
+    let mut pending = match pending_result {
+        Ok(pending) => pending,
+        Err(error) => {
+            if state.settings_recovery_pending() {
+                return Err(format!(
+                    "设置提交失败且最后有效配置回滚未完成；核心保持停止并等待下次恢复：{error}"
+                ));
+            }
+            let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+            if coordinator.stop_requested() {
+                return Err(format!(
+                    "停止请求优先于设置应用；当前核心保持停止且配置未变更：{error}"
+                ));
+            }
+            let recovery = {
+                let _transaction = state.lock_routing_transaction().await;
+                start_owned_core_verified(&app, &state).await
+            };
+            return match recovery {
+                Ok(_) => Err(format!(
+                    "核心停止后设置预检失效；配置未变更且旧核心已恢复：{error}"
+                )),
+                Err(recovery_error) => Err(format!(
+                    "核心停止后设置预检失效；配置未变更，但旧核心恢复失败并进入 terminal Fail Closed：{error}；{recovery_error}"
+                )),
+            };
+        }
+    };
+    let reload_epoch_before_start = app
+        .state::<lifecycle::DesktopCoordinator>()
+        .recovery_epoch();
+    let start_result = {
+        let _transaction = state.lock_routing_transaction().await;
+        start_owned_core_verified(&app, &state).await
+    };
+    if let Err(start_error) = start_result {
+        let rollback = {
+            let _transaction = state.lock_routing_transaction().await;
+            state.rollback_deferred_settings(&pending)
+        };
+        if let Err(rollback_error) = rollback {
+            return Err(format!(
+                "新核心启动失败且最后有效配置回滚未完成；保持 Fail Closed：{start_error}；{rollback_error}"
+            ));
+        }
+        let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+        if coordinator.stop_requested()
+            || coordinator.recovery_epoch() != reload_epoch_before_start.saturating_add(1)
+        {
+            return Err("停止请求优先于设置重载；已恢复最后有效配置并保持核心停止".into());
+        }
+        let recovery = {
+            let _transaction = state.lock_routing_transaction().await;
+            start_owned_core_verified(&app, &state).await
+        };
+        return match recovery {
+            Ok(_) => Err(format!(
+                "新核心未通过权威回读；已恢复最后有效配置和旧核心：{start_error}"
+            )),
+            Err(recovery_error) => Err(format!(
+                "新核心未通过权威回读；已恢复最后有效配置，但旧核心恢复失败并进入 terminal Fail Closed：{start_error}；{recovery_error}"
+            )),
+        };
+    }
+
+    let finalized = {
+        let _transaction = state.lock_routing_transaction().await;
+        state.finalize_deferred_settings(&mut pending)
+    };
+    match finalized {
+        Ok(result) => Ok(result),
+        Err(finalize_error) => {
+            let _ = lifecycle::dispatch_stop_and_wait(&app).await;
+            let rollback = {
+                let _transaction = state.lock_routing_transaction().await;
+                state.rollback_deferred_settings(&pending)
+            };
+            if let Err(rollback_error) = rollback {
+                return Err(format!(
+                    "新核心已通过回读，但设置事务收尾与回滚均失败；核心已停止并保持 Fail Closed：{finalize_error}；{rollback_error}"
+                ));
+            }
+            if app
+                .state::<lifecycle::DesktopCoordinator>()
+                .stop_requested()
+            {
+                return Err("停止请求优先于设置收尾；已恢复最后有效配置并保持核心停止".into());
+            }
+            let recovery = {
+                let _transaction = state.lock_routing_transaction().await;
+                start_owned_core_verified(&app, &state).await
+            };
+            match recovery {
+                Ok(_) => Err(format!(
+                    "设置事务收尾失败；已恢复最后有效配置和旧核心：{finalize_error}"
+                )),
+                Err(recovery_error) => Err(format!(
+                    "设置事务收尾失败；已恢复最后有效配置，但旧核心恢复失败并进入 terminal Fail Closed：{finalize_error}；{recovery_error}"
+                )),
+            }
+        }
+    }
+}
+
+fn helper_settings_deployment_required(
+    helper_owned: bool,
+    runtime_changed: bool,
+    credentials_changed: bool,
+) -> bool {
+    helper_owned && (runtime_changed || credentials_changed)
 }
 
 fn after_successful_settings_commit<T>(
@@ -600,10 +784,17 @@ pub async fn start_development_core(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreStatus, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    start_owned_core_verified(&app, &state).await
+}
+
+async fn start_owned_core_verified(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<CoreStatus, String> {
     let coordinator = app.state::<lifecycle::DesktopCoordinator>();
     let cancel = Arc::new(AtomicBool::new(false));
     let start_epoch = coordinator.prepare_manual_start(&cancel)?;
-    let _transaction = state.lock_routing_transaction().await;
     let mut status = match state.start_development_core_cancellable(&cancel).await {
         Ok(status) => status,
         Err(error) => {
@@ -612,7 +803,7 @@ pub async fn start_development_core(
                 .await
                 .is_ok_and(|status| status.state == "external")
             {
-                lifecycle::dispatch(&app, LifecycleEvent::PortConflictObserved);
+                lifecycle::dispatch(app, LifecycleEvent::PortConflictObserved);
             }
             coordinator.complete_manual_start_failure(start_epoch);
             return Err(error);
@@ -637,7 +828,7 @@ pub async fn start_development_core(
         coordinator.complete_manual_start_failure(start_epoch);
         return Err("应用自管核心在首次 Guardian 前失去 PID 或 Controller ownership；已停止并保持 Fail Closed".into());
     }
-    let guardian_result = record_owned_controller_cycle_locked(&state).await;
+    let guardian_result = record_owned_controller_cycle_locked(state).await;
     if guardian_result.is_err()
         || !coordinator.manual_start_allowed(start_epoch)
         || !state.owned_core_controller_is_running(pid)
@@ -690,6 +881,14 @@ pub async fn stop_development_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn helper_owned_runtime_changes_are_rejected_even_while_stopped() {
+        assert!(helper_settings_deployment_required(true, true, false));
+        assert!(helper_settings_deployment_required(true, false, true));
+        assert!(!helper_settings_deployment_required(true, false, false));
+        assert!(!helper_settings_deployment_required(false, true, true));
+    }
 
     #[test]
     fn failed_settings_apply_does_not_cancel_scheduled_recovery() {
