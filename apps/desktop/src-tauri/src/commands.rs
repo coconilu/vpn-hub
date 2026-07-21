@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
         Arc,
@@ -24,8 +25,8 @@ use crate::{
     lifecycle::{self, LifecycleEvent},
     runtime::{
         AppState, CoreStatus, PortSnapshot, RoutingStatus, SettingsApplyRequest,
-        SettingsApplyResult, SettingsPreview, SettingsPreviewRequest, SubscriptionNodeCatalog,
-        SubscriptionNodeGroup,
+        SettingsApplyResult, SettingsPreview, SettingsPreviewRequest, SettingsTerminalStatus,
+        SubscriptionNodeCatalog, SubscriptionNodeGroup,
     },
 };
 
@@ -509,6 +510,17 @@ fn after_successful_terminal_recovery<T>(
     Ok(recovered)
 }
 
+async fn recover_active_settings_terminal(
+    current: SettingsTerminalStatus,
+    recovery: impl Future<Output = Result<SettingsTerminalStatus, String>>,
+    dispatch_reload: impl FnOnce(),
+) -> Result<SettingsTerminalStatus, String> {
+    if !current.active {
+        return Ok(current);
+    }
+    after_successful_terminal_recovery(recovery.await, dispatch_reload)
+}
+
 async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
@@ -621,22 +633,29 @@ pub async fn recover_settings_terminal(
 ) -> Result<crate::runtime::SettingsTerminalStatus, String> {
     let _settings_apply = state.lock_settings_apply().await;
     let _transaction = state.lock_routing_transaction().await;
-    let recovery = if state.settings_terminal_active() && state.controller_client()?.is_none() {
-        state.recover_settings_transaction_for_terminal()?;
-        start_owned_core_for_terminal_recovery(&app, &state).await
-    } else {
-        state.recover_settings_terminal().await
-    };
+    let current = state.settings_terminal_status();
     let coordinator = app.state::<lifecycle::DesktopCoordinator>();
-    after_successful_terminal_recovery(recovery, || {
-        coordinator.prepare_config_reload();
-        lifecycle::dispatch(
-            &app,
-            LifecycleEvent::ConfigReload {
-                now_ms: unix_time_ms(),
-            },
-        );
-    })
+    recover_active_settings_terminal(
+        current,
+        async {
+            if state.controller_client()?.is_none() {
+                state.recover_settings_transaction_for_terminal()?;
+                start_owned_core_for_terminal_recovery(&app, &state).await
+            } else {
+                state.recover_settings_terminal().await
+            }
+        },
+        || {
+            coordinator.prepare_config_reload();
+            lifecycle::dispatch(
+                &app,
+                LifecycleEvent::ConfigReload {
+                    now_ms: unix_time_ms(),
+                },
+            );
+        },
+    )
+    .await
 }
 
 fn unavailable_result(
@@ -1080,6 +1099,104 @@ mod tests {
         })
         .expect("terminal recovery");
         assert_eq!(reloads.get(), 1);
+    }
+
+    fn terminal_status(active: bool) -> SettingsTerminalStatus {
+        SettingsTerminalStatus {
+            active,
+            state: active.then_some(crate::runtime::SettingsTerminalState::Pending),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_recovery_transitions_and_reloads_exactly_once() {
+        async fn invoke(
+            lock: Arc<tokio::sync::Mutex<()>>,
+            gate_active: Arc<AtomicBool>,
+            clears: Arc<std::sync::atomic::AtomicUsize>,
+            reloads: Arc<std::sync::atomic::AtomicUsize>,
+            ready: Arc<tokio::sync::Barrier>,
+        ) -> Result<SettingsTerminalStatus, String> {
+            ready.wait().await;
+            let _guard = lock.lock().await;
+            let current = terminal_status(gate_active.load(Ordering::SeqCst));
+            recover_active_settings_terminal(
+                current,
+                async {
+                    clears.fetch_add(1, Ordering::SeqCst);
+                    gate_active.store(false, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok(terminal_status(false))
+                },
+                || {
+                    reloads.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await
+        }
+
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let gate_active = Arc::new(AtomicBool::new(true));
+        let clears = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ready = Arc::new(tokio::sync::Barrier::new(3));
+        let first = tokio::spawn(invoke(
+            Arc::clone(&lock),
+            Arc::clone(&gate_active),
+            Arc::clone(&clears),
+            Arc::clone(&reloads),
+            Arc::clone(&ready),
+        ));
+        let second = tokio::spawn(invoke(
+            lock,
+            Arc::clone(&gate_active),
+            Arc::clone(&clears),
+            Arc::clone(&reloads),
+            Arc::clone(&ready),
+        ));
+        ready.wait().await;
+
+        let first_status = first.await.expect("first join").expect("first recovery");
+        let second_status = second.await.expect("second join").expect("second recovery");
+        assert_eq!(first_status, terminal_status(false));
+        assert_eq!(second_status, terminal_status(false));
+        assert_eq!(clears.load(Ordering::SeqCst), 1);
+        assert_eq!(reloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_terminal_recovery_retry_is_an_inactive_no_op() {
+        let gate_active = AtomicBool::new(true);
+        let clears = std::sync::atomic::AtomicUsize::new(0);
+        let reloads = std::sync::atomic::AtomicUsize::new(0);
+
+        let first = recover_active_settings_terminal(
+            terminal_status(gate_active.load(Ordering::SeqCst)),
+            async {
+                clears.fetch_add(1, Ordering::SeqCst);
+                gate_active.store(false, Ordering::SeqCst);
+                Ok(terminal_status(false))
+            },
+            || {
+                reloads.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("first recovery");
+        let second = recover_active_settings_terminal(
+            terminal_status(gate_active.load(Ordering::SeqCst)),
+            async { Err("inactive recovery must not be polled".into()) },
+            || {
+                reloads.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("inactive retry");
+
+        assert_eq!(first, terminal_status(false));
+        assert_eq!(second, terminal_status(false));
+        assert_eq!(clears.load(Ordering::SeqCst), 1);
+        assert_eq!(reloads.load(Ordering::SeqCst), 1);
     }
 
     fn subscription() -> OutletConfig {

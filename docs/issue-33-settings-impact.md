@@ -62,6 +62,8 @@ selectors, durably remove the gate, and only then publish the core to automatic
 routing and emit exactly one config reload. It never borrows a Helper-owned or external Controller. Controller
 unavailability, failed authentication, failed ownership, failed readback, or a
 damaged gate remains fail closed.
+Concurrent or later retries that observe an already inactive gate return that
+inactive status as a successful no-op and do not emit another config reload.
 
 Credential deletion follows the same one-way boundary. During
 `RuntimeValidationPending`, the formal protected credential remains present;
