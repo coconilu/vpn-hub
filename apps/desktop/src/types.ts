@@ -254,6 +254,7 @@ export interface SettingsPreview {
   diff: SettingsDiff;
   issues: ValidationIssue[];
   can_apply: boolean;
+  requires_managed_core_restart: boolean;
   request_fingerprint: string;
   tun_plan: SafeTunPlanPreview;
 }
@@ -305,4 +306,5 @@ export interface SettingsApplyResult {
   settings: SafeSettingsView;
   diff: SettingsDiff;
   removed_history_rows: number;
+  managed_core_restarted: boolean;
 }

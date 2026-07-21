@@ -89,7 +89,9 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
       setCredentialIntentById({}); setPreview(null);
       const result = await pending;
       setView(result.settings); setDraft(result.settings.draft); setBaseline(JSON.stringify(result.settings.draft)); setReplacement(null); setFailClosed(false); setPageState("success");
-      onNotice(`设置已原子应用；清理 ${result.removed_history_rows} 条过期历史。`); await onApplied();
+      onNotice(result.managed_core_restarted
+        ? `设置已原子应用，自管核心已安全重启并通过权威回读；清理 ${result.removed_history_rows} 条过期历史。`
+        : `设置已原子应用；清理 ${result.removed_history_rows} 条过期历史。`); await onApplied();
     } catch (reason) { previewGeneration.current += 1; credentialInputs.current.clear(); setCredentialIntentById({}); setPreview(null); setError(String(reason)); setPageState("error"); }
   };
 
@@ -124,7 +126,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
             <Eye />预览变更
           </button>
           <button className="primary-button" type="button" disabled={!canApply || pageState === "applying"} onClick={() => void runApply()}>
-            <Save />应用设置
+            <Save />{preview?.requires_managed_core_restart ? "确认并重启核心" : "应用设置"}
           </button>
         </div>
       </header>
@@ -137,6 +139,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
           <ul>
             {preview.diff.changes.map((change) => <li key={change.code}>{change.summary}</li>)}
             {credentialIntentCount > 0 && <li>将更新 {credentialIntentCount} 个凭据状态；预览不读取或回显凭据。</li>}
+            {preview.requires_managed_core_restart && <li className="restart-warning">确认后将短暂中断连接：候选校验 → 精确停止自管核心 → 原子提交 → 重启 → Controller/Guardian 权威回读；失败时恢复最后有效配置，绝不回退 DIRECT。</li>}
           </ul>
           {preview.issues.length > 0 && (
             <ul className="validation-list">{preview.issues.map((issue) => <li key={`${issue.field}-${issue.code}`}>{issue.message}</li>)}</ul>

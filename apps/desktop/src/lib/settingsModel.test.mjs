@@ -110,3 +110,10 @@ test("unsupported TUN stays visibly off and cannot record consent", () => {
   assert.equal(source.includes("windows_verified_application_identity_exclusion_unavailable"), true);
   assert.equal(source.includes("missing_executable_identity_outlet_ids"), true);
 });
+
+test("managed-core reload is one explicit confirmation with fail-closed recovery copy", () => {
+  const source = fs.readFileSync(new URL("../SettingsPage.tsx", import.meta.url), "utf8");
+  assert.equal(source.includes("确认并重启核心"), true);
+  assert.equal(source.includes("候选校验 → 精确停止自管核心 → 原子提交 → 重启 → Controller/Guardian 权威回读"), true);
+  assert.equal(source.includes("失败时恢复最后有效配置，绝不回退 DIRECT"), true);
+});
