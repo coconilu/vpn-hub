@@ -13,6 +13,8 @@ import type {
   SettingsApplyResult,
   SettingsPreview,
   SettingsPreviewRequest,
+  SubscriptionNodeCatalog,
+  SubscriptionNodeGroup,
 } from "../types";
 
 declare global {
@@ -43,6 +45,36 @@ let browserSettings: SafeSettingsView = {
   credentials: [],
 };
 let browserSettingsPreviewTicket: string | null = null;
+let browserNodeCatalog: SubscriptionNodeCatalog = {
+  controller_ready: true,
+  subscriptions: [
+    {
+      subscription_id: "sub-a",
+      label: "订阅示例 A",
+      state: "available",
+      current_node: "示例节点 02",
+      nodes: [
+        { name: "示例节点 01", proxy_type: "Vless", alive: true, latency_ms: 42 },
+        { name: "示例节点 02", proxy_type: "Vless", alive: true, latency_ms: 67 },
+        { name: "示例节点 03", proxy_type: "Trojan", alive: false, latency_ms: null },
+        { name: "示例节点 04", proxy_type: "Hysteria2", alive: null, latency_ms: null },
+        { name: "实验线路 A", proxy_type: "Vmess", alive: true, latency_ms: 118 },
+        { name: "实验线路 B", proxy_type: "Vless", alive: true, latency_ms: 91 },
+      ],
+    },
+    {
+      subscription_id: "sub-b",
+      label: "订阅示例 B",
+      state: "available",
+      current_node: "备用节点 01",
+      nodes: [
+        { name: "备用节点 01", proxy_type: "Vless", alive: true, latency_ms: 83 },
+        { name: "备用节点 02", proxy_type: "Trojan", alive: true, latency_ms: 105 },
+      ],
+    },
+  ],
+  message: "浏览器预览：以下为合成节点数据，不会连接 Mihomo 或修改系统网络。",
+};
 
 export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
   if (!isTauriRuntime()) return structuredClone(browserSnapshot);
@@ -148,6 +180,37 @@ export async function setHistoryRetention(days: number): Promise<number> {
 export async function getSettings(): Promise<SafeSettingsView> {
   if (!isTauriRuntime()) return structuredClone(browserSettings);
   return invoke<SafeSettingsView>("get_settings");
+}
+
+export async function getSubscriptionNodeCatalog(): Promise<SubscriptionNodeCatalog> {
+  if (!isTauriRuntime()) return structuredClone(browserNodeCatalog);
+  return invoke<SubscriptionNodeCatalog>("get_subscription_node_catalog");
+}
+
+export async function selectSubscriptionNode(
+  subscriptionId: string,
+  nodeName: string,
+): Promise<SubscriptionNodeGroup> {
+  if (!isTauriRuntime()) {
+    const group = browserNodeCatalog.subscriptions.find(
+      (item) => item.subscription_id === subscriptionId,
+    );
+    if (!group || !group.nodes.some((node) => node.name === nodeName)) {
+      throw new Error("节点列表已变化，请刷新后重试；原节点选择保持不变");
+    }
+    const updated = { ...group, current_node: nodeName };
+    browserNodeCatalog = {
+      ...browserNodeCatalog,
+      subscriptions: browserNodeCatalog.subscriptions.map((item) => (
+        item.subscription_id === subscriptionId ? updated : item
+      )),
+    };
+    return structuredClone(updated);
+  }
+  return invoke<SubscriptionNodeGroup>("select_subscription_node", {
+    subscriptionId,
+    nodeName,
+  });
 }
 
 export async function previewSettings(request: SettingsPreviewRequest): Promise<SettingsPreview> {

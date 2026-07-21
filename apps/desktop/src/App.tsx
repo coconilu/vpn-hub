@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Dashboard } from "./Dashboard";
 import { HistoryPage } from "./HistoryPage";
+import { NodesPage } from "./NodesPage";
 import { SettingsPage } from "./SettingsPage";
 import { Sidebar, type ViewId } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
@@ -99,6 +100,8 @@ export default function App() {
             onUdpRevalidate={handleUdpRevalidate}
             onCoreToggle={handleCoreToggle}
           />
+        ) : view === "nodes" ? (
+          <NodesPage />
         ) : view === "history" ? (
           <HistoryPage onNotice={setNotice} />
         ) : (

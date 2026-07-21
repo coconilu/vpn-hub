@@ -38,6 +38,8 @@ pub fn run() {
             commands::export_history,
             commands::set_history_retention,
             commands::get_settings,
+            commands::get_subscription_node_catalog,
+            commands::select_subscription_node,
             commands::preview_settings,
             commands::apply_settings,
             commands::refresh_guardian,
