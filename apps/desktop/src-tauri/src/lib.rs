@@ -42,6 +42,8 @@ pub fn run() {
             commands::select_subscription_node,
             commands::preview_settings,
             commands::apply_settings,
+            commands::get_settings_terminal_status,
+            commands::recover_settings_terminal,
             commands::refresh_guardian,
             commands::revalidate_udp_capabilities,
             commands::set_route_mode,

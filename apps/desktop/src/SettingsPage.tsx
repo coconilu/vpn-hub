@@ -1,22 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, Eye, Gauge, KeyRound, ListOrdered, Plus, RadioTower, Route, Save, ShieldAlert, ShieldCheck, Trash2 } from "lucide-react";
-import { applySettings, getSettings, previewSettings } from "./lib/bridge";
+import { applySettings, getSettings, getSettingsTerminalStatus, previewSettings, recoverSettingsTerminal } from "./lib/bridge";
 import {
   buildSettingsPreviewRequest,
   createOutletId,
   dispatchOneShotSettingsApply,
   isCurrentPreviewResponse,
   moveItem,
+  settingsPreviewOutcome,
+  settingsValidationTargetIds,
 } from "./lib/settingsModel";
 import { buildEntrySwitchFoundationPreview } from "./lib/entrySwitchModel";
-import type { CredentialState, LocalProxyProtocol, SafeSettingsView, SettingsDraft, SettingsOutlet, SettingsPreview } from "./types";
+import type { CredentialState, LocalProxyProtocol, SafeSettingsView, SettingsDraft, SettingsOutlet, SettingsPreview, SettingsTerminalStatus } from "./types";
 
 interface Props { currentOutletId: string | null; onApplied: () => Promise<void>; onNotice: (message: string) => void }
-type PageState = "loading" | "clean" | "dirty" | "preview" | "applying" | "success" | "error";
+type PageState = "loading" | "clean" | "dirty" | "checking" | "preview" | "confirm_reload" | "applying" | "success" | "error";
 const credentialLabel: Record<CredentialState, string> = { configured: "已配置", missing: "未配置", unavailable: "存储不可用", corrupted: "凭据损坏" };
 
 export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const [view, setView] = useState<SafeSettingsView | null>(null);
+  const [terminalStatus, setTerminalStatus] = useState<SettingsTerminalStatus>({ active: false, state: null });
   const [draft, setDraft] = useState<SettingsDraft | null>(null);
   const [baseline, setBaseline] = useState("");
   const [credentialIntentById, setCredentialIntentById] = useState<Record<string, "set" | "delete">>({});
@@ -31,11 +34,12 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const errorRef = useRef<HTMLDivElement>(null);
   const credentialInputs = useRef(new Map<string, HTMLInputElement>());
   const previewGeneration = useRef(0);
+  const operationInFlight = useRef(false);
   const credentialIntentCount = Object.keys(credentialIntentById).length;
   const dirty = draft !== null && (JSON.stringify(draft) !== baseline
     || credentialIntentCount > 0 || replacement !== null || failClosed);
 
-  useEffect(() => { void getSettings().then((settings) => { setView(settings); setDraft(settings.draft); setEntrySwitchTarget(settings.draft.entry); setBaseline(JSON.stringify(settings.draft)); setPageState("clean"); }).catch((reason) => { setError(String(reason)); setPageState("error"); }); }, []);
+  useEffect(() => { void Promise.all([getSettings(), getSettingsTerminalStatus()]).then(([settings, terminal]) => { setView(settings); setTerminalStatus(terminal); setDraft(settings.draft); setEntrySwitchTarget(settings.draft.entry); setBaseline(JSON.stringify(settings.draft)); setPageState("clean"); }).catch((reason) => { setError(String(reason)); setPageState("error"); }); }, []);
   useEffect(() => { if (pageState === "error") errorRef.current?.focus(); }, [pageState]);
 
   const invalidatePreview = () => {
@@ -57,33 +61,44 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     changeDraft((current) => ({ ...current, manual_outlet: current.manual_outlet === id ? null : current.manual_outlet, outlets: current.outlets.filter((_, itemIndex) => itemIndex !== index) }));
   };
 
-  const runPreview = async () => {
-    if (!draft) return;
+  const requestCurrentPreview = async () => {
+    if (!draft) return null;
     const request = buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById);
     const generation = ++previewGeneration.current;
-    setPageState("preview"); setError(null);
+    setPageState("checking"); setError(null);
     try {
       const result = await previewSettings(request);
-      if (!isCurrentPreviewResponse(generation, previewGeneration.current, request.request_fingerprint, result.request_fingerprint)) return;
+      if (!isCurrentPreviewResponse(generation, previewGeneration.current, request.request_fingerprint, result.request_fingerprint)) return null;
       setPreview(result);
-      if (result.issues.length > 0) { setError("预览发现需要修正的设置。所有问题已在下方列出。"); setPageState("error"); }
-    }
-    catch (reason) {
-      if (generation !== previewGeneration.current) return;
+      const outcome = settingsPreviewOutcome(result);
+      if (outcome === "error") {
+        setError("自动校验发现需要修正的设置。请从问题摘要跳转到对应字段。");
+        setPageState("error");
+      } else if (outcome === "no_changes") {
+        setError("没有可应用的设置变更。");
+        setPageState("error");
+      } else {
+        setPageState(outcome === "confirm_reload" ? "confirm_reload" : "preview");
+      }
+      return result;
+    } catch (reason) {
+      if (generation !== previewGeneration.current) return null;
       setError(String(reason)); setPageState("error");
+      return null;
     }
   };
-  const runApply = async () => {
-    if (!draft || !preview || preview.issues.length > 0) return;
+
+  const commitPreview = async (approved: SettingsPreview) => {
+    if (!draft || approved.issues.length > 0) return;
     const request = buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById);
-    if (request.request_fingerprint !== preview.request_fingerprint) { invalidatePreview(); return; }
+    if (request.request_fingerprint !== approved.request_fingerprint) { invalidatePreview(); return; }
     setPageState("applying"); setError(null);
     try {
       const pending = dispatchOneShotSettingsApply({
         draft,
         active_outlet_replacement: replacement,
         fail_closed_on_removed_active: failClosed,
-        preview_fingerprint: preview.request_fingerprint,
+        preview_fingerprint: approved.request_fingerprint,
       }, credentialInputs.current, credentialIntentById, applySettings);
       previewGeneration.current += 1;
       setCredentialIntentById({}); setPreview(null);
@@ -91,17 +106,97 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
       setView(result.settings); setDraft(result.settings.draft); setBaseline(JSON.stringify(result.settings.draft)); setReplacement(null); setFailClosed(false); setPageState("success");
       onNotice(result.managed_core_restarted
         ? `设置已原子应用，自管核心已安全重启并通过权威回读；清理 ${result.removed_history_rows} 条过期历史。`
-        : `设置已原子应用；清理 ${result.removed_history_rows} 条过期历史。`); await onApplied();
-    } catch (reason) { previewGeneration.current += 1; credentialInputs.current.clear(); setCredentialIntentById({}); setPreview(null); setError(String(reason)); setPageState("error"); }
+        : `设置已在线应用；核心未重启，清理 ${result.removed_history_rows} 条过期历史。`);
+      try { await onApplied(); } catch { onNotice("设置已应用，但仪表盘刷新失败；请稍后手动刷新。"); }
+    } catch (reason) {
+      previewGeneration.current += 1; credentialInputs.current.clear(); setCredentialIntentById({}); setPreview(null); setError(String(reason)); setPageState("error");
+    }
   };
 
-  if (!draft || !view) return <main className="settings-view" aria-busy="true"><p className="settings-loading">正在读取安全设置…</p></main>;
+  const runPreview = async () => {
+    if (!dirty || operationInFlight.current) return;
+    operationInFlight.current = true;
+    try { await requestCurrentPreview(); } finally { operationInFlight.current = false; }
+  };
+
+  const runApply = async () => {
+    if (!dirty || operationInFlight.current) return;
+    operationInFlight.current = true;
+    try {
+      const request = draft
+        ? buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById)
+        : null;
+      const confirmed = pageState === "confirm_reload" && preview && request
+        && preview.request_fingerprint === request.request_fingerprint;
+      if (confirmed) {
+        await commitPreview(preview);
+        return;
+      }
+      const checked = await requestCurrentPreview();
+      if (checked && settingsPreviewOutcome(checked) === "live_apply") await commitPreview(checked);
+    } finally {
+      operationInFlight.current = false;
+    }
+  };
+
+  const runTerminalRecovery = async () => {
+    if (operationInFlight.current) return;
+    operationInFlight.current = true;
+    setPageState("applying"); setError(null);
+    try {
+      const status = await recoverSettingsTerminal();
+      setTerminalStatus(status); setPageState("clean");
+      onNotice("已通过受鉴权 Controller 确认 MASTER/UDP 双 REJECT；terminal 安全门已解除，自动路由将重新评估。");
+      await onApplied();
+    } catch (reason) {
+      setError(String(reason)); setPageState("error");
+    } finally {
+      operationInFlight.current = false;
+    }
+  };
+
+  if (!draft || !view) return (
+    <main className="settings-view" aria-busy={pageState === "loading"}>
+      {error
+        ? <div className="settings-error" role="alert"><strong>无法读取设置</strong><span>{error}</span></div>
+        : <p className="settings-loading">正在读取安全设置…</p>}
+    </main>
+  );
   const statusById = new Map(view.credentials.map((status) => [status.subscription_id, status.state]));
   const enabledOutlets = draft.outlets.filter((outlet) => outlet.enabled);
   const currentRequest = buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById);
-  const canApply = preview !== null && preview.issues.length === 0
-    && preview.request_fingerprint === currentRequest.request_fingerprint
-    && (preview.diff.changes.length > 0 || credentialIntentCount > 0);
+  const previewMatches = preview?.request_fingerprint === currentRequest.request_fingerprint;
+  const busy = pageState === "checking" || pageState === "applying";
+  const actionUnavailable = !dirty || busy;
+  const actionReason = pageState === "checking"
+    ? "正在自动校验草稿；完成前不能重复提交。"
+    : pageState === "applying"
+      ? "正在应用已校验设置；完成前字段与操作保持锁定。"
+      : !dirty
+        ? "当前没有待应用的变更。"
+        : pageState === "confirm_reload" && previewMatches
+          ? "这些变更需要短暂中断连接；再次点击将确认受控重载。"
+          : "点击“应用设置”会自动校验；在线变更直接应用，需要重载时再请求确认。";
+  const impactLabel = {
+    live_apply: "在线应用",
+    managed_core_reload: "需核心重载",
+    dedicated_transaction: "专用安全事务",
+  } as const;
+  const focusValidationField = (field: string) => {
+    const target = settingsValidationTargetIds(field)
+      .map((id) => document.getElementById(id))
+      .find((element) => element !== null);
+    target?.focus();
+  };
+  const validationAttributes = (field: string) => {
+    const invalid = preview?.issues.some((issue) => issue.field === field
+      || (field === "outlets" && issue.field.startsWith("outlets."))) ?? false;
+    return {
+      id: `settings-${field}`,
+      "aria-invalid": invalid || undefined,
+      "aria-describedby": invalid ? "settings-validation-summary" : undefined,
+    };
+  };
   const originalEntry = view.draft.entry;
   const entrySwitchPreview = buildEntrySwitchFoundationPreview(
     originalEntry,
@@ -111,7 +206,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   );
 
   return (
-    <main className="settings-view">
+    <main className="settings-view" aria-busy={busy}>
       <header className="settings-header">
         <div className="settings-heading">
           <h1>设置</h1>
@@ -120,16 +215,27 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
         <div className="settings-actions">
           <span className={`settings-stage${pageState === "applying" ? " is-busy" : dirty ? " is-dirty" : ""}`} role="status" aria-live="polite">
             <span className="stage-dot" aria-hidden="true" />
-            {pageState === "applying" ? "正在原子应用" : dirty ? "有未应用变更" : pageState === "success" ? "应用成功" : "已同步"}
+            {pageState === "checking" ? "正在自动校验" : pageState === "applying" ? "正在原子应用" : pageState === "confirm_reload" ? "等待重载确认" : dirty ? "有未应用变更" : pageState === "success" ? "应用成功" : "已同步"}
           </span>
-          <button className="secondary-button" type="button" disabled={!dirty || pageState === "applying"} onClick={() => void runPreview()}>
-            <Eye />预览变更
+          <button className="secondary-button" type="button" aria-disabled={actionUnavailable} aria-describedby="settings-action-reason" onClick={() => void runPreview()}>
+            <Eye />查看变更
           </button>
-          <button className="primary-button" type="button" disabled={!canApply || pageState === "applying"} onClick={() => void runApply()}>
-            <Save />{preview?.requires_managed_core_restart ? "确认并重启核心" : "应用设置"}
+          <button className="primary-button" type="button" aria-disabled={actionUnavailable} aria-describedby="settings-action-reason" onClick={() => void runApply()}>
+            <Save />{pageState === "checking" ? "正在校验…" : pageState === "applying" ? "正在应用…" : pageState === "confirm_reload" && previewMatches ? "确认并重启核心" : "应用设置"}
           </button>
+          <p className="settings-action-reason" id="settings-action-reason">{actionReason}</p>
         </div>
       </header>
+
+      {terminalStatus.active && (
+        <section className="settings-error" role="alert" aria-label="terminal Fail Closed 安全门">
+          <strong>自动路由已锁定为 Fail Closed</strong>
+          <span>设置恢复未能证明旧状态完整一致。定时探测和配置重载不会重新选路；只有下方显式恢复会通过受鉴权 Controller 再次确认 MASTER/UDP 双 REJECT 后解除安全门。</span>
+          <button className="secondary-button" type="button" disabled={busy} onClick={() => void runTerminalRecovery()}>
+            <ShieldCheck />执行受鉴权恢复
+          </button>
+        </section>
+      )}
 
       {error && <div className="settings-error" ref={errorRef} tabIndex={-1} role="alert"><strong>无法应用</strong><span>{error}</span></div>}
 
@@ -137,16 +243,19 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
         <section className="settings-preview" aria-label="设置变更预览">
           <h2>变更预览</h2>
           <ul>
-            {preview.diff.changes.map((change) => <li key={change.code}>{change.summary}</li>)}
-            {credentialIntentCount > 0 && <li>将更新 {credentialIntentCount} 个凭据状态；预览不读取或回显凭据。</li>}
+            {preview.diff.changes.map((change) => <li key={change.code}><span className={`impact-badge is-${change.impact}`}>{impactLabel[change.impact]}</span>{change.summary}</li>)}
             {preview.requires_managed_core_restart && <li className="restart-warning">确认后将短暂中断连接：候选校验 → 精确停止自管核心 → 原子提交 → 重启 → Controller/Guardian 权威回读；失败时恢复最后有效配置，绝不回退 DIRECT。</li>}
           </ul>
           {preview.issues.length > 0 && (
-            <ul className="validation-list">{preview.issues.map((issue) => <li key={`${issue.field}-${issue.code}`}>{issue.message}</li>)}</ul>
+            <div id="settings-validation-summary" role="group" aria-label="设置问题摘要">
+              <h3>请修正以下问题</h3>
+              <ul className="validation-list">{preview.issues.map((issue) => <li key={`${issue.field}-${issue.code}`}><button type="button" onClick={() => focusValidationField(issue.field)}>{issue.message}</button></li>)}</ul>
+            </div>
           )}
         </section>
       )}
 
+      <fieldset className="settings-fields" disabled={busy}>
       <section className="settings-card">
         <div className="card-head">
           <div className="card-title">
@@ -158,11 +267,11 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
           </div>
         </div>
         <div className="field-grid">
-          <label className="field"><span>当前入口地址</span><input value={draft.entry.host} readOnly aria-readonly="true" /></label>
+          <label className="field"><span>当前入口地址</span><input {...validationAttributes("entry")} value={draft.entry.host} readOnly aria-readonly="true" /></label>
           <label className="field"><span>当前入口端口</span><input type="number" value={draft.entry.port} readOnly aria-readonly="true" /></label>
           <label className="field">
             <span>默认模式</span>
-            <select value={draft.route_mode} onChange={(event) => changeDraft((current) => ({ ...current, route_mode: event.target.value as SettingsDraft["route_mode"] }))}>
+            <select {...validationAttributes("route_mode")} value={draft.route_mode} onChange={(event) => changeDraft((current) => ({ ...current, route_mode: event.target.value as SettingsDraft["route_mode"] }))}>
               <option value="priority">按优先级</option>
               <option value="fastest">最低延迟</option>
               <option value="manual">手动</option>
@@ -170,17 +279,17 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
           </label>
           <label className="field">
             <span>手动出口</span>
-            <select value={draft.manual_outlet ?? ""} onChange={(event) => changeDraft((current) => ({ ...current, manual_outlet: event.target.value || null }))}>
+            <select {...validationAttributes("manual_outlet")} value={draft.manual_outlet ?? ""} onChange={(event) => changeDraft((current) => ({ ...current, manual_outlet: event.target.value || null }))}>
               <option value="">未选择</option>
               {enabledOutlets.map((outlet) => <option key={outlet.outlet_id} value={outlet.outlet_id}>{outlet.label}</option>)}
             </select>
           </label>
-          <label className="field"><span>冷却时间（秒）</span><input type="number" min="1" max="86400" value={draft.cooldown_seconds} onChange={(event) => changeDraft((current) => ({ ...current, cooldown_seconds: Number(event.target.value) }))} /></label>
-          <label className="field"><span>改善阈值（毫秒）</span><input type="number" min="0" max="60000" value={draft.minimum_improvement_ms} onChange={(event) => changeDraft((current) => ({ ...current, minimum_improvement_ms: Number(event.target.value) }))} /></label>
+          <label className="field"><span>冷却时间（秒）</span><input {...validationAttributes("cooldown_seconds")} type="number" min="1" max="86400" value={draft.cooldown_seconds} onChange={(event) => changeDraft((current) => ({ ...current, cooldown_seconds: Number(event.target.value) }))} /></label>
+          <label className="field"><span>改善阈值（毫秒）</span><input {...validationAttributes("minimum_improvement_ms")} type="number" min="0" max="60000" value={draft.minimum_improvement_ms} onChange={(event) => changeDraft((current) => ({ ...current, minimum_improvement_ms: Number(event.target.value) }))} /></label>
         </div>
         <label className="field wide-field">
           <span>HTTPS 探测目标（每行一个）</span>
-          <textarea rows={3} value={draft.probe_targets.join("\n")} onChange={(event) => changeDraft((current) => ({ ...current, probe_targets: event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean) }))} />
+          <textarea {...validationAttributes("probe_targets")} rows={3} value={draft.probe_targets.join("\n")} onChange={(event) => changeDraft((current) => ({ ...current, probe_targets: event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean) }))} />
         </label>
       </section>
 
@@ -198,7 +307,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
             <button type="button" className="secondary-button" onClick={addLocal}><Plus />本地出口</button>
           </div>
         </div>
-        <div className="settings-outlets">
+        <div className="settings-outlets" {...validationAttributes("outlets")} tabIndex={-1}>
           {draft.outlets.map((outlet, index) => (
             <article className="settings-outlet" key={outlet.outlet_id}>
               <div className="outlet-rail">
@@ -208,7 +317,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
               </div>
               <div className="outlet-body">
                 <div className="outlet-head">
-                  <label className="field outlet-name-field"><span>名称</span><input value={outlet.label} onChange={(event) => updateOutlet(index, (current) => ({ ...current, label: event.target.value }))} /></label>
+                  <label className="field outlet-name-field"><span>名称</span><input {...validationAttributes(`outlets.${outlet.outlet_id}.label`)} value={outlet.label} onChange={(event) => updateOutlet(index, (current) => ({ ...current, label: event.target.value }))} /></label>
                   <span className={`kind-badge ${outlet.kind === "subscription" ? "is-subscription" : "is-local"}`}>{outlet.kind === "subscription" ? "订阅" : "本地"}</span>
                   <label className="check-field"><input type="checkbox" checked={outlet.enabled} onChange={(event) => updateOutlet(index, (current) => ({ ...current, enabled: event.target.checked }))} />启用</label>
                   <code className="outlet-id" title="稳定出口 ID">{outlet.outlet_id}</code>
@@ -234,7 +343,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
                         }}
                       />
                     </label>
-                    <label className="field interval-field"><span>更新周期（秒）</span><input type="number" min="60" value={outlet.provider_update_seconds} onChange={(event) => updateOutlet(index, (current) => current.kind === "subscription" ? { ...current, provider_update_seconds: Number(event.target.value) } : current)} /></label>
+                    <label className="field interval-field"><span>更新周期（秒）</span><input {...validationAttributes(`outlets.${outlet.outlet_id}.provider_update_seconds`)} type="number" min="60" value={outlet.provider_update_seconds} onChange={(event) => updateOutlet(index, (current) => current.kind === "subscription" ? { ...current, provider_update_seconds: Number(event.target.value) } : current)} /></label>
                     <button className="text-danger" type="button" onClick={() => { const input = credentialInputs.current.get(outlet.outlet_id); if (input) input.value = ""; setCredentialIntentById((current) => ({ ...current, [outlet.outlet_id]: "delete" })); invalidatePreview(); }}>删除凭据</button>
                   </div>
                 ) : (
@@ -247,8 +356,8 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
                         <option value="http">HTTP</option>
                       </select>
                     </label>
-                    <label className="field host-field"><span>Loopback 地址</span><input value={outlet.host} onChange={(event) => updateOutlet(index, (current) => current.kind === "local_proxy" ? { ...current, host: event.target.value } : current)} /></label>
-                    <label className="field port-field"><span>端口</span><input type="number" min="1" max="65535" value={outlet.port} onChange={(event) => updateOutlet(index, (current) => current.kind === "local_proxy" ? { ...current, port: Number(event.target.value) } : current)} /></label>
+                    <label className="field host-field"><span>Loopback 地址</span><input {...validationAttributes(`outlets.${outlet.outlet_id}.host`)} value={outlet.host} onChange={(event) => updateOutlet(index, (current) => current.kind === "local_proxy" ? { ...current, host: event.target.value } : current)} /></label>
+                    <label className="field port-field"><span>端口</span><input {...validationAttributes(`outlets.${outlet.outlet_id}.port`)} type="number" min="1" max="65535" value={outlet.port} onChange={(event) => updateOutlet(index, (current) => current.kind === "local_proxy" ? { ...current, port: Number(event.target.value) } : current)} /></label>
                   </div>
                 )}
               </div>
@@ -258,7 +367,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
         </div>
       </section>
 
-      <section className="settings-card">
+      <section id="settings-runtime" className="settings-card" tabIndex={-1}>
         <div className="card-head">
           <div className="card-title">
             <Gauge aria-hidden="true" />
@@ -277,7 +386,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
             ["恢复阈值", "recovery_threshold", 1, 100],
             ["历史保留（天）", "retention_days", 1, 3650],
           ] as const).map(([label, field, min, max]) => (
-            <label className="field" key={field}><span>{label}</span><input type="number" min={min} max={max} value={draft[field]} onChange={(event) => changeDraft((current) => ({ ...current, [field]: Number(event.target.value) }))} /></label>
+            <label className="field" key={field}><span>{label}</span><input {...validationAttributes(field)} type="number" min={min} max={max} value={draft[field]} onChange={(event) => changeDraft((current) => ({ ...current, [field]: Number(event.target.value) }))} /></label>
           ))}
         </div>
       </section>
@@ -310,7 +419,8 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
             <ul>{entrySwitchPreview.issues.map((issue) => <li key={issue.code}>{issue.message}</li>)}</ul>
           </div>
         </div>
-        <button className="primary-button" type="button" disabled aria-disabled="true" title="等待隔离 Windows live acceptance">执行安全切换</button>
+        <p className="disabled-action-reason" id="entry-switch-unavailable">当前不可执行：等待隔离 Windows live acceptance 与专用授权/回滚事务就绪。</p>
+        <button className="primary-button" type="button" disabled aria-disabled="true" aria-describedby="entry-switch-unavailable">执行安全切换</button>
       </section>
 
       <section className="settings-card safety-card">
@@ -346,10 +456,10 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
           </div>
         </div>
         <div className="safety-checks">
-          <label className="check-field"><input type="checkbox" checked={false} disabled />启用 TUN</label>
-          <label className="check-field"><input type="checkbox" checked={false} disabled />我已理解断网、DNS 泄漏与递归代理风险</label>
+          <label className="check-field"><input type="checkbox" checked={false} disabled aria-describedby="tun-unavailable-reason" />启用 TUN</label>
+          <label className="check-field"><input type="checkbox" checked={false} disabled aria-describedby="tun-unavailable-reason" />我已理解断网、DNS 泄漏与递归代理风险</label>
         </div>
-        <p className="tun-reason"><code>{preview?.tun_plan.reason_code ?? "windows_verified_application_identity_exclusion_unavailable"}</code></p>
+        <p className="tun-reason" id="tun-unavailable-reason">当前不可用：<code>{preview?.tun_plan.reason_code ?? "windows_verified_application_identity_exclusion_unavailable"}</code></p>
         {preview && (
           <div className="tun-plan" role="status" aria-live="polite">
             <p>计划 generation：<code>{preview.tun_plan.generation}</code>；订阅出口 {preview.tun_plan.subscription_outlet_ids.length} 个，本地客户端出口 {preview.tun_plan.local_outlet_ids.length} 个。</p>
@@ -358,6 +468,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
           </div>
         )}
       </section>
+      </fieldset>
     </main>
   );
 }

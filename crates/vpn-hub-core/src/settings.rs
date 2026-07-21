@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CredentialState, EntryConfig, GuardianConfig, MonitorConfig, OutletConfig, OutletKind,
-    PrivateRoutingConfig, RouteMode, SubscriptionCredentialStatus,
+    PrivateRoutingConfig, RouteMode, SubscriptionCredentialStatus, normalize_loopback_host,
 };
 
 const MIN_REFRESH_SECONDS: u64 = 5;
@@ -81,6 +81,7 @@ impl SettingsOutletDraft {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SettingsDraft {
     pub entry: EntryConfig,
     pub route_mode: RouteMode,
@@ -135,14 +136,69 @@ impl ValidationIssue {
 pub struct SettingsChange {
     pub code: String,
     pub summary: String,
+    pub impact: SettingsImpact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsImpact {
+    LiveApply,
+    ManagedCoreReload,
+    DedicatedTransaction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SettingsDiff {
     pub changes: Vec<SettingsChange>,
-    pub runtime_changed: bool,
-    pub monitor_changed: bool,
-    pub retention_changed: bool,
+}
+
+impl SettingsDiff {
+    #[must_use]
+    pub fn has_impact(&self, impact: SettingsImpact) -> bool {
+        self.changes.iter().any(|change| change.impact == impact)
+    }
+
+    #[must_use]
+    pub fn requires_managed_core_reload(&self) -> bool {
+        self.has_impact(SettingsImpact::ManagedCoreReload)
+    }
+
+    #[must_use]
+    pub fn affects_private_routing(&self) -> bool {
+        self.changes.iter().any(|change| {
+            matches!(
+                change.code.as_str(),
+                "entry_changed"
+                    | "route_policy_changed"
+                    | "routing_thresholds_changed"
+                    | "probe_targets_changed"
+                    | "outlets_changed"
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn requires_authenticated_controller_apply(&self) -> bool {
+        self.changes.iter().any(|change| {
+            matches!(
+                change.code.as_str(),
+                "route_policy_changed" | "routing_thresholds_changed"
+            )
+        })
+    }
+
+    pub fn add_change(
+        &mut self,
+        code: impl Into<String>,
+        summary: impl Into<String>,
+        impact: SettingsImpact,
+    ) {
+        self.changes.push(SettingsChange {
+            code: code.into(),
+            summary: summary.into(),
+            impact,
+        });
+    }
 }
 
 impl SettingsDraft {
@@ -293,11 +349,23 @@ impl SettingsDraft {
         candidate.probe_targets.clone_from(&self.probe_targets);
         candidate.outlets = outlets;
         if let Err(error) = candidate.validate() {
-            issues.push(ValidationIssue::new(
-                "routing",
-                "invalid_routing_config",
-                error.to_string(),
-            ));
+            let message = error.to_string();
+            let field = if message.contains("entry.") {
+                "entry"
+            } else if message.contains("probe target") || message.contains("probe_targets") {
+                "probe_targets"
+            } else if message.contains("manual_outlet") {
+                "manual_outlet"
+            } else {
+                "outlets"
+            };
+            if !issues.iter().any(|issue| issue.field == field) {
+                issues.push(ValidationIssue::new(
+                    field,
+                    "invalid_routing_config",
+                    message,
+                ));
+            }
         }
         if let Some(manual) = candidate.manual_outlet.as_deref()
             && !candidate
@@ -331,6 +399,7 @@ impl SettingsDraft {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn basic_validation_issues(&self) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
         if self.outlets.is_empty() || !self.outlets.iter().any(SettingsOutletDraft::enabled) {
@@ -358,7 +427,8 @@ impl SettingsDraft {
             }
             let label = outlet.label();
             let lower = label.to_ascii_lowercase();
-            if label.len() > 80
+            if label.trim().is_empty()
+                || label.len() > 80
                 || label.chars().any(char::is_control)
                 || label.contains("://")
                 || ["token", "secret", "password", "controller"]
@@ -371,6 +441,57 @@ impl SettingsDraft {
                     "出口名称不能包含 URL、凭据形态或控制字符",
                 ));
             }
+            match outlet {
+                SettingsOutletDraft::Subscription {
+                    outlet_id,
+                    provider_update_seconds,
+                    ..
+                } if *provider_update_seconds < 60 => issues.push(ValidationIssue::new(
+                    format!("outlets.{outlet_id}.provider_update_seconds"),
+                    "provider_update_too_short",
+                    "订阅 provider 更新周期不能小于 60 秒",
+                )),
+                SettingsOutletDraft::LocalProxy {
+                    outlet_id,
+                    host,
+                    port,
+                    ..
+                } => {
+                    if normalize_loopback_host(host).is_none() {
+                        issues.push(ValidationIssue::new(
+                            format!("outlets.{outlet_id}.host"),
+                            "local_proxy_host_not_loopback",
+                            "本地出口地址必须是 loopback IP 或 localhost",
+                        ));
+                    }
+                    if *port == 0 {
+                        issues.push(ValidationIssue::new(
+                            format!("outlets.{outlet_id}.port"),
+                            "local_proxy_port_invalid",
+                            "本地出口端口必须在 1 到 65535 之间",
+                        ));
+                    }
+                }
+                SettingsOutletDraft::Subscription { .. } => {}
+            }
+        }
+        if self.route_mode == RouteMode::Manual && self.manual_outlet.is_none() {
+            issues.push(ValidationIssue::new(
+                "manual_outlet",
+                "manual_outlet_required",
+                "手动模式必须选择一个已启用出口",
+            ));
+        }
+        if self.probe_targets.len() < 2
+            || self.probe_targets.iter().any(|target| {
+                reqwest::Url::parse(target).map_or(true, |url| url.scheme() != "https")
+            })
+        {
+            issues.push(ValidationIssue::new(
+                "probe_targets",
+                "invalid_probe_targets",
+                "探测目标至少需要两个有效 HTTPS URL",
+            ));
         }
         if !(MIN_REFRESH_SECONDS..=MAX_REFRESH_SECONDS).contains(&self.refresh_interval_seconds) {
             issues.push(ValidationIssue::new(
@@ -379,24 +500,42 @@ impl SettingsDraft {
                 "刷新周期必须在 5 秒到 24 小时之间",
             ));
         }
-        if self.connect_timeout_ms == 0
-            || self.connect_timeout_ms > MAX_TIMEOUT_MS
-            || self.request_timeout_ms < self.connect_timeout_ms
-            || self.request_timeout_ms > MAX_TIMEOUT_MS
+        if self.connect_timeout_ms == 0 || self.connect_timeout_ms > MAX_TIMEOUT_MS {
+            issues.push(ValidationIssue::new(
+                "connect_timeout_ms",
+                "connect_timeout_out_of_range",
+                "连接超时必须在 1 毫秒到 120 秒之间",
+            ));
+        }
+        if self.request_timeout_ms == 0 || self.request_timeout_ms > MAX_TIMEOUT_MS {
+            issues.push(ValidationIssue::new(
+                "request_timeout_ms",
+                "request_timeout_out_of_range",
+                "请求超时必须在 1 毫秒到 120 秒之间",
+            ));
+        }
+        if (1..=MAX_TIMEOUT_MS).contains(&self.connect_timeout_ms)
+            && (1..=MAX_TIMEOUT_MS).contains(&self.request_timeout_ms)
+            && self.request_timeout_ms < self.connect_timeout_ms
         {
             issues.push(ValidationIssue::new(
                 "request_timeout_ms",
-                "timeout_out_of_range",
-                "请求超时必须不小于连接超时，且不超过 120 秒",
+                "request_timeout_before_connect_timeout",
+                "请求超时不能小于连接超时",
             ));
         }
-        if !(1..=MAX_THRESHOLD).contains(&self.failure_threshold)
-            || !(1..=MAX_THRESHOLD).contains(&self.recovery_threshold)
-        {
+        if !(1..=MAX_THRESHOLD).contains(&self.failure_threshold) {
             issues.push(ValidationIssue::new(
                 "failure_threshold",
-                "threshold_out_of_range",
-                "失败与恢复阈值必须在 1 到 100 之间",
+                "failure_threshold_out_of_range",
+                "失败阈值必须在 1 到 100 之间",
+            ));
+        }
+        if !(1..=MAX_THRESHOLD).contains(&self.recovery_threshold) {
+            issues.push(ValidationIssue::new(
+                "recovery_threshold",
+                "recovery_threshold_out_of_range",
+                "恢复阈值必须在 1 到 100 之间",
             ));
         }
         if !(1..=3650).contains(&self.retention_days) {
@@ -425,36 +564,48 @@ impl SettingsDraft {
 
     #[must_use]
     pub fn diff(&self, current: &Self) -> SettingsDiff {
-        let mut changes = Vec::new();
-        let mut runtime_changed = false;
-        let mut monitor_changed = false;
-        let mut add = |code: &str, summary: &str| {
-            changes.push(SettingsChange {
-                code: code.into(),
-                summary: summary.into(),
-            });
+        let mut diff = SettingsDiff {
+            changes: Vec::new(),
+        };
+        let mut add = |code: &str, summary: &str, impact: SettingsImpact| {
+            diff.add_change(code, summary, impact);
         };
         if self.entry != current.entry {
-            runtime_changed = true;
-            add("entry_changed", "统一入口将更新");
+            add(
+                "entry_changed",
+                "统一入口只能通过专用安全事务更新",
+                SettingsImpact::DedicatedTransaction,
+            );
         }
         if self.route_mode != current.route_mode || self.manual_outlet != current.manual_outlet {
-            runtime_changed = true;
-            add("route_policy_changed", "默认路由模式或手动出口将更新");
+            add(
+                "route_policy_changed",
+                "默认路由模式或手动出口将通过 Controller 在线更新",
+                SettingsImpact::LiveApply,
+            );
         }
         if self.cooldown_seconds != current.cooldown_seconds
             || self.minimum_improvement_ms != current.minimum_improvement_ms
         {
-            runtime_changed = true;
-            add("routing_thresholds_changed", "切换阈值将更新");
+            add(
+                "routing_thresholds_changed",
+                "切换阈值将在线更新",
+                SettingsImpact::LiveApply,
+            );
         }
         if self.probe_targets != current.probe_targets {
-            runtime_changed = true;
-            add("probe_targets_changed", "探测目标将更新");
+            add(
+                "probe_targets_changed",
+                "探测目标影响 Mihomo provider 健康检查，将受控重载核心",
+                SettingsImpact::ManagedCoreReload,
+            );
         }
         if self.outlets != current.outlets {
-            runtime_changed = true;
-            add("outlets_changed", "出口定义、启用状态或顺序将更新");
+            add(
+                "outlets_changed",
+                "出口定义、provider、启用状态或顺序将受控重载核心",
+                SettingsImpact::ManagedCoreReload,
+            );
         }
         if self.refresh_interval_seconds != current.refresh_interval_seconds
             || self.connect_timeout_ms != current.connect_timeout_ms
@@ -462,19 +613,20 @@ impl SettingsDraft {
             || self.failure_threshold != current.failure_threshold
             || self.recovery_threshold != current.recovery_threshold
         {
-            monitor_changed = true;
-            add("monitor_changed", "Guardian 探测周期与阈值将更新");
+            add(
+                "monitor_changed",
+                "Guardian 探测周期与阈值将在线更新",
+                SettingsImpact::LiveApply,
+            );
         }
-        let retention_changed = self.retention_days != current.retention_days;
-        if retention_changed {
-            add("retention_changed", "历史保留期将更新并清理过期数据");
+        if self.retention_days != current.retention_days {
+            add(
+                "retention_changed",
+                "历史保留期将在线更新并清理过期数据",
+                SettingsImpact::LiveApply,
+            );
         }
-        SettingsDiff {
-            changes,
-            runtime_changed,
-            monitor_changed,
-            retention_changed,
-        }
+        diff
     }
 }
 
@@ -600,7 +752,7 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|issue| issue.code == "threshold_out_of_range")
+                .any(|issue| issue.code == "failure_threshold_out_of_range")
         );
 
         let mut draft = five_outlet_draft();
@@ -620,7 +772,8 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|issue| issue.code == "invalid_routing_config")
+                .any(|issue| issue.code == "local_proxy_host_not_loopback"
+                    && issue.field == "outlets.local-a.host")
         );
     }
 
@@ -639,5 +792,168 @@ mod tests {
         assert!(!json.contains("settings.sub-a"));
         assert!(!json.contains("secret_ref"));
         assert!(json.contains("configured"));
+    }
+
+    #[test]
+    fn classifies_every_settings_field_by_operational_impact() {
+        fn assert_only_impact(
+            current: &SettingsDraft,
+            mutate: impl FnOnce(&mut SettingsDraft),
+            expected: SettingsImpact,
+        ) {
+            let mut candidate = current.clone();
+            mutate(&mut candidate);
+            let diff = candidate.diff(current);
+            assert_eq!(diff.changes.len(), 1, "unexpected changes: {diff:?}");
+            assert_eq!(diff.changes[0].impact, expected);
+        }
+
+        let current = five_outlet_draft();
+        assert_only_impact(
+            &current,
+            |draft| draft.entry.port += 1,
+            SettingsImpact::DedicatedTransaction,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.route_mode = RouteMode::Fastest,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.manual_outlet = Some("local-a".into()),
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.cooldown_seconds += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.minimum_improvement_ms += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| {
+                draft
+                    .probe_targets
+                    .push("https://probe.invalid/health".into());
+            },
+            SettingsImpact::ManagedCoreReload,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.refresh_interval_seconds += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.connect_timeout_ms += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.request_timeout_ms += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.failure_threshold += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.recovery_threshold += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.retention_days += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| {
+                let SettingsOutletDraft::Subscription {
+                    provider_update_seconds,
+                    ..
+                } = &mut draft.outlets[0]
+                else {
+                    panic!("expected subscription outlet");
+                };
+                *provider_update_seconds += 60;
+            },
+            SettingsImpact::ManagedCoreReload,
+        );
+    }
+
+    #[test]
+    fn ordinary_settings_draft_rejects_dedicated_capability_fields() {
+        for field in ["system_proxy", "tun", "service"] {
+            let mut value = serde_json::to_value(five_outlet_draft()).expect("serialize draft");
+            let object = value.as_object_mut().expect("draft object");
+            object.insert(field.into(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<SettingsDraft>(value).is_err(),
+                "ordinary settings accepted dedicated field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_issues_identify_the_exact_editable_field() {
+        let current = PrivateRoutingConfig::default();
+
+        let mut connect = five_outlet_draft();
+        connect.connect_timeout_ms = 0;
+        let issues = connect.basic_validation_issues();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.field == "connect_timeout_ms")
+        );
+        assert!(!issues.iter().any(|issue| {
+            issue.code == "connect_timeout_out_of_range" && issue.field == "request_timeout_ms"
+        }));
+
+        let mut recovery = five_outlet_draft();
+        recovery.recovery_threshold = 0;
+        let issues = recovery.basic_validation_issues();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.field == "recovery_threshold")
+        );
+        assert!(!issues.iter().any(|issue| {
+            issue.code == "recovery_threshold_out_of_range" && issue.field == "failure_threshold"
+        }));
+
+        let mut manual = five_outlet_draft();
+        manual.route_mode = RouteMode::Manual;
+        manual.manual_outlet = None;
+        let issues = manual.basic_validation_issues();
+        assert!(issues.iter().any(|issue| issue.field == "manual_outlet"));
+
+        let mut probes = five_outlet_draft();
+        probes.probe_targets.truncate(1);
+        let issues = probes.basic_validation_issues();
+        assert!(issues.iter().any(|issue| issue.field == "probe_targets"));
+
+        let mut outlet = five_outlet_draft();
+        let SettingsOutletDraft::LocalProxy { host, .. } = &mut outlet.outlets[3] else {
+            panic!("expected local outlet");
+        };
+        *host = "192.0.2.1".into();
+        let Err(issues) = outlet.private_candidate(&current) else {
+            panic!("remote outlet must fail");
+        };
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.field == "outlets.local-a.host")
+        );
+        assert!(!issues.iter().any(|issue| issue.field == "route_mode"));
     }
 }

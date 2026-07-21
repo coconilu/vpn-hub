@@ -65,7 +65,7 @@ pub use secret_store::{
 };
 pub use settings::{
     LocalProxyProtocol, SafeSettingsView, SafeSubscriptionStatus, SettingsChange, SettingsDiff,
-    SettingsDraft, SettingsOutletDraft, ValidationIssue,
+    SettingsDraft, SettingsImpact, SettingsOutletDraft, ValidationIssue,
 };
 pub use store::{GuardianStore, StoreError};
 pub use udp_capability::{

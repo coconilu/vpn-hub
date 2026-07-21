@@ -281,16 +281,19 @@ tr.selected:hover { background: #e3efff; }
 .settings-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
 .settings-heading h1 { font-size: 24px; line-height: 32px; letter-spacing: -.025em; }
 .settings-heading p { margin-top: 4px; color: var(--muted); font-size: 12px; }
-.settings-actions { display: flex; align-items: center; gap: 8px; }
+.settings-actions { display: grid; grid-template-columns: auto auto auto; align-items: center; gap: 8px; max-width: 560px; }
+.settings-action-reason { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 10px; line-height: 1.45; text-align: right; }
 .settings-stage { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 11px; border: 1px solid var(--border); border-radius: 999px; color: var(--muted); background: #fff; font-size: 11px; font-weight: 600; white-space: nowrap; }
 .stage-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--healthy); }
 .settings-stage.is-dirty { border-color: #f0d49b; color: #8a5a00; background: #fffaf0; }
 .settings-stage.is-dirty .stage-dot { background: var(--warning); }
 .settings-stage.is-busy .stage-dot { background: var(--accent); }
 .primary-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 36px; padding: 0 14px; border: 1px solid #0c5fc9; border-radius: 8px; color: #fff; background: var(--accent); font-size: 12px; font-weight: 650; cursor: pointer; transition: background 140ms ease; }
-.primary-button:hover:not(:disabled) { background: #0e5dc8; }
+.primary-button:hover:not(:disabled):not([aria-disabled="true"]) { background: #0e5dc8; }
 .primary-button svg { width: 14px; height: 14px; }
-.primary-button:disabled { cursor: not-allowed; opacity: .48; }
+.primary-button:disabled, button[aria-disabled="true"] { cursor: not-allowed; opacity: .48; }
+.settings-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.settings-fields:disabled { opacity: .8; }
 .settings-error, .settings-preview { margin-bottom: 14px; padding: 12px 14px; border-radius: 10px; font-size: 12px; }
 .settings-error { display: flex; gap: 10px; border: 1px solid #f0b7ba; color: #8e2f34; background: #fff7f7; }
 .settings-error strong { white-space: nowrap; }
@@ -298,6 +301,13 @@ tr.selected:hover { background: #e3efff; }
 .settings-preview h2 { margin-bottom: 8px; font-size: 13px; }
 .settings-preview ul { display: grid; gap: 6px; margin: 0; padding-left: 18px; }
 .settings-preview .validation-list { margin-top: 8px; color: #9a3035; }
+.settings-preview h3 { margin: 10px 0 6px; font-size: 12px; }
+.impact-badge { display: inline-flex; margin-right: 7px; padding: 2px 7px; border-radius: 999px; font-size: 10px; font-weight: 700; }
+.impact-badge.is-live_apply { color: #17633a; background: #e7f6ed; }
+.impact-badge.is-managed_core_reload { color: #8a5a00; background: #fff0cc; }
+.impact-badge.is-dedicated_transaction { color: #8e2f34; background: #fdebed; }
+.validation-list button { padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: left; text-decoration: underline; cursor: pointer; }
+.validation-list button:focus-visible { border-radius: 3px; outline: 2px solid currentColor; outline-offset: 2px; }
 .settings-card { margin-bottom: 14px; padding: 18px 20px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
 .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid #edf1f6; }
 .card-title { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
@@ -314,6 +324,7 @@ tr.selected:hover { background: #e3efff; }
 .field textarea { padding: 8px 10px; line-height: 1.6; resize: vertical; font-family: "Cascadia Code", Consolas, monospace; }
 .field input:hover, .field select:hover, .field textarea:hover { border-color: #a9bdd6; }
 .field input:focus, .field select:focus, .field textarea:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 3px rgb(23 105 224 / 12%); }
+.field [aria-invalid="true"], .settings-outlets[aria-invalid="true"] { border-color: var(--danger); }
 .field input[readonly] { color: var(--muted); background: #f6f8fb; }
 .wide-field { margin-top: 12px; }
 .check-field { display: flex; align-items: center; gap: 8px; min-height: 34px; color: #344054; font-size: 12px; }
@@ -361,6 +372,7 @@ tr.selected:hover { background: #e3efff; }
 .safety-steps { color: #3a4a5f; background: #f6f8fb; }
 .safety-steps ol, .safety-issues ul { display: grid; gap: 6px; margin: 0; padding-left: 18px; }
 .safety-issues { border: 1px solid #f0d9b0; color: #8a5a00; background: #fffaf0; }
+.disabled-action-reason { margin: 0 0 8px; color: #8a5a00; font-size: 11px; }
 .replacement-row { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px 16px; }
 .replacement-field { flex: 1 1 240px; max-width: 420px; }
 .tun-card { background: #fafbfc; }
@@ -390,7 +402,9 @@ tr.selected:hover { background: #e3efff; }
   .brand { justify-content: center; padding: 0; }
   .brand > span:not(.brand-mark), .nav-item span, .sidebar-safety div { display: none; }
   .nav-item { justify-content: center; padding: 0; }
-  .settings-actions, .card-head { width: 100%; align-items: stretch; flex-direction: column; }
+  .settings-actions { width: 100%; grid-template-columns: 1fr; align-items: stretch; }
+  .settings-action-reason { text-align: left; }
+  .card-head { width: 100%; align-items: stretch; flex-direction: column; }
   .nodes-header { align-items: stretch; flex-direction: column; }
   .nodes-header .secondary-button { align-self: flex-start; }
   .node-toolbar { grid-template-columns: 1fr; }
@@ -398,6 +412,8 @@ tr.selected:hover { background: #e3efff; }
   .history-actions { flex-wrap: wrap; }
   .safety-columns { grid-template-columns: 1fr; }
   .settings-outlet { grid-template-columns: 34px minmax(0, 1fr); gap: 8px; padding: 10px 12px; }
+  .settings-card { padding-right: 14px; padding-left: 14px; }
+  .outlet-detail { padding-right: 10px; padding-left: 10px; }
   .outlet-rail { padding-right: 8px; }
   .outlet-id { max-width: 100%; margin-bottom: 0; }
   .mode-segment span { padding: 0 10px; }

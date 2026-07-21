@@ -72,6 +72,22 @@ export function isCurrentPreviewResponse(
     && currentFingerprint === responseFingerprint;
 }
 
+export function settingsPreviewOutcome(preview) {
+  if (preview.issues.length > 0) return "error";
+  if (!preview.can_apply) return "no_changes";
+  if (preview.requires_managed_core_restart) return "confirm_reload";
+  return "live_apply";
+}
+
+export function settingsValidationTargetIds(field) {
+  if (field === "routing") return ["settings-outlets"];
+  if (field === "runtime") return ["settings-runtime"];
+  const exact = `settings-${field}`;
+  return field.startsWith("outlets.")
+    ? [exact, "settings-outlets"]
+    : [exact];
+}
+
 export function takeCredentialMutations(inputById, intentById) {
   const intents = credentialIntents(intentById);
   const setIds = new Set(intents

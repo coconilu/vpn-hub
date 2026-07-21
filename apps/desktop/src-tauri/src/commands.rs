@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
         Arc,
@@ -24,8 +25,8 @@ use crate::{
     lifecycle::{self, LifecycleEvent},
     runtime::{
         AppState, CoreStatus, PortSnapshot, RoutingStatus, SettingsApplyRequest,
-        SettingsApplyResult, SettingsPreview, SettingsPreviewRequest, SubscriptionNodeCatalog,
-        SubscriptionNodeGroup,
+        SettingsApplyResult, SettingsPreview, SettingsPreviewRequest, SettingsTerminalStatus,
+        SubscriptionNodeCatalog, SubscriptionNodeGroup,
     },
 };
 
@@ -235,7 +236,7 @@ pub async fn preview_settings(
     let managed_core_running = core_status.managed && core_status.pid.is_some();
     let mut preview = state.preview_settings_with_core_state(&request, managed_core_running)?;
     if core_status.state == "external"
-        && (preview.diff.runtime_changed || !request.credential_intents.is_empty())
+        && (preview.diff.affects_private_routing() || !request.credential_intents.is_empty())
     {
         preview.issues.push(ValidationIssue::new(
             "runtime",
@@ -246,13 +247,24 @@ pub async fn preview_settings(
     }
     if helper_settings_deployment_required(
         state.uses_helper_authority(),
-        preview.diff.runtime_changed,
+        preview.diff.affects_private_routing(),
         !request.credential_intents.is_empty(),
     ) {
         preview.issues.push(ValidationIssue::new(
             "runtime",
             "helper_settings_deployment_required",
             "Helper 核心使用受保护的 ProgramData 配置；当前设置事务不会越权改写该运行配置",
+        ));
+        preview.can_apply = false;
+    }
+    if managed_core_running
+        && preview.diff.requires_authenticated_controller_apply()
+        && state.controller_client()?.is_none()
+    {
+        preview.issues.push(ValidationIssue::new(
+            "runtime",
+            "authenticated_controller_required",
+            "自管核心未提供受鉴权 Controller；路由策略不会被误报为在线应用",
         ));
         preview.can_apply = false;
     }
@@ -268,14 +280,19 @@ pub async fn apply_settings(
     request: SettingsApplyRequest,
 ) -> Result<SettingsApplyResult, String> {
     let _settings_apply = state.lock_settings_apply().await;
-    let preflight = {
+    if state.settings_terminal_active() {
+        return Err(
+            "terminal_recovery_active：设置安全门仍处于 Fail Closed；请先执行显式受鉴权恢复".into(),
+        );
+    }
+    let (preflight, managed_core_running) = {
         let _transaction = state.lock_routing_transaction().await;
         let core_status = state.core_status_authoritative().await?;
         let managed_core_running = core_status.managed && core_status.pid.is_some();
         let preview = state.preflight_settings_apply(&request, managed_core_running)?;
         if helper_settings_deployment_required(
             state.uses_helper_authority(),
-            preview.diff.runtime_changed,
+            preview.diff.affects_private_routing(),
             !request.credential_mutations.is_empty(),
         ) {
             return Err(
@@ -283,20 +300,52 @@ pub async fn apply_settings(
             );
         }
         if core_status.state == "external"
-            && (preview.diff.runtime_changed || !request.credential_mutations.is_empty())
+            && (preview.diff.affects_private_routing() || !request.credential_mutations.is_empty())
         {
             return Err(
                 "入口或 Controller ownership 不可证明；不会停止、重启或改写未知核心".into(),
             );
         }
-        preview
+        if managed_core_running
+            && preview.diff.requires_authenticated_controller_apply()
+            && state.controller_client()?.is_none()
+        {
+            return Err("自管核心未提供受鉴权 Controller；不会把路由策略误报为在线应用".into());
+        }
+        (preview, managed_core_running)
     };
     if !preflight.requires_managed_core_restart {
         let _transaction = state.lock_routing_transaction().await;
+        let requires_controller_confirmation =
+            managed_core_running && preflight.diff.requires_authenticated_controller_apply();
+        let apply_result = if requires_controller_confirmation {
+            state
+                .apply_settings_with_runtime_validation(request, || async {
+                    record_owned_controller_cycle_locked(&state)
+                        .await
+                        .map(|_| ())
+                })
+                .await
+        } else {
+            state.apply_settings(request)
+        };
         let coordinator = app.state::<lifecycle::DesktopCoordinator>();
-        let result = after_successful_settings_commit(state.apply_settings(request), || {
+        let result = match after_successful_settings_commit(apply_result, || {
             coordinator.prepare_config_reload();
-        })?;
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                if requires_controller_confirmation && !state.settings_terminal_active() {
+                    lifecycle::dispatch(
+                        &app,
+                        LifecycleEvent::ConfigReload {
+                            now_ms: unix_time_ms(),
+                        },
+                    );
+                }
+                return Err(error);
+            }
+        };
         lifecycle::dispatch(
             &app,
             LifecycleEvent::ConfigReload {
@@ -393,11 +442,16 @@ pub async fn apply_settings(
 
     let finalized = {
         let _transaction = state.lock_routing_transaction().await;
-        state.finalize_deferred_settings(&mut pending)
+        state.finalize_deferred_settings(&mut pending, true)
     };
     match finalized {
         Ok(result) => Ok(result),
         Err(finalize_error) => {
+            if state.deferred_settings_commit_decided(&pending) {
+                return Err(format!(
+                    "settings_commit_recovery_pending：提交决定已持久化；设置与 Controller 保持新状态，剩余收尾只会幂等前滚：{finalize_error}"
+                ));
+            }
             let _ = lifecycle::dispatch_stop_and_wait(&app).await;
             let rollback = {
                 let _transaction = state.lock_routing_transaction().await;
@@ -432,10 +486,10 @@ pub async fn apply_settings(
 
 fn helper_settings_deployment_required(
     helper_owned: bool,
-    runtime_changed: bool,
+    private_routing_changed: bool,
     credentials_changed: bool,
 ) -> bool {
-    helper_owned && (runtime_changed || credentials_changed)
+    helper_owned && (private_routing_changed || credentials_changed)
 }
 
 fn after_successful_settings_commit<T>(
@@ -445,6 +499,26 @@ fn after_successful_settings_commit<T>(
     let committed = result?;
     on_commit();
     Ok(committed)
+}
+
+fn after_successful_terminal_recovery<T>(
+    result: Result<T, String>,
+    dispatch_reload: impl FnOnce(),
+) -> Result<T, String> {
+    let recovered = result?;
+    dispatch_reload();
+    Ok(recovered)
+}
+
+async fn recover_active_settings_terminal(
+    current: SettingsTerminalStatus,
+    recovery: impl Future<Output = Result<SettingsTerminalStatus, String>>,
+    dispatch_reload: impl FnOnce(),
+) -> Result<SettingsTerminalStatus, String> {
+    if !current.active {
+        return Ok(current);
+    }
+    after_successful_terminal_recovery(recovery.await, dispatch_reload)
 }
 
 async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
@@ -508,6 +582,13 @@ async fn record_routing_cycle_locked_with_mode(
     state: &AppState,
     allow_direct_fallback: bool,
 ) -> Result<u64, String> {
+    if state.settings_terminal_active() {
+        state.enforce_settings_terminal_fail_closed().await?;
+        return Err(
+            "terminal_recovery_active：自动 Guardian/ConfigReload 探测已阻断，MASTER/UDP 保持 Fail Closed"
+                .into(),
+        );
+    }
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
     let private = state.private_config()?;
@@ -536,6 +617,45 @@ async fn record_routing_cycle_locked_with_mode(
     .await
     .map_err(|error| format!("Guardian 路由周期失败：{error}"))?;
     Ok(guardian.monitor.interval_seconds)
+}
+
+#[tauri::command]
+pub async fn get_settings_terminal_status(
+    state: State<'_, AppState>,
+) -> Result<crate::runtime::SettingsTerminalStatus, String> {
+    Ok(state.settings_terminal_status())
+}
+
+#[tauri::command]
+pub async fn recover_settings_terminal(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::runtime::SettingsTerminalStatus, String> {
+    let _settings_apply = state.lock_settings_apply().await;
+    let _transaction = state.lock_routing_transaction().await;
+    let current = state.settings_terminal_status();
+    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    recover_active_settings_terminal(
+        current,
+        async {
+            if state.controller_client()?.is_none() {
+                state.recover_settings_transaction_for_terminal()?;
+                start_owned_core_for_terminal_recovery(&app, &state).await
+            } else {
+                state.recover_settings_terminal().await
+            }
+        },
+        || {
+            coordinator.prepare_config_reload();
+            lifecycle::dispatch(
+                &app,
+                LifecycleEvent::ConfigReload {
+                    now_ms: unix_time_ms(),
+                },
+            );
+        },
+    )
+    .await
 }
 
 fn unavailable_result(
@@ -847,6 +967,63 @@ async fn start_owned_core_verified(
     Ok(status)
 }
 
+async fn start_owned_core_for_terminal_recovery(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<crate::runtime::SettingsTerminalStatus, String> {
+    if !state.settings_terminal_active() {
+        return Ok(state.settings_terminal_status());
+    }
+    if state.uses_helper_authority() {
+        return Err(
+            "terminal 专用恢复当前只允许 desktop-owned 核心；不会借用 Helper 或外部 Controller"
+                .into(),
+        );
+    }
+    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let start_epoch = coordinator.prepare_manual_start(&cancel)?;
+    let status = match state.start_development_core_cancellable(&cancel).await {
+        Ok(status) => status,
+        Err(error) => {
+            coordinator.complete_manual_start_failure(start_epoch);
+            return Err(format!(
+                "terminal 专用恢复无法启动初始双 REJECT 核心；安全门保持：{error}"
+            ));
+        }
+    };
+    let Some(pid) = status.pid else {
+        coordinator.complete_manual_start_failure(start_epoch);
+        return Err("terminal 专用恢复核心未发布可验证 PID；安全门保持".into());
+    };
+    if !coordinator.manual_start_allowed(start_epoch)
+        || !state.owned_core_controller_is_running(pid)
+    {
+        let _ = state.stop_supervised_core_if_pid(pid).await;
+        coordinator.complete_manual_start_failure(start_epoch);
+        return Err(
+            "terminal 专用恢复核心未通过 PID/Controller ownership；已停止且安全门保持".into(),
+        );
+    }
+    let recovered = match state.recover_settings_terminal_for_owned_core(pid).await {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = state.stop_supervised_core_if_pid(pid).await;
+            coordinator.complete_manual_start_failure(start_epoch);
+            return Err(format!(
+                "terminal 专用恢复未通过双 REJECT 权威回读；核心已停止且安全门保持：{error}"
+            ));
+        }
+    };
+    if !coordinator.complete_manual_start(pid, start_epoch)
+        || !state.owned_core_controller_is_running(pid)
+    {
+        let _ = state.stop_supervised_core_if_pid(pid).await;
+        return Err("停止请求优先于 terminal 专用恢复结果；核心已清理".into());
+    }
+    Ok(recovered)
+}
+
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn stop_development_core(
@@ -905,6 +1082,121 @@ mod tests {
         })
         .expect("successful commit");
         assert_eq!(coordinator.recovery_epoch(), recovery_epoch + 1);
+    }
+
+    #[test]
+    fn terminal_recovery_dispatches_reload_only_once_and_only_after_success() {
+        let reloads = std::cell::Cell::new(0_u32);
+        let failed =
+            after_successful_terminal_recovery::<()>(Err("pending journal".into()), || {
+                reloads.set(reloads.get() + 1);
+            });
+        assert!(failed.is_err());
+        assert_eq!(reloads.get(), 0);
+
+        after_successful_terminal_recovery(Ok(()), || {
+            reloads.set(reloads.get() + 1);
+        })
+        .expect("terminal recovery");
+        assert_eq!(reloads.get(), 1);
+    }
+
+    fn terminal_status(active: bool) -> SettingsTerminalStatus {
+        SettingsTerminalStatus {
+            active,
+            state: active.then_some(crate::runtime::SettingsTerminalState::Pending),
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_terminal_recovery_transitions_and_reloads_exactly_once() {
+        async fn invoke(
+            lock: Arc<tokio::sync::Mutex<()>>,
+            gate_active: Arc<AtomicBool>,
+            clears: Arc<std::sync::atomic::AtomicUsize>,
+            reloads: Arc<std::sync::atomic::AtomicUsize>,
+            ready: Arc<tokio::sync::Barrier>,
+        ) -> Result<SettingsTerminalStatus, String> {
+            ready.wait().await;
+            let _guard = lock.lock().await;
+            let current = terminal_status(gate_active.load(Ordering::SeqCst));
+            recover_active_settings_terminal(
+                current,
+                async {
+                    clears.fetch_add(1, Ordering::SeqCst);
+                    gate_active.store(false, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok(terminal_status(false))
+                },
+                || {
+                    reloads.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await
+        }
+
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let gate_active = Arc::new(AtomicBool::new(true));
+        let clears = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ready = Arc::new(tokio::sync::Barrier::new(3));
+        let first = tokio::spawn(invoke(
+            Arc::clone(&lock),
+            Arc::clone(&gate_active),
+            Arc::clone(&clears),
+            Arc::clone(&reloads),
+            Arc::clone(&ready),
+        ));
+        let second = tokio::spawn(invoke(
+            lock,
+            Arc::clone(&gate_active),
+            Arc::clone(&clears),
+            Arc::clone(&reloads),
+            Arc::clone(&ready),
+        ));
+        ready.wait().await;
+
+        let first_status = first.await.expect("first join").expect("first recovery");
+        let second_status = second.await.expect("second join").expect("second recovery");
+        assert_eq!(first_status, terminal_status(false));
+        assert_eq!(second_status, terminal_status(false));
+        assert_eq!(clears.load(Ordering::SeqCst), 1);
+        assert_eq!(reloads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn successful_terminal_recovery_retry_is_an_inactive_no_op() {
+        let gate_active = AtomicBool::new(true);
+        let clears = std::sync::atomic::AtomicUsize::new(0);
+        let reloads = std::sync::atomic::AtomicUsize::new(0);
+
+        let first = recover_active_settings_terminal(
+            terminal_status(gate_active.load(Ordering::SeqCst)),
+            async {
+                clears.fetch_add(1, Ordering::SeqCst);
+                gate_active.store(false, Ordering::SeqCst);
+                Ok(terminal_status(false))
+            },
+            || {
+                reloads.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("first recovery");
+        let second = recover_active_settings_terminal(
+            terminal_status(gate_active.load(Ordering::SeqCst)),
+            async { Err("inactive recovery must not be polled".into()) },
+            || {
+                reloads.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("inactive retry");
+
+        assert_eq!(first, terminal_status(false));
+        assert_eq!(second, terminal_status(false));
+        assert_eq!(clears.load(Ordering::SeqCst), 1);
+        assert_eq!(reloads.load(Ordering::SeqCst), 1);
     }
 
     fn subscription() -> OutletConfig {

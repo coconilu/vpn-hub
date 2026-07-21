@@ -243,11 +243,17 @@ export interface ValidationIssue {
   message: string;
 }
 
+export type SettingsTerminalState = "pending" | "fail_closed_confirmed" | "fail_closed_unconfirmed";
+
+export interface SettingsTerminalStatus {
+  active: boolean;
+  state: SettingsTerminalState | null;
+}
+
+export type SettingsImpact = "live_apply" | "managed_core_reload" | "dedicated_transaction";
+
 export interface SettingsDiff {
-  changes: Array<{ code: string; summary: string }>;
-  runtime_changed: boolean;
-  monitor_changed: boolean;
-  retention_changed: boolean;
+  changes: Array<{ code: string; summary: string; impact: SettingsImpact }>;
 }
 
 export interface SettingsPreview {
