@@ -47,11 +47,19 @@ The gate survives transaction-journal cleanup and restart. While it is active,
 config reloads, scheduled probes, network-triggered probes, and new settings
 applies cannot enter Guardian routing; they only reassert and read back
 `REJECT` for both selectors. The Settings UI exposes one explicit recovery
-action. If no owned core survived the restart, that action uses a dedicated
-startup path: start a desktop-owned core in its initial double-`REJECT` state,
+action. Before the gate can be cleared, that action must inspect any surviving
+settings journal and finish its phase-aware recovery: phases before
+`CommitDecided` roll back, phases at or after it roll forward idempotently, and
+all main, backup, `.new`, and snapshot-directory artifacts must be durably
+gone. A recovery error keeps the gate and journal, reasserts double `REJECT`
+when an owned Controller exists, returns an error, and emits no config reload.
+
+If no owned core survived the restart, the explicit action completes the
+transaction recovery first and then uses a dedicated startup path: start a
+desktop-owned core in its initial double-`REJECT` state,
 prove exact PID and Controller ownership, authenticate and read back both
 selectors, durably remove the gate, and only then publish the core to automatic
-routing. It never borrows a Helper-owned or external Controller. Controller
+routing and emit exactly one config reload. It never borrows a Helper-owned or external Controller. Controller
 unavailability, failed authentication, failed ownership, failed readback, or a
 damaged gate remains fail closed.
 

@@ -575,6 +575,7 @@ pub struct AppState {
     settings_apply_transaction: RoutingTransaction,
     settings_terminal: Mutex<Option<SettingsTerminalState>>,
     initialization_error: Option<String>,
+    settings_recovery_error: Mutex<Option<String>>,
     supervisor_route: SupervisorRoute,
     #[cfg(test)]
     entry_switch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -955,6 +956,7 @@ impl AppState {
             .unwrap_or_else(|| prepare_local_guardian_config(data_directory, &workspace_root));
         let private_config_path = data_directory.join("private-routing.toml");
         let mut recovered_routing_action = None;
+        let mut settings_recovery_error = None;
         let secret_store = if let Ok(store) = SystemSecretStore::new() {
             match recover_settings_transaction(
                 &runtime_directory,
@@ -963,9 +965,10 @@ impl AppState {
                 &store,
             ) {
                 Ok(action) => recovered_routing_action = action,
-                Err(_) => {
-                    initialization_error
-                        .get_or_insert_with(|| "设置事务恢复失败；开发核心保持 Fail Closed".into());
+                Err(error) => {
+                    settings_recovery_error = Some(format!(
+                        "设置事务恢复失败；开发核心保持 Fail Closed：{error}"
+                    ));
                 }
             }
             if prepare_private_config(&private_config_path, &store).is_err() {
@@ -1018,6 +1021,7 @@ impl AppState {
             settings_apply_transaction: RoutingTransaction::default(),
             settings_terminal: Mutex::new(settings_terminal),
             initialization_error,
+            settings_recovery_error: Mutex::new(settings_recovery_error),
             supervisor_route,
             #[cfg(test)]
             entry_switch_hook: Mutex::new(None),
@@ -1535,6 +1539,26 @@ impl AppState {
         if !self.settings_terminal_active() {
             return Ok(self.settings_terminal_status());
         }
+        if let Err(transaction_error) = self.recover_settings_transaction_for_terminal() {
+            return match self.force_controller_fail_closed().await {
+                Ok(()) => {
+                    let _ = self.persist_settings_terminal_state(
+                        SettingsTerminalState::FailClosedConfirmed,
+                    );
+                    Err(format!(
+                        "terminal 事务恢复未完成；安全门与 journal 保留，MASTER/UDP 已确认 REJECT：{transaction_error}"
+                    ))
+                }
+                Err(selector_error) => {
+                    let _ = self.persist_settings_terminal_state(
+                        SettingsTerminalState::FailClosedUnconfirmed,
+                    );
+                    Err(format!(
+                        "terminal 事务恢复未完成且无法确认双 REJECT；安全门与 journal 保留：{transaction_error}；{selector_error}"
+                    ))
+                }
+            };
+        }
         self.force_controller_fail_closed().await.map_err(|error| {
             format!("terminal 恢复未通过受鉴权 Controller 双 REJECT 回读：{error}")
         })?;
@@ -1544,6 +1568,37 @@ impl AppState {
             .lock()
             .map_err(|_| "设置 terminal 安全门状态锁已损坏".to_string())? = None;
         Ok(self.settings_terminal_status())
+    }
+
+    pub fn recover_settings_transaction_for_terminal(&self) -> Result<(), String> {
+        if !settings_transaction_artifacts_exist(&self.runtime_directory) {
+            return Ok(());
+        }
+        let store = self
+            .secret_store
+            .as_ref()
+            .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?;
+        let recovered_action = recover_settings_transaction(
+            &self.runtime_directory,
+            &self.private_config_path,
+            &self.guardian_config_path,
+            store,
+        )?;
+        if settings_transaction_artifacts_exist(&self.runtime_directory) {
+            return Err("设置事务恢复后仍残留未耐久清除的 journal/snapshot artifact".into());
+        }
+        let private = self.private_config()?;
+        let mut engine = RoutingEngine::new(private.route_mode, private.manual_outlet.clone());
+        apply_recovered_routing_action(&mut engine, &private, recovered_action.as_ref());
+        *self
+            .routing_engine
+            .lock()
+            .map_err(|_| "路由策略状态锁已损坏".to_string())? = engine;
+        *self
+            .settings_recovery_error
+            .lock()
+            .map_err(|_| "设置事务恢复错误状态锁已损坏".to_string())? = None;
+        Ok(())
     }
 
     pub async fn recover_settings_terminal_for_owned_core(
@@ -2772,8 +2827,7 @@ impl AppState {
     }
 
     pub fn settings_recovery_pending(&self) -> bool {
-        settings_journal_path(&self.runtime_directory).exists()
-            || settings_journal_backup_path(&self.runtime_directory).exists()
+        settings_transaction_artifacts_exist(&self.runtime_directory)
     }
 
     pub fn set_route_mode(
@@ -3362,7 +3416,12 @@ impl AppState {
     }
 
     fn ensure_runtime_ready(&self) -> Result<(), String> {
-        self.initialization_error
+        if let Some(error) = self.initialization_error.as_ref() {
+            return Err(error.clone());
+        }
+        self.settings_recovery_error
+            .lock()
+            .map_err(|_| "设置事务恢复错误状态锁已损坏".to_string())?
             .as_ref()
             .map_or(Ok(()), |error| Err(error.clone()))
     }
@@ -3541,6 +3600,31 @@ fn settings_journal_path(runtime_directory: &Path) -> PathBuf {
 
 fn settings_journal_backup_path(runtime_directory: &Path) -> PathBuf {
     runtime_directory.join("settings-transaction.json.bak")
+}
+
+fn settings_transaction_artifacts_exist(runtime_directory: &Path) -> bool {
+    for path in [
+        settings_journal_path(runtime_directory),
+        settings_journal_backup_path(runtime_directory),
+        runtime_directory.join("settings-transaction.json.new"),
+        runtime_directory.join("settings-transaction.json.bak.new"),
+    ] {
+        if path.exists() {
+            return true;
+        }
+    }
+    fs::read_dir(runtime_directory).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.strip_prefix("settings-transaction-")
+                .is_some_and(|suffix| {
+                    suffix.len() == 16
+                        && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        && entry.path().is_dir()
+                })
+        })
+    })
 }
 
 fn settings_terminal_gate_path(runtime_directory: &Path) -> PathBuf {
@@ -4273,6 +4357,43 @@ mod tests {
         inner: SystemDurableFileOps,
         fail_at: usize,
         operation: AtomicUsize,
+    }
+
+    struct FailingJournalCleanupOps {
+        inner: SystemDurableFileOps,
+        fail_cleanup: AtomicBool,
+    }
+
+    impl DurableFileOps for FailingJournalCleanupOps {
+        fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+            self.inner.create_dir_all(path)
+        }
+
+        fn write(&self, path: &Path, content: &[u8]) -> io::Result<()> {
+            self.inner.write(path, content)
+        }
+
+        fn sync_file(&self, path: &Path) -> io::Result<()> {
+            self.inner.sync_file(path)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.inner.rename(from, to)
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            if self.fail_cleanup.load(Ordering::SeqCst)
+                && path.file_name().and_then(|name| name.to_str())
+                    == Some("settings-transaction.json")
+            {
+                return Err(io::Error::other("injected journal cleanup failure"));
+            }
+            self.inner.remove_file(path)
+        }
+
+        fn sync_directory(&self, path: &Path) -> io::Result<()> {
+            self.inner.sync_directory(path)
+        }
     }
 
     impl FailingDurableOps {
@@ -6228,6 +6349,252 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 "crash point {point:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_recovery_keeps_gate_journal_and_reject_on_snapshot_failure_then_retries() {
+        let _serial = SELECTOR_COMPENSATION_TEST_LOCK.lock().await;
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root.clone(), directory.path());
+        state.set_settings_validation_hook_for_test(|_, _| Ok(()));
+        let fake_controller = FakeSelectorController::start(false, false);
+        install_fake_controller_client(&state, fake_controller.port);
+
+        let mut config = state.private_config().expect("private");
+        config.outlets = vec![OutletConfig {
+            id: "local-a".into(),
+            label: "Local A".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "socks5h://127.0.0.1:45112".into(),
+            },
+        }];
+        config.save(&state.private_config_path).expect("config");
+        let mut draft = state.settings_view().expect("settings").draft;
+        draft.minimum_improvement_ms += 1;
+        let preview = state
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+            .expect("preview");
+        let _pending = state
+            .apply_settings_deferred(SettingsApplyRequest {
+                draft,
+                credential_mutations: Vec::new(),
+                active_outlet_replacement: None,
+                fail_closed_on_removed_active: false,
+                preview_fingerprint: preview.request_fingerprint,
+            })
+            .expect("deferred settings");
+        state
+            .persist_settings_terminal_state(SettingsTerminalState::Pending)
+            .expect("pending gate");
+        let journal = read_settings_journal(&state.runtime_directory).expect("journal");
+        let snapshot =
+            settings_transaction_directory(&state.runtime_directory, &journal.transaction_id)
+                .join("file-0.snapshot");
+        let snapshot_bytes = fs::read(&snapshot).expect("snapshot bytes");
+        fs::remove_file(&snapshot).expect("inject snapshot failure");
+
+        let error = state
+            .recover_settings_terminal()
+            .await
+            .expect_err("snapshot failure must keep terminal");
+        assert!(error.contains("事务恢复未完成"));
+        assert!(state.settings_terminal_active());
+        assert!(settings_transaction_artifacts_exist(
+            &state.runtime_directory
+        ));
+        assert_eq!(
+            fake_controller.selected(),
+            (FAIL_CLOSED_PROXY.into(), FAIL_CLOSED_PROXY.into())
+        );
+        drop(state);
+
+        let restarted = AppState::new_for_test(workspace_root, directory.path());
+        assert!(restarted.settings_terminal_active());
+        assert!(restarted.settings_recovery_pending());
+        assert!(restarted.ensure_runtime_ready().is_err());
+        fs::write(&snapshot, snapshot_bytes).expect("repair snapshot");
+        install_fake_controller_client(&restarted, fake_controller.port);
+        let recovered = restarted
+            .recover_settings_terminal()
+            .await
+            .expect("retry terminal recovery");
+        assert!(!recovered.active);
+        assert!(!settings_transaction_artifacts_exist(
+            &restarted.runtime_directory
+        ));
+        restarted
+            .ensure_runtime_ready()
+            .expect("successful retry clears only the transaction recovery error");
+        assert_eq!(
+            fake_controller.selected(),
+            (FAIL_CLOSED_PROXY.into(), FAIL_CLOSED_PROXY.into())
+        );
+    }
+
+    #[test]
+    fn secret_restore_and_journal_cleanup_failures_retain_recoverable_artifacts() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runtime = directory.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("runtime");
+        let private = directory.path().join("private-routing.toml");
+        let guardian_path = directory.path().join("guardian.toml");
+        let database_path = directory.path().join("history.db");
+        PrivateRoutingConfig::default()
+            .save(&private)
+            .expect("private");
+        GuardianConfig {
+            database_path,
+            monitor: MonitorConfig {
+                interval_seconds: 180,
+                connect_timeout_ms: 1_500,
+                request_timeout_ms: 8_000,
+                failure_threshold: 2,
+                recovery_threshold: 3,
+            },
+            outlets: Vec::new(),
+        }
+        .save(&guardian_path)
+        .expect("guardian");
+        let files = settings_transaction_files(&private, &guardian_path);
+        let store = TestSecretStore::default();
+        let current_ref = "settings.secret-failure";
+        let rollback_ref = "rollback.settings.abcdef1234567890.0";
+        store.set(current_ref, "candidate").expect("candidate");
+        let mut journal = test_journal(
+            "abcdef1234567890",
+            SettingsTransactionPhase::Prepared,
+            &files,
+            JournalSecretOperation {
+                current_ref: current_ref.into(),
+                rollback_ref: rollback_ref.into(),
+                previous_present: true,
+                backup_ready: true,
+                action: JournalSecretAction::Set,
+            },
+        );
+        write_settings_journal(&runtime, &journal).expect("journal");
+        backup_settings_files(&runtime, &journal, &files).expect("snapshots");
+        journal.phase = SettingsTransactionPhase::RuntimeValidationPending;
+        write_settings_journal(&runtime, &journal).expect("pending journal");
+        assert!(recover_settings_transaction(&runtime, &private, &guardian_path, &store).is_err());
+        assert!(settings_transaction_artifacts_exist(&runtime));
+        store
+            .set(rollback_ref, "original")
+            .expect("repair rollback");
+        recover_settings_transaction(&runtime, &private, &guardian_path, &store)
+            .expect("secret recovery retry");
+        assert_eq!(
+            store.get(current_ref).expect("formal"),
+            Some("original".into())
+        );
+        assert!(!settings_transaction_artifacts_exist(&runtime));
+
+        let mut cleanup_journal = test_journal(
+            "1234567890abcdef",
+            SettingsTransactionPhase::RolledBack,
+            &files,
+            JournalSecretOperation {
+                current_ref: "settings.none".into(),
+                rollback_ref: "rollback.settings.1234567890abcdef.0".into(),
+                previous_present: false,
+                backup_ready: false,
+                action: JournalSecretAction::Delete,
+            },
+        );
+        cleanup_journal.secret_operations.clear();
+        write_settings_journal(&runtime, &cleanup_journal).expect("cleanup journal");
+        let operations = FailingJournalCleanupOps {
+            inner: SystemDurableFileOps,
+            fail_cleanup: AtomicBool::new(true),
+        };
+        assert!(
+            recover_settings_transaction_with_operations(
+                &runtime,
+                &private,
+                &guardian_path,
+                &store,
+                &operations,
+            )
+            .is_err()
+        );
+        assert!(settings_transaction_artifacts_exist(&runtime));
+        operations.fail_cleanup.store(false, Ordering::SeqCst);
+        recover_settings_transaction_with_operations(
+            &runtime,
+            &private,
+            &guardian_path,
+            &store,
+            &operations,
+        )
+        .expect("cleanup retry");
+        assert!(!settings_transaction_artifacts_exist(&runtime));
+    }
+
+    #[tokio::test]
+    async fn post_decision_terminal_recovery_rolls_forward_before_clearing_gate() {
+        let _serial = SELECTOR_COMPENSATION_TEST_LOCK.lock().await;
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root.clone(), directory.path());
+        let fake_controller = FakeSelectorController::start(false, false);
+        install_fake_controller_client(&state, fake_controller.port);
+        let files =
+            settings_transaction_files(&state.private_config_path, &state.guardian_config_path);
+        let mut journal = test_journal(
+            "abcdef1234567890",
+            SettingsTransactionPhase::Prepared,
+            &files,
+            JournalSecretOperation {
+                current_ref: "settings.none".into(),
+                rollback_ref: "rollback.settings.abcdef1234567890.0".into(),
+                previous_present: false,
+                backup_ready: false,
+                action: JournalSecretAction::Delete,
+            },
+        );
+        journal.secret_operations.clear();
+        write_settings_journal(&state.runtime_directory, &journal).expect("journal");
+        backup_settings_files(&state.runtime_directory, &journal, &files).expect("snapshots");
+        let mut candidate = state.private_config().expect("private");
+        candidate.cooldown_seconds += 1;
+        candidate
+            .save(&state.private_config_path)
+            .expect("candidate");
+        journal.phase = SettingsTransactionPhase::CommitDecided;
+        write_settings_journal(&state.runtime_directory, &journal).expect("commit decision");
+        state
+            .persist_settings_terminal_state(SettingsTerminalState::Pending)
+            .expect("terminal gate");
+
+        let recovered = state
+            .recover_settings_terminal()
+            .await
+            .expect("post-decision terminal recovery");
+        assert!(!recovered.active);
+        assert!(!settings_transaction_artifacts_exist(
+            &state.runtime_directory
+        ));
+        assert_eq!(
+            state.private_config().expect("committed").cooldown_seconds,
+            candidate.cooldown_seconds
+        );
+        assert_eq!(
+            fake_controller.selected(),
+            (FAIL_CLOSED_PROXY.into(), FAIL_CLOSED_PROXY.into())
+        );
+        drop(state);
+        let restarted = AppState::new_for_test(workspace_root, directory.path());
+        assert!(!restarted.settings_terminal_active());
+        assert!(!restarted.settings_recovery_pending());
+        assert_eq!(
+            restarted
+                .private_config()
+                .expect("restarted committed")
+                .cooldown_seconds,
+            candidate.cooldown_seconds
+        );
     }
 
     #[test]

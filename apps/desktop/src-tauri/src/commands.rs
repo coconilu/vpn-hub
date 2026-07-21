@@ -500,6 +500,15 @@ fn after_successful_settings_commit<T>(
     Ok(committed)
 }
 
+fn after_successful_terminal_recovery<T>(
+    result: Result<T, String>,
+    dispatch_reload: impl FnOnce(),
+) -> Result<T, String> {
+    let recovered = result?;
+    dispatch_reload();
+    Ok(recovered)
+}
+
 async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
@@ -612,20 +621,22 @@ pub async fn recover_settings_terminal(
 ) -> Result<crate::runtime::SettingsTerminalStatus, String> {
     let _settings_apply = state.lock_settings_apply().await;
     let _transaction = state.lock_routing_transaction().await;
-    let status = if state.settings_terminal_active() && state.controller_client()?.is_none() {
-        start_owned_core_for_terminal_recovery(&app, &state).await?
+    let recovery = if state.settings_terminal_active() && state.controller_client()?.is_none() {
+        state.recover_settings_transaction_for_terminal()?;
+        start_owned_core_for_terminal_recovery(&app, &state).await
     } else {
-        state.recover_settings_terminal().await?
+        state.recover_settings_terminal().await
     };
     let coordinator = app.state::<lifecycle::DesktopCoordinator>();
-    coordinator.prepare_config_reload();
-    lifecycle::dispatch(
-        &app,
-        LifecycleEvent::ConfigReload {
-            now_ms: unix_time_ms(),
-        },
-    );
-    Ok(status)
+    after_successful_terminal_recovery(recovery, || {
+        coordinator.prepare_config_reload();
+        lifecycle::dispatch(
+            &app,
+            LifecycleEvent::ConfigReload {
+                now_ms: unix_time_ms(),
+            },
+        );
+    })
 }
 
 fn unavailable_result(
@@ -1052,6 +1063,23 @@ mod tests {
         })
         .expect("successful commit");
         assert_eq!(coordinator.recovery_epoch(), recovery_epoch + 1);
+    }
+
+    #[test]
+    fn terminal_recovery_dispatches_reload_only_once_and_only_after_success() {
+        let reloads = std::cell::Cell::new(0_u32);
+        let failed =
+            after_successful_terminal_recovery::<()>(Err("pending journal".into()), || {
+                reloads.set(reloads.get() + 1);
+            });
+        assert!(failed.is_err());
+        assert_eq!(reloads.get(), 0);
+
+        after_successful_terminal_recovery(Ok(()), || {
+            reloads.set(reloads.get() + 1);
+        })
+        .expect("terminal recovery");
+        assert_eq!(reloads.get(), 1);
     }
 
     fn subscription() -> OutletConfig {
