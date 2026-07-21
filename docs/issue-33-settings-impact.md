@@ -21,14 +21,30 @@ authenticated Controller stays in the journal's runtime-validation-pending
 phase until both the Controller cycle and final database commit succeed. Before
 the transaction starts, the desktop reads the authoritative current members of
 both `VPN-HUB-MASTER` and `VPN-HUB-UDP` in one authenticated Controller
-snapshot. A rejected cycle or failed finalization enters the same compensation
-path: restore the previous private and Guardian files, the exact in-memory
-routing snapshot, and both Controller selections with authoritative readback;
-then clean the journal and require a fresh preview ticket before retrying. If
-the old selections cannot be confirmed, both selectors are set to `REJECT` and
-read back, the in-memory current route is cleared, and the result is terminal
-recovery rather than a retryable success. Failure to confirm even that state is
-reported as unconfirmed terminal recovery.
+snapshot. A rejected cycle, or a finalization failure before the durable commit
+decision, enters the same compensation path: restore the previous private and
+Guardian files, the exact in-memory routing snapshot, and both Controller
+selections with authoritative readback; then clean the journal and require a
+fresh preview ticket before retrying.
+
+`CommitDecided` is the one-way durability boundary. It is atomically persisted
+before protected-credential deletion, retention/history cleanup, or any other
+irreversible side effect. A failure after that decision leaves the journal for
+idempotent roll-forward on the next attempt or restart; it never reports a
+rollback. This includes a database commit followed by failure to persist the
+`Finalized` journal phase.
+
+If the old selections cannot be confirmed, both selectors are set to `REJECT`
+and read back, the in-memory current route is cleared, and a separate private
+`runtime/settings-terminal.json` gate is atomically persisted with an adjacent
+backup. The gate survives transaction-journal cleanup and restart. While it is
+active, config reloads, scheduled probes, network-triggered probes, and new
+settings applies cannot enter Guardian routing; they only reassert and read
+back `REJECT` for both selectors. The Settings UI exposes one explicit recovery
+action. That action must authenticate to the owned Controller and confirm both
+selectors at `REJECT` before it durably removes the gate and permits a new
+config reload. Controller unavailability, failed authentication, failed
+readback, or a damaged gate remains fail closed.
 
 `system_proxy`, `tun`, and `service` are not ordinary settings fields. Unknown
 draft fields are rejected during deserialization, while the known `entry` field

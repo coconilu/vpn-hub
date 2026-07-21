@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, Eye, Gauge, KeyRound, ListOrdered, Plus, RadioTower, Route, Save, ShieldAlert, ShieldCheck, Trash2 } from "lucide-react";
-import { applySettings, getSettings, previewSettings } from "./lib/bridge";
+import { applySettings, getSettings, getSettingsTerminalStatus, previewSettings, recoverSettingsTerminal } from "./lib/bridge";
 import {
   buildSettingsPreviewRequest,
   createOutletId,
@@ -11,7 +11,7 @@ import {
   settingsValidationTargetIds,
 } from "./lib/settingsModel";
 import { buildEntrySwitchFoundationPreview } from "./lib/entrySwitchModel";
-import type { CredentialState, LocalProxyProtocol, SafeSettingsView, SettingsDraft, SettingsOutlet, SettingsPreview } from "./types";
+import type { CredentialState, LocalProxyProtocol, SafeSettingsView, SettingsDraft, SettingsOutlet, SettingsPreview, SettingsTerminalStatus } from "./types";
 
 interface Props { currentOutletId: string | null; onApplied: () => Promise<void>; onNotice: (message: string) => void }
 type PageState = "loading" | "clean" | "dirty" | "checking" | "preview" | "confirm_reload" | "applying" | "success" | "error";
@@ -19,6 +19,7 @@ const credentialLabel: Record<CredentialState, string> = { configured: "已配�
 
 export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const [view, setView] = useState<SafeSettingsView | null>(null);
+  const [terminalStatus, setTerminalStatus] = useState<SettingsTerminalStatus>({ active: false, state: null });
   const [draft, setDraft] = useState<SettingsDraft | null>(null);
   const [baseline, setBaseline] = useState("");
   const [credentialIntentById, setCredentialIntentById] = useState<Record<string, "set" | "delete">>({});
@@ -38,7 +39,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const dirty = draft !== null && (JSON.stringify(draft) !== baseline
     || credentialIntentCount > 0 || replacement !== null || failClosed);
 
-  useEffect(() => { void getSettings().then((settings) => { setView(settings); setDraft(settings.draft); setEntrySwitchTarget(settings.draft.entry); setBaseline(JSON.stringify(settings.draft)); setPageState("clean"); }).catch((reason) => { setError(String(reason)); setPageState("error"); }); }, []);
+  useEffect(() => { void Promise.all([getSettings(), getSettingsTerminalStatus()]).then(([settings, terminal]) => { setView(settings); setTerminalStatus(terminal); setDraft(settings.draft); setEntrySwitchTarget(settings.draft.entry); setBaseline(JSON.stringify(settings.draft)); setPageState("clean"); }).catch((reason) => { setError(String(reason)); setPageState("error"); }); }, []);
   useEffect(() => { if (pageState === "error") errorRef.current?.focus(); }, [pageState]);
 
   const invalidatePreview = () => {
@@ -138,6 +139,22 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     }
   };
 
+  const runTerminalRecovery = async () => {
+    if (operationInFlight.current) return;
+    operationInFlight.current = true;
+    setPageState("applying"); setError(null);
+    try {
+      const status = await recoverSettingsTerminal();
+      setTerminalStatus(status); setPageState("clean");
+      onNotice("已通过受鉴权 Controller 确认 MASTER/UDP 双 REJECT；terminal 安全门已解除，自动路由将重新评估。");
+      await onApplied();
+    } catch (reason) {
+      setError(String(reason)); setPageState("error");
+    } finally {
+      operationInFlight.current = false;
+    }
+  };
+
   if (!draft || !view) return (
     <main className="settings-view" aria-busy={pageState === "loading"}>
       {error
@@ -209,6 +226,16 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
           <p className="settings-action-reason" id="settings-action-reason">{actionReason}</p>
         </div>
       </header>
+
+      {terminalStatus.active && (
+        <section className="settings-error" role="alert" aria-label="terminal Fail Closed 安全门">
+          <strong>自动路由已锁定为 Fail Closed</strong>
+          <span>设置恢复未能证明旧状态完整一致。定时探测和配置重载不会重新选路；只有下方显式恢复会通过受鉴权 Controller 再次确认 MASTER/UDP 双 REJECT 后解除安全门。</span>
+          <button className="secondary-button" type="button" disabled={busy} onClick={() => void runTerminalRecovery()}>
+            <ShieldCheck />执行受鉴权恢复
+          </button>
+        </section>
+      )}
 
       {error && <div className="settings-error" ref={errorRef} tabIndex={-1} role="alert"><strong>无法应用</strong><span>{error}</span></div>}
 

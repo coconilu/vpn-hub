@@ -234,6 +234,26 @@ enum SettingsTransactionPhase {
     Finalized,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsTerminalState {
+    Pending,
+    FailClosedConfirmed,
+    FailClosedUnconfirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SettingsTerminalStatus {
+    pub active: bool,
+    pub state: Option<SettingsTerminalState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct SettingsTerminalGate {
+    version: u32,
+    state: SettingsTerminalState,
+}
+
 pub struct DeferredSettingsApply {
     result: SettingsApplyResult,
     transaction_id: String,
@@ -553,6 +573,7 @@ pub struct AppState {
     settings_preview_ticket: Mutex<Option<String>>,
     routing_transaction: RoutingTransaction,
     settings_apply_transaction: RoutingTransaction,
+    settings_terminal: Mutex<Option<SettingsTerminalState>>,
     initialization_error: Option<String>,
     supervisor_route: SupervisorRoute,
     #[cfg(test)]
@@ -561,6 +582,8 @@ pub struct AppState {
     settings_validation_hook: Mutex<Option<SettingsValidationHook>>,
     #[cfg(test)]
     settings_finalize_hook: Mutex<Option<SettingsFinalizeHook>>,
+    #[cfg(test)]
+    settings_post_database_hook: Mutex<Option<SettingsFinalizeHook>>,
     #[cfg(test)]
     controller_client_override: Mutex<Option<ControllerClient>>,
 }
@@ -907,6 +930,14 @@ impl AppState {
         if cleanup_stale_settings_validation_directories(&runtime_directory).is_err() {
             initialization_error.get_or_insert_with(|| "无法清理遗留的隔离设置验证目录".into());
         }
+        let settings_terminal = if let Ok(state) = read_settings_terminal_gate(&runtime_directory) {
+            state
+        } else {
+            initialization_error.get_or_insert_with(|| {
+                "设置 terminal 安全门损坏；自动路由保持 Fail Closed，等待显式恢复".into()
+            });
+            Some(SettingsTerminalState::FailClosedUnconfirmed)
+        };
         let guardian_config_path = guardian_override
             .unwrap_or_else(|| prepare_local_guardian_config(data_directory, &workspace_root));
         let private_config_path = data_directory.join("private-routing.toml");
@@ -972,6 +1003,7 @@ impl AppState {
             settings_preview_ticket: Mutex::new(None),
             routing_transaction: RoutingTransaction::default(),
             settings_apply_transaction: RoutingTransaction::default(),
+            settings_terminal: Mutex::new(settings_terminal),
             initialization_error,
             supervisor_route,
             #[cfg(test)]
@@ -980,6 +1012,8 @@ impl AppState {
             settings_validation_hook: Mutex::new(None),
             #[cfg(test)]
             settings_finalize_hook: Mutex::new(None),
+            #[cfg(test)]
+            settings_post_database_hook: Mutex::new(None),
             #[cfg(test)]
             controller_client_override: Mutex::new(None),
         }
@@ -1020,6 +1054,17 @@ impl AppState {
             .settings_finalize_hook
             .lock()
             .expect("settings finalize hook") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn set_settings_post_database_hook_for_test(
+        &self,
+        hook: impl Fn() -> Result<(), String> + Send + 'static,
+    ) {
+        *self
+            .settings_post_database_hook
+            .lock()
+            .expect("settings post database hook") = Some(Box::new(hook));
     }
 
     #[cfg(test)]
@@ -1306,7 +1351,14 @@ impl AppState {
         let failure = match validate().await {
             Ok(()) => match self.finalize_deferred_settings(&mut pending, false) {
                 Ok(result) => return Ok(result),
-                Err(error) => format!("设置最终提交失败：{error}"),
+                Err(error) => {
+                    if self.deferred_settings_commit_decided(&pending) {
+                        return Err(format!(
+                            "settings_commit_recovery_pending：提交决定已持久化；后续收尾失败，只会幂等前滚且不会伪装回滚：{error}"
+                        ));
+                    }
+                    format!("设置最终提交失败：{error}")
+                }
             },
             Err(error) => format!("Controller 在线应用未确认：{error}"),
         };
@@ -1392,6 +1444,65 @@ impl AppState {
         self.clear_current_route_for_terminal_recovery()
     }
 
+    pub fn settings_terminal_status(&self) -> SettingsTerminalStatus {
+        let state = self.settings_terminal.lock().ok().and_then(|guard| *guard);
+        SettingsTerminalStatus {
+            active: state.is_some(),
+            state,
+        }
+    }
+
+    pub fn settings_terminal_active(&self) -> bool {
+        self.settings_terminal_status().active
+    }
+
+    fn persist_settings_terminal_state(&self, state: SettingsTerminalState) -> Result<(), String> {
+        *self
+            .settings_terminal
+            .lock()
+            .map_err(|_| "设置 terminal 安全门状态锁已损坏".to_string())? = Some(state);
+        write_settings_terminal_gate(&self.runtime_directory, state)
+    }
+
+    pub async fn enforce_settings_terminal_fail_closed(&self) -> Result<(), String> {
+        if !self.settings_terminal_active() {
+            return Ok(());
+        }
+        match self.force_controller_fail_closed().await {
+            Ok(()) => {
+                self.persist_settings_terminal_state(SettingsTerminalState::FailClosedConfirmed)
+            }
+            Err(error) => {
+                let persistence = self
+                    .persist_settings_terminal_state(SettingsTerminalState::FailClosedUnconfirmed);
+                let _ = self.clear_current_route_for_terminal_recovery();
+                match persistence {
+                    Ok(()) => Err(format!(
+                        "terminal_recovery_unconfirmed：自动路由已阻断，但无法权威确认 MASTER/UDP Fail Closed：{error}"
+                    )),
+                    Err(persistence_error) => Err(format!(
+                        "terminal_recovery_unconfirmed：自动路由已阻断，但无法权威确认 MASTER/UDP Fail Closed：{error}；{persistence_error}"
+                    )),
+                }
+            }
+        }
+    }
+
+    pub async fn recover_settings_terminal(&self) -> Result<SettingsTerminalStatus, String> {
+        if !self.settings_terminal_active() {
+            return Ok(self.settings_terminal_status());
+        }
+        self.force_controller_fail_closed().await.map_err(|error| {
+            format!("terminal 恢复未通过受鉴权 Controller 双 REJECT 回读：{error}")
+        })?;
+        clear_settings_terminal_gate(&self.runtime_directory)?;
+        *self
+            .settings_terminal
+            .lock()
+            .map_err(|_| "设置 terminal 安全门状态锁已损坏".to_string())? = None;
+        Ok(self.settings_terminal_status())
+    }
+
     async fn compensate_failed_live_settings(
         &self,
         pending: &DeferredSettingsApply,
@@ -1412,14 +1523,28 @@ impl AppState {
             return format!("{failure}；已恢复旧配置、路由状态与 Controller selectors，可重新提交");
         }
 
+        let terminal_persistence =
+            self.persist_settings_terminal_state(SettingsTerminalState::Pending);
         if self.force_controller_fail_closed().await.is_ok() {
+            let confirmation =
+                self.persist_settings_terminal_state(SettingsTerminalState::FailClosedConfirmed);
+            let persistence = terminal_persistence.and(confirmation);
             format!(
-                "terminal_recovery_fail_closed：{failure}；旧状态无法完整恢复，MASTER/UDP 已权威确认 Fail Closed"
+                "terminal_recovery_fail_closed：{failure}；旧状态无法完整恢复，MASTER/UDP 已权威确认 Fail Closed{}",
+                persistence
+                    .err()
+                    .map_or_else(String::new, |error| format!("；{error}"))
             )
         } else {
             let _ = self.clear_current_route_for_terminal_recovery();
+            let confirmation =
+                self.persist_settings_terminal_state(SettingsTerminalState::FailClosedUnconfirmed);
+            let persistence = terminal_persistence.and(confirmation);
             format!(
-                "terminal_recovery_unconfirmed：{failure}；旧状态无法完整恢复，MASTER/UDP Fail Closed 也无法权威确认"
+                "terminal_recovery_unconfirmed：{failure}；旧状态无法完整恢复，MASTER/UDP Fail Closed 也无法权威确认{}",
+                persistence
+                    .err()
+                    .map_or_else(String::new, |error| format!("；{error}"))
             )
         }
     }
@@ -1792,12 +1917,30 @@ impl AppState {
         {
             hook()?;
         }
-        let removed = finish_committed_settings_with_operations(
+        journal.phase = SettingsTransactionPhase::CommitDecided;
+        write_settings_journal_with_operations(
             &self.runtime_directory,
+            &journal,
+            &SystemDurableFileOps,
+        )?;
+        let removed = apply_committed_settings_side_effects(
             &self.private_config_path,
             &self.guardian_config_path,
-            &mut journal,
+            &journal,
             store,
+        )?;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .settings_post_database_hook
+            .lock()
+            .map_err(|_| "设置数据库提交后测试钩子锁已损坏".to_string())?
+            .as_ref()
+        {
+            hook()?;
+        }
+        mark_settings_transaction_finalized(
+            &self.runtime_directory,
+            &mut journal,
             &SystemDurableFileOps,
         )?;
         let _cleanup = cleanup_settings_transaction_with_operations(
@@ -1809,6 +1952,16 @@ impl AppState {
         pending.result.removed_history_rows = removed;
         pending.result.managed_core_restarted = managed_core_restarted;
         Ok(pending.result.clone())
+    }
+
+    pub fn deferred_settings_commit_decided(&self, pending: &DeferredSettingsApply) -> bool {
+        read_settings_journal(&self.runtime_directory).is_ok_and(|journal| {
+            journal.transaction_id == pending.transaction_id
+                && matches!(
+                    journal.phase,
+                    SettingsTransactionPhase::CommitDecided | SettingsTransactionPhase::Finalized
+                )
+        })
     }
 
     pub fn rollback_deferred_settings(
@@ -3300,6 +3453,64 @@ fn settings_journal_backup_path(runtime_directory: &Path) -> PathBuf {
     runtime_directory.join("settings-transaction.json.bak")
 }
 
+fn settings_terminal_gate_path(runtime_directory: &Path) -> PathBuf {
+    runtime_directory.join("settings-terminal.json")
+}
+
+fn settings_terminal_gate_backup_path(runtime_directory: &Path) -> PathBuf {
+    runtime_directory.join("settings-terminal.json.bak")
+}
+
+fn write_settings_terminal_gate(
+    runtime_directory: &Path,
+    state: SettingsTerminalState,
+) -> Result<(), String> {
+    let gate = SettingsTerminalGate { version: 1, state };
+    let content =
+        serde_json::to_vec(&gate).map_err(|_| "无法序列化设置 terminal 安全门".to_string())?;
+    let path = settings_terminal_gate_path(runtime_directory);
+    durable_atomic_save_with_backup(&path, &content, &SystemDurableFileOps)
+        .map_err(|_| "无法持久化设置 terminal 安全门".to_string())?;
+    harden_private_path(&path)?;
+    harden_private_path(&settings_terminal_gate_backup_path(runtime_directory))
+}
+
+fn read_settings_terminal_gate(
+    runtime_directory: &Path,
+) -> Result<Option<SettingsTerminalState>, String> {
+    let paths = [
+        settings_terminal_gate_path(runtime_directory),
+        settings_terminal_gate_backup_path(runtime_directory),
+    ];
+    if !paths.iter().any(|path| path.exists()) {
+        return Ok(None);
+    }
+    for path in paths {
+        let Ok(content) = fs::read(path) else {
+            continue;
+        };
+        if let Ok(gate) = serde_json::from_slice::<SettingsTerminalGate>(&content)
+            && gate.version == 1
+        {
+            return Ok(Some(gate.state));
+        }
+    }
+    Err("设置 terminal 安全门不存在或已损坏".into())
+}
+
+fn clear_settings_terminal_gate(runtime_directory: &Path) -> Result<(), String> {
+    for path in [
+        settings_terminal_gate_path(runtime_directory),
+        settings_terminal_gate_backup_path(runtime_directory),
+        runtime_directory.join("settings-terminal.json.new"),
+        runtime_directory.join("settings-terminal.json.bak.new"),
+    ] {
+        durable_remove_if_exists(&path, &SystemDurableFileOps)
+            .map_err(|_| "无法持久化清除设置 terminal 安全门".to_string())?;
+    }
+    Ok(())
+}
+
 fn settings_transaction_directory(runtime_directory: &Path, transaction_id: &str) -> PathBuf {
     runtime_directory.join(format!("settings-transaction-{transaction_id}"))
 }
@@ -3515,16 +3726,11 @@ fn restore_settings_credentials<S: SecretStore + ?Sized>(
     Ok(())
 }
 
-fn finish_committed_settings_with_operations<
-    S: SecretStore + ?Sized,
-    O: DurableFileOps + ?Sized,
->(
-    runtime_directory: &Path,
+fn apply_committed_settings_side_effects<S: SecretStore + ?Sized>(
     private_path: &Path,
     guardian_path: &Path,
-    journal: &mut SettingsTransactionJournal,
+    journal: &SettingsTransactionJournal,
     store: &S,
-    operations: &O,
 ) -> Result<u64, String> {
     for operation in &journal.secret_operations {
         if operation.action == JournalSecretAction::Delete {
@@ -3537,9 +3743,32 @@ fn finish_committed_settings_with_operations<
         .map_err(|_| "无法读取已提交的 Guardian 配置".to_string())?;
     let private = PrivateRoutingConfig::load(private_path)
         .map_err(|_| "无法读取已提交的私密路由配置".to_string())?;
-    let removed = finish_settings_database(&private, &guardian, journal.target_retention_days)?;
+    finish_settings_database(&private, &guardian, journal.target_retention_days)
+}
+
+fn mark_settings_transaction_finalized<O: DurableFileOps + ?Sized>(
+    runtime_directory: &Path,
+    journal: &mut SettingsTransactionJournal,
+    operations: &O,
+) -> Result<(), String> {
     journal.phase = SettingsTransactionPhase::Finalized;
-    write_settings_journal_with_operations(runtime_directory, journal, operations)?;
+    write_settings_journal_with_operations(runtime_directory, journal, operations)
+}
+
+fn finish_committed_settings_with_operations<
+    S: SecretStore + ?Sized,
+    O: DurableFileOps + ?Sized,
+>(
+    runtime_directory: &Path,
+    private_path: &Path,
+    guardian_path: &Path,
+    journal: &mut SettingsTransactionJournal,
+    store: &S,
+    operations: &O,
+) -> Result<u64, String> {
+    let removed =
+        apply_committed_settings_side_effects(private_path, guardian_path, journal, store)?;
+    mark_settings_transaction_finalized(runtime_directory, journal, operations)?;
     Ok(removed)
 }
 
@@ -3597,13 +3826,7 @@ fn rollback_settings_transaction<S: SecretStore + ?Sized>(
     guardian_path: &Path,
     store: &S,
 ) -> Result<(), String> {
-    rollback_settings_transaction_inner(
-        runtime_directory,
-        private_path,
-        guardian_path,
-        store,
-        false,
-    )
+    rollback_settings_transaction_inner(runtime_directory, private_path, guardian_path, store)
 }
 
 fn rollback_deferred_settings_transaction<S: SecretStore + ?Sized>(
@@ -3612,7 +3835,7 @@ fn rollback_deferred_settings_transaction<S: SecretStore + ?Sized>(
     guardian_path: &Path,
     store: &S,
 ) -> Result<(), String> {
-    rollback_settings_transaction_inner(runtime_directory, private_path, guardian_path, store, true)
+    rollback_settings_transaction_inner(runtime_directory, private_path, guardian_path, store)
 }
 
 fn rollback_settings_transaction_inner<S: SecretStore + ?Sized>(
@@ -3620,7 +3843,6 @@ fn rollback_settings_transaction_inner<S: SecretStore + ?Sized>(
     private_path: &Path,
     guardian_path: &Path,
     store: &S,
-    allow_finalized: bool,
 ) -> Result<(), String> {
     let primary = settings_journal_path(runtime_directory);
     let backup = settings_journal_backup_path(runtime_directory);
@@ -3630,16 +3852,14 @@ fn rollback_settings_transaction_inner<S: SecretStore + ?Sized>(
     let mut journal = read_settings_journal(runtime_directory)?;
     match journal.phase {
         SettingsTransactionPhase::Prepared | SettingsTransactionPhase::RolledBack => {}
-        SettingsTransactionPhase::Finalized if !allow_finalized => {
-            return Err("已完成的设置事务不能作为待验证事务回滚".into());
+        SettingsTransactionPhase::CommitDecided | SettingsTransactionPhase::Finalized => {
+            return Err("提交决定已持久化的设置事务只能幂等前滚，不能回滚".into());
         }
         SettingsTransactionPhase::BackupsReady
         | SettingsTransactionPhase::CredentialsStaged
         | SettingsTransactionPhase::PrivateCommitted
         | SettingsTransactionPhase::GuardianCommitted
-        | SettingsTransactionPhase::CommitDecided
-        | SettingsTransactionPhase::RuntimeValidationPending
-        | SettingsTransactionPhase::Finalized => {
+        | SettingsTransactionPhase::RuntimeValidationPending => {
             let files = settings_transaction_files(private_path, guardian_path);
             restore_settings_files_with_operations(
                 runtime_directory,
@@ -3934,9 +4154,9 @@ mod tests {
         time::Instant,
     };
     use vpn_hub_core::{
-        HealthStatus, LocalProxyProtocol, MASTER_SELECTOR, MonitorConfig, OutletConfig,
-        OutletHealth, OutletKind, RoutingPolicy, SecretStoreError, SettingsOutletDraft,
-        generate_mihomo_config, outlet_proxy_name,
+        HealthStatus, HistoryFilter, LocalProxyProtocol, MASTER_SELECTOR, MonitorConfig,
+        OutletConfig, OutletHealth, OutletKind, ProbeOutletConfig, ProbeResult, RoutingPolicy,
+        SecretStoreError, SettingsOutletDraft, generate_mihomo_config, outlet_proxy_name,
     };
     use vpn_hub_helper::{ExpectedOwnership, ReplayCache, serve_one_named_pipe_request};
 
@@ -4004,6 +4224,9 @@ mod tests {
                         thread::sleep(Duration::from_millis(5));
                         continue;
                     };
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking fake Controller stream");
                     if server_stop.load(Ordering::SeqCst) {
                         break;
                     }
@@ -4083,7 +4306,7 @@ mod tests {
             self.stop.store(true, Ordering::SeqCst);
             let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
             if let Some(server) = self.server.take() {
-                server.join().expect("fake Controller server");
+                let _ = server.join();
             }
         }
     }
@@ -5196,7 +5419,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     fn settings_preview_never_contacts_a_user_entered_port() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
-        let state = AppState::new_for_test(workspace_root, directory.path());
+        let state = AppState::new_for_test(workspace_root.clone(), directory.path());
         let lease = ProbePortLease::reserve().expect("owned random listener");
         assert!(!matches!(lease.port(), 3_666 | 6_666));
         let mut config = state.private_config().expect("private");
@@ -5532,11 +5755,181 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn post_database_journal_failure_rolls_forward_after_restart() {
+        let _serial = SELECTOR_COMPENSATION_TEST_LOCK.lock().await;
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let data_directory = directory.path().join("app-data");
+        let state = AppState::new_for_test(workspace_root.clone(), &data_directory);
+        state.set_settings_validation_hook_for_test(|_, _| Ok(()));
+        state.set_settings_post_database_hook_for_test(|| {
+            Err("synthetic finalized journal failure".into())
+        });
+        let fake_controller = FakeSelectorController::start(false, false);
+        install_fake_controller_client(&state, fake_controller.port);
+
+        let mut config = state.private_config().expect("private");
+        config.route_mode = RouteMode::Manual;
+        config.manual_outlet = Some("local-a".into());
+        config.outlets = vec![OutletConfig {
+            id: "local-a".into(),
+            label: "Local A".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "socks5h://127.0.0.1:45112".into(),
+            },
+        }];
+        config.save(&state.private_config_path).expect("config");
+        let database_path = GuardianConfig::load(&state.guardian_config_path)
+            .expect("guardian")
+            .database_path;
+        let mut history = GuardianStore::open(&database_path).expect("database");
+        let historical_outlet = ProbeOutletConfig {
+            id: "local-a".into(),
+            label: "Local A".into(),
+            proxy_url: "socks5h://127.0.0.1:45112".into(),
+            probe_url: "https://example.invalid/".into(),
+            degraded_latency_ms: 2_500,
+            enabled: true,
+        };
+        history
+            .record_probe(
+                &historical_outlet,
+                &ProbeResult {
+                    outlet_id: "local-a".into(),
+                    label: "Local A".into(),
+                    observed_at: "2020-01-01T00:00:00Z".into(),
+                    port_reachable: true,
+                    status: HealthStatus::Healthy,
+                    http_status: Some(204),
+                    latency_ms: Some(10),
+                    error_code: None,
+                    successful_targets: 1,
+                    total_targets: 1,
+                },
+                2,
+                3,
+            )
+            .expect("historical probe");
+        let historical_count = history
+            .query_history(&HistoryFilter::default(), "2020-01-02T00:00:00Z")
+            .expect("history before cleanup")
+            .total_count;
+        assert!(historical_count > 1);
+        drop(history);
+
+        let mut draft = state.settings_view().expect("settings").draft;
+        draft.route_mode = RouteMode::Fastest;
+        draft.manual_outlet = None;
+        draft.retention_days = 1;
+        let preview = state
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+            .expect("preview");
+        let error = state
+            .apply_settings_with_runtime_validation(
+                SettingsApplyRequest {
+                    draft,
+                    credential_mutations: Vec::new(),
+                    active_outlet_replacement: None,
+                    fail_closed_on_removed_active: false,
+                    preview_fingerprint: preview.request_fingerprint,
+                },
+                || async {
+                    let controller = state
+                        .controller_client()?
+                        .ok_or_else(|| "missing fake Controller".to_string())?;
+                    controller
+                        .select(MASTER_SELECTOR, NEW_MASTER)
+                        .await
+                        .map_err(|_| "synthetic MASTER failure".to_string())?;
+                    controller
+                        .select(UDP_SELECTOR, NEW_UDP)
+                        .await
+                        .map_err(|_| "synthetic UDP failure".to_string())?;
+                    Ok(())
+                },
+            )
+            .await
+            .expect_err("Finalized journal write failure must stay forward-only");
+
+        assert!(error.starts_with("settings_commit_recovery_pending"));
+        assert_eq!(
+            read_settings_journal(&state.runtime_directory)
+                .expect("pending journal")
+                .phase,
+            SettingsTransactionPhase::CommitDecided
+        );
+        assert_eq!(
+            GuardianStore::open(
+                GuardianConfig::load(&state.guardian_config_path)
+                    .expect("guardian")
+                    .database_path,
+            )
+            .expect("database")
+            .retention_days()
+            .expect("retention"),
+            1
+        );
+        assert!(
+            GuardianStore::open(&database_path)
+                .expect("database")
+                .query_history(&HistoryFilter::default(), "2020-01-02T00:00:00Z")
+                .expect("history after cleanup")
+                .total_count
+                < historical_count
+        );
+        assert_eq!(
+            state.private_config().expect("committed config").route_mode,
+            RouteMode::Fastest
+        );
+        assert_eq!(
+            fake_controller.selected(),
+            (NEW_MASTER.into(), NEW_UDP.into())
+        );
+
+        drop(state);
+        let restarted = AppState::new_for_test(workspace_root, &data_directory);
+        assert!(!restarted.settings_recovery_pending());
+        assert_eq!(
+            restarted
+                .private_config()
+                .expect("restarted config")
+                .route_mode,
+            RouteMode::Fastest
+        );
+        assert_eq!(
+            GuardianStore::open(
+                GuardianConfig::load(&restarted.guardian_config_path)
+                    .expect("guardian")
+                    .database_path,
+            )
+            .expect("database")
+            .retention_days()
+            .expect("retention"),
+            1
+        );
+        assert!(
+            GuardianStore::open(&database_path)
+                .expect("database")
+                .query_history(&HistoryFilter::default(), "2020-01-02T00:00:00Z")
+                .expect("history after restart")
+                .total_count
+                < historical_count
+        );
+        assert_eq!(
+            fake_controller.selected(),
+            (NEW_MASTER.into(), NEW_UDP.into())
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn unconfirmed_old_selectors_enter_terminal_confirmed_fail_closed() {
         let _serial = SELECTOR_COMPENSATION_TEST_LOCK.lock().await;
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
-        let state = AppState::new_for_test(workspace_root, directory.path());
+        let state = AppState::new_for_test(workspace_root.clone(), directory.path());
         state.set_settings_validation_hook_for_test(|_, _| Ok(()));
         let fake_controller = FakeSelectorController::start(true, true);
         install_fake_controller_client(&state, fake_controller.port);
@@ -5610,6 +6003,44 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             (FAIL_CLOSED_PROXY.into(), FAIL_CLOSED_PROXY.into())
         );
         assert!(!settings_journal_path(&state.runtime_directory).exists());
+        assert_eq!(
+            state.settings_terminal_status().state,
+            Some(SettingsTerminalState::FailClosedConfirmed)
+        );
+        assert!(settings_terminal_gate_path(&state.runtime_directory).exists());
+
+        for _ in 0..2 {
+            let error = crate::commands::record_routing_cycle_locked(&state)
+                .await
+                .expect_err("ConfigReload/timed probe must remain gated");
+            assert!(error.starts_with("terminal_recovery_active"));
+            assert_eq!(
+                fake_controller.selected(),
+                (FAIL_CLOSED_PROXY.into(), FAIL_CLOSED_PROXY.into())
+            );
+        }
+
+        let restarted = AppState::new_for_test(workspace_root, directory.path());
+        install_fake_controller_client(&restarted, fake_controller.port);
+        assert_eq!(
+            restarted.settings_terminal_status().state,
+            Some(SettingsTerminalState::FailClosedConfirmed)
+        );
+        crate::commands::record_routing_cycle_locked(&restarted)
+            .await
+            .expect_err("restart must restore the terminal probe gate");
+        assert_eq!(
+            fake_controller.selected(),
+            (FAIL_CLOSED_PROXY.into(), FAIL_CLOSED_PROXY.into())
+        );
+
+        let recovered = restarted
+            .recover_settings_terminal()
+            .await
+            .expect("explicit authenticated recovery");
+        assert!(!recovered.active);
+        assert!(!settings_terminal_gate_path(&restarted.runtime_directory).exists());
+        assert!(!settings_terminal_gate_backup_path(&restarted.runtime_directory).exists());
     }
 
     #[tokio::test]
@@ -6366,9 +6797,10 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
 
         assert!(state.owned_core_controller_is_running(pid));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while state.owned_core_controller_is_running(pid) && Instant::now() < deadline {
+        while state.owned_core_pid() == Some(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(25));
         }
+        assert!(state.owned_core_pid().is_none());
         assert!(!state.owned_core_controller_is_running(pid));
         assert!(state.managed_core.lock().expect("managed core").is_none());
     }

@@ -279,6 +279,11 @@ pub async fn apply_settings(
     request: SettingsApplyRequest,
 ) -> Result<SettingsApplyResult, String> {
     let _settings_apply = state.lock_settings_apply().await;
+    if state.settings_terminal_active() {
+        return Err(
+            "terminal_recovery_active：设置安全门仍处于 Fail Closed；请先执行显式受鉴权恢复".into(),
+        );
+    }
     let (preflight, managed_core_running) = {
         let _transaction = state.lock_routing_transaction().await;
         let core_status = state.core_status_authoritative().await?;
@@ -329,7 +334,7 @@ pub async fn apply_settings(
         }) {
             Ok(result) => result,
             Err(error) => {
-                if requires_controller_confirmation {
+                if requires_controller_confirmation && !state.settings_terminal_active() {
                     lifecycle::dispatch(
                         &app,
                         LifecycleEvent::ConfigReload {
@@ -441,6 +446,11 @@ pub async fn apply_settings(
     match finalized {
         Ok(result) => Ok(result),
         Err(finalize_error) => {
+            if state.deferred_settings_commit_decided(&pending) {
+                return Err(format!(
+                    "settings_commit_recovery_pending：提交决定已持久化；设置与 Controller 保持新状态，剩余收尾只会幂等前滚：{finalize_error}"
+                ));
+            }
             let _ = lifecycle::dispatch_stop_and_wait(&app).await;
             let rollback = {
                 let _transaction = state.lock_routing_transaction().await;
@@ -551,6 +561,13 @@ async fn record_routing_cycle_locked_with_mode(
     state: &AppState,
     allow_direct_fallback: bool,
 ) -> Result<u64, String> {
+    if state.settings_terminal_active() {
+        state.enforce_settings_terminal_fail_closed().await?;
+        return Err(
+            "terminal_recovery_active：自动 Guardian/ConfigReload 探测已阻断，MASTER/UDP 保持 Fail Closed"
+                .into(),
+        );
+    }
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
     let private = state.private_config()?;
@@ -579,6 +596,32 @@ async fn record_routing_cycle_locked_with_mode(
     .await
     .map_err(|error| format!("Guardian 路由周期失败：{error}"))?;
     Ok(guardian.monitor.interval_seconds)
+}
+
+#[tauri::command]
+pub async fn get_settings_terminal_status(
+    state: State<'_, AppState>,
+) -> Result<crate::runtime::SettingsTerminalStatus, String> {
+    Ok(state.settings_terminal_status())
+}
+
+#[tauri::command]
+pub async fn recover_settings_terminal(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::runtime::SettingsTerminalStatus, String> {
+    let _settings_apply = state.lock_settings_apply().await;
+    let _transaction = state.lock_routing_transaction().await;
+    let status = state.recover_settings_terminal().await?;
+    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    coordinator.prepare_config_reload();
+    lifecycle::dispatch(
+        &app,
+        LifecycleEvent::ConfigReload {
+            now_ms: unix_time_ms(),
+        },
+    );
+    Ok(status)
 }
 
 fn unavailable_result(

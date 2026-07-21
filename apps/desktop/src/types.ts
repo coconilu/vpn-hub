@@ -243,6 +243,13 @@ export interface ValidationIssue {
   message: string;
 }
 
+export type SettingsTerminalState = "pending" | "fail_closed_confirmed" | "fail_closed_unconfirmed";
+
+export interface SettingsTerminalStatus {
+  active: boolean;
+  state: SettingsTerminalState | null;
+}
+
 export type SettingsImpact = "live_apply" | "managed_core_reload" | "dedicated_transaction";
 
 export interface SettingsDiff {

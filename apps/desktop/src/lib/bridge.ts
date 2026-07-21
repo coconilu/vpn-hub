@@ -9,6 +9,7 @@ import type {
   HistoryResponse,
   RouteMode,
   SafeSettingsView,
+  SettingsTerminalStatus,
   SettingsApplyRequest,
   SettingsApplyResult,
   SettingsDiff,
@@ -64,6 +65,7 @@ let browserSettings: SafeSettingsView = {
   },
   credentials: [{ subscription_id: "sub-a", state: "configured" }],
 };
+let browserSettingsTerminalStatus: SettingsTerminalStatus = { active: false, state: null };
 let browserSettingsPreviewTicket: string | null = null;
 
 function browserSettingsDiff(
@@ -241,6 +243,19 @@ export async function setHistoryRetention(days: number): Promise<number> {
 export async function getSettings(): Promise<SafeSettingsView> {
   if (!isTauriRuntime()) return structuredClone(browserSettings);
   return invoke<SafeSettingsView>("get_settings");
+}
+
+export async function getSettingsTerminalStatus(): Promise<SettingsTerminalStatus> {
+  if (!isTauriRuntime()) return structuredClone(browserSettingsTerminalStatus);
+  return invoke<SettingsTerminalStatus>("get_settings_terminal_status");
+}
+
+export async function recoverSettingsTerminal(): Promise<SettingsTerminalStatus> {
+  if (!isTauriRuntime()) {
+    browserSettingsTerminalStatus = { active: false, state: null };
+    return structuredClone(browserSettingsTerminalStatus);
+  }
+  return invoke<SettingsTerminalStatus>("recover_settings_terminal");
 }
 
 export async function getSubscriptionNodeCatalog(): Promise<SubscriptionNodeCatalog> {
