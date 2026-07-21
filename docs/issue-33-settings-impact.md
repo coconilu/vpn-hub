@@ -37,14 +37,30 @@ rollback. This includes a database commit followed by failure to persist the
 If the old selections cannot be confirmed, both selectors are set to `REJECT`
 and read back, the in-memory current route is cleared, and a separate private
 `runtime/settings-terminal.json` gate is atomically persisted with an adjacent
-backup. The gate survives transaction-journal cleanup and restart. While it is
-active, config reloads, scheduled probes, network-triggered probes, and new
-settings applies cannot enter Guardian routing; they only reassert and read
-back `REJECT` for both selectors. The Settings UI exposes one explicit recovery
-action. That action must authenticate to the owned Controller and confirm both
-selectors at `REJECT` before it durably removes the gate and permits a new
-config reload. Controller unavailability, failed authentication, failed
-readback, or a damaged gate remains fail closed.
+backup. The `Pending` intent is durable before rollback evidence is cleaned or
+any selector restoration is attempted. It is removed only after both old
+selectors are restored and authoritatively read back. Main, backup, and orphan
+`.new` gate artifacts are all treated as active after a crash, so no boundary
+can restart without either the settings journal or the terminal gate.
+
+The gate survives transaction-journal cleanup and restart. While it is active,
+config reloads, scheduled probes, network-triggered probes, and new settings
+applies cannot enter Guardian routing; they only reassert and read back
+`REJECT` for both selectors. The Settings UI exposes one explicit recovery
+action. If no owned core survived the restart, that action uses a dedicated
+startup path: start a desktop-owned core in its initial double-`REJECT` state,
+prove exact PID and Controller ownership, authenticate and read back both
+selectors, durably remove the gate, and only then publish the core to automatic
+routing. It never borrows a Helper-owned or external Controller. Controller
+unavailability, failed authentication, failed ownership, failed readback, or a
+damaged gate remains fail closed.
+
+Credential deletion follows the same one-way boundary. During
+`RuntimeValidationPending`, the formal protected credential remains present;
+runtime YAML generation uses a transaction-scoped candidate view that omits
+credentials marked for deletion. The formal credential is deleted only after
+`CommitDecided` is durable, and restart recovery repeats that deletion
+idempotently while rolling forward.
 
 `system_proxy`, `tun`, and `service` are not ordinary settings fields. Unknown
 draft fields are rejected during deserialization, while the known `entry` field

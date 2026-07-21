@@ -585,6 +585,8 @@ pub struct AppState {
     #[cfg(test)]
     settings_post_database_hook: Mutex<Option<SettingsFinalizeHook>>,
     #[cfg(test)]
+    settings_compensation_hook: Mutex<Option<SettingsCompensationHook>>,
+    #[cfg(test)]
     controller_client_override: Mutex<Option<ControllerClient>>,
 }
 
@@ -604,6 +606,17 @@ type SettingsValidationHook = Box<dyn Fn(&Path, &Path) -> Result<(), String> + S
 
 #[cfg(test)]
 type SettingsFinalizeHook = Box<dyn Fn() -> Result<(), String> + Send>;
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsCompensationPoint {
+    PendingPersisted,
+    FilesRolledBack,
+    SelectorsRestored,
+}
+
+#[cfg(test)]
+type SettingsCompensationHook = Box<dyn Fn(SettingsCompensationPoint) -> bool + Send>;
 
 #[derive(Default)]
 struct RoutingTransaction {
@@ -1015,6 +1028,8 @@ impl AppState {
             #[cfg(test)]
             settings_post_database_hook: Mutex::new(None),
             #[cfg(test)]
+            settings_compensation_hook: Mutex::new(None),
+            #[cfg(test)]
             controller_client_override: Mutex::new(None),
         }
     }
@@ -1068,6 +1083,17 @@ impl AppState {
     }
 
     #[cfg(test)]
+    fn set_settings_compensation_hook_for_test(
+        &self,
+        hook: impl Fn(SettingsCompensationPoint) -> bool + Send + 'static,
+    ) {
+        *self
+            .settings_compensation_hook
+            .lock()
+            .expect("settings compensation hook") = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
     fn set_controller_client_for_test(&self, controller: ControllerClient) {
         *self
             .controller_client_override
@@ -1109,6 +1135,23 @@ impl AppState {
         SubscriptionSecrets::new(store)
             .resolve(config)
             .map_err(|error| format!("无法解析订阅凭据：{error}"))
+    }
+
+    fn resolved_subscription_urls_for_runtime_start(
+        &self,
+        config: &PrivateRoutingConfig,
+    ) -> Result<ResolvedSubscriptionUrls, String> {
+        let mut resolved = self.resolved_subscription_urls(config)?;
+        if let Ok(journal) = read_settings_journal(&self.runtime_directory)
+            && journal.phase == SettingsTransactionPhase::RuntimeValidationPending
+        {
+            for operation in &journal.secret_operations {
+                if operation.action == JournalSecretAction::Delete {
+                    resolved.remove(&operation.current_ref);
+                }
+            }
+        }
+        Ok(resolved)
     }
 
     pub fn subscription_credential_statuses(
@@ -1503,35 +1546,90 @@ impl AppState {
         Ok(self.settings_terminal_status())
     }
 
+    pub async fn recover_settings_terminal_for_owned_core(
+        &self,
+        expected_pid: u32,
+    ) -> Result<SettingsTerminalStatus, String> {
+        if !self.owned_core_controller_is_running(expected_pid) {
+            return Err(
+                "terminal 专用恢复无法证明启动核心的 PID/Controller ownership；安全门保持".into(),
+            );
+        }
+        self.recover_settings_terminal().await
+    }
+
+    #[cfg(test)]
+    fn settings_compensation_crashes_at(&self, point: SettingsCompensationPoint) -> bool {
+        self.settings_compensation_hook
+            .lock()
+            .is_ok_and(|hook| hook.as_ref().is_some_and(|hook| hook(point)))
+    }
+
     async fn compensate_failed_live_settings(
         &self,
         pending: &DeferredSettingsApply,
         selectors: &ControllerSelectorSnapshot,
         failure: &str,
     ) -> String {
+        if let Err(error) = self.persist_settings_terminal_state(SettingsTerminalState::Pending) {
+            return format!(
+                "terminal_recovery_unconfirmed：{failure}；无法耐久记录 terminal Pending，未清理回滚证据且未尝试 selector 恢复：{error}"
+            );
+        }
+        #[cfg(test)]
+        if self.settings_compensation_crashes_at(SettingsCompensationPoint::PendingPersisted) {
+            return format!("terminal_recovery_pending：{failure}；模拟在 Pending intent 后崩溃");
+        }
+
         let rollback = self.rollback_deferred_settings(pending);
+        #[cfg(test)]
+        if rollback.is_ok()
+            && self.settings_compensation_crashes_at(SettingsCompensationPoint::FilesRolledBack)
+        {
+            return format!("terminal_recovery_pending：{failure}；模拟在文件/凭据回滚后崩溃");
+        }
         if rollback.is_ok()
             && let Ok(Some(controller)) = self.controller_client()
-            && Self::select_and_confirm_controller_targets(
+        {
+            let restored = Self::select_and_confirm_controller_targets(
                 &controller,
                 &selectors.master,
                 &selectors.udp,
             )
             .await
-            .is_ok()
-        {
-            return format!("{failure}；已恢复旧配置、路由状态与 Controller selectors，可重新提交");
+            .is_ok();
+            #[cfg(test)]
+            if restored
+                && self
+                    .settings_compensation_crashes_at(SettingsCompensationPoint::SelectorsRestored)
+            {
+                return format!(
+                    "terminal_recovery_pending：{failure}；模拟在 selectors 权威恢复后、清 gate 前崩溃"
+                );
+            }
+            if restored {
+                return match clear_settings_terminal_gate(&self.runtime_directory) {
+                    Ok(()) => {
+                        if let Ok(mut terminal) = self.settings_terminal.lock() {
+                            *terminal = None;
+                        }
+                        format!(
+                            "{failure}；已恢复旧配置、路由状态与 Controller selectors，可重新提交"
+                        )
+                    }
+                    Err(error) => format!(
+                        "terminal_recovery_pending：{failure}；旧状态已权威恢复，但 terminal gate 未能耐久清除：{error}"
+                    ),
+                };
+            }
         }
 
-        let terminal_persistence =
-            self.persist_settings_terminal_state(SettingsTerminalState::Pending);
         if self.force_controller_fail_closed().await.is_ok() {
             let confirmation =
                 self.persist_settings_terminal_state(SettingsTerminalState::FailClosedConfirmed);
-            let persistence = terminal_persistence.and(confirmation);
             format!(
                 "terminal_recovery_fail_closed：{failure}；旧状态无法完整恢复，MASTER/UDP 已权威确认 Fail Closed{}",
-                persistence
+                confirmation
                     .err()
                     .map_or_else(String::new, |error| format!("；{error}"))
             )
@@ -1539,10 +1637,9 @@ impl AppState {
             let _ = self.clear_current_route_for_terminal_recovery();
             let confirmation =
                 self.persist_settings_terminal_state(SettingsTerminalState::FailClosedUnconfirmed);
-            let persistence = terminal_persistence.and(confirmation);
             format!(
                 "terminal_recovery_unconfirmed：{failure}；旧状态无法完整恢复，MASTER/UDP Fail Closed 也无法权威确认{}",
-                persistence
+                confirmation
                     .err()
                     .map_or_else(String::new, |error| format!("；{error}"))
             )
@@ -2217,13 +2314,6 @@ impl AppState {
             operations,
         )?;
         if defer_runtime_validation {
-            for operation in pending {
-                if operation.journal.action == JournalSecretAction::Delete {
-                    store
-                        .delete(&operation.journal.current_ref)
-                        .map_err(|_| "无法暂存已提交的凭据删除".to_string())?;
-                }
-            }
             return Ok((0, Some(journal)));
         }
         for operation in pending {
@@ -2462,7 +2552,7 @@ impl AppState {
         private_config: &PrivateRoutingConfig,
         controller_secret: &str,
     ) -> Result<String, String> {
-        let resolved = self.resolved_subscription_urls(private_config)?;
+        let resolved = self.resolved_subscription_urls_for_runtime_start(private_config)?;
         let udp_capabilities = self.udp_capability_map(private_config)?;
         generate_mihomo_config_with_udp_capabilities(
             private_config,
@@ -2480,7 +2570,7 @@ impl AppState {
         controller_secret: &str,
         startup_entry_port: u16,
     ) -> Result<String, String> {
-        let resolved = self.resolved_subscription_urls(private_config)?;
+        let resolved = self.resolved_subscription_urls_for_runtime_start(private_config)?;
         let udp_capabilities = self.udp_capability_map(private_config)?;
         generate_mihomo_startup_config(
             private_config,
@@ -3481,6 +3571,8 @@ fn read_settings_terminal_gate(
     let paths = [
         settings_terminal_gate_path(runtime_directory),
         settings_terminal_gate_backup_path(runtime_directory),
+        runtime_directory.join("settings-terminal.json.new"),
+        runtime_directory.join("settings-terminal.json.bak.new"),
     ];
     if !paths.iter().any(|path| path.exists()) {
         return Ok(None);
@@ -5239,6 +5331,149 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     }
 
     #[test]
+    fn runtime_validation_pending_delete_keeps_formal_credential_and_uses_candidate_view() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        state.set_settings_validation_hook_for_test(|_, _| Ok(()));
+        let transaction_suffix = generate_controller_secret()[..16].to_owned();
+        let outlet_id = format!("delete-{transaction_suffix}");
+        let secret_ref = format!("settings.{outlet_id}");
+        let mut config = state.private_config().expect("private");
+        config.outlets = vec![OutletConfig {
+            id: outlet_id.clone(),
+            label: "Delete candidate".into(),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: secret_ref.clone(),
+                provider_update_seconds: 180,
+            },
+        }];
+        config.save(&state.private_config_path).expect("config");
+        let store = state.secret_store.as_ref().expect("secret store");
+        store
+            .set(&secret_ref, "https://example.invalid/private-candidate")
+            .expect("formal credential");
+
+        let draft = state.settings_view().expect("settings").draft;
+        let intents = vec![CredentialMutationIntent {
+            subscription_id: outlet_id.clone(),
+            action: CredentialMutationAction::Delete,
+        }];
+        let preview = state
+            .preview_settings(&preview_request(&draft, None, false, intents))
+            .expect("preview");
+        let pending = state
+            .apply_settings_deferred(SettingsApplyRequest {
+                draft,
+                credential_mutations: vec![CredentialMutation {
+                    subscription_id: outlet_id,
+                    action: CredentialMutationAction::Delete,
+                    credential: None,
+                }],
+                active_outlet_replacement: None,
+                fail_closed_on_removed_active: false,
+                preview_fingerprint: preview.request_fingerprint,
+            })
+            .expect("runtime-validation-pending");
+
+        assert_eq!(
+            read_settings_journal(&state.runtime_directory)
+                .expect("journal")
+                .phase,
+            SettingsTransactionPhase::RuntimeValidationPending
+        );
+        assert!(store.get(&secret_ref).expect("formal credential").is_some());
+        assert!(
+            state
+                .resolved_subscription_urls(&state.private_config().expect("private"))
+                .expect("formal view")
+                .contains_key(&secret_ref)
+        );
+        assert!(
+            !state
+                .resolved_subscription_urls_for_runtime_start(
+                    &state.private_config().expect("private"),
+                )
+                .expect("candidate view")
+                .contains_key(&secret_ref)
+        );
+
+        state
+            .rollback_deferred_settings(&pending)
+            .expect("rollback pending delete");
+        assert!(
+            store
+                .get(&secret_ref)
+                .expect("restored credential")
+                .is_some()
+        );
+        store.delete(&secret_ref).expect("test cleanup");
+    }
+
+    #[test]
+    fn every_precommit_delete_crash_phase_keeps_the_formal_credential() {
+        for (index, phase) in [
+            SettingsTransactionPhase::Prepared,
+            SettingsTransactionPhase::BackupsReady,
+            SettingsTransactionPhase::CredentialsStaged,
+            SettingsTransactionPhase::PrivateCommitted,
+            SettingsTransactionPhase::GuardianCommitted,
+            SettingsTransactionPhase::RuntimeValidationPending,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let runtime = directory.path().join("runtime");
+            fs::create_dir_all(&runtime).expect("runtime");
+            let private = directory.path().join("private-routing.toml");
+            let guardian = directory.path().join("guardian.toml");
+            fs::write(&private, b"original-private").expect("private");
+            fs::write(&guardian, b"original-guardian").expect("guardian");
+            let files = settings_transaction_files(&private, &guardian);
+            let store = TestSecretStore::default();
+            let current_ref = format!("settings.delete.{index}");
+            let rollback_ref = format!("rollback.settings.abcdef1234567890.{index}");
+            store.set(&current_ref, "formal-value").expect("formal");
+            let mut journal = test_journal(
+                "abcdef1234567890",
+                SettingsTransactionPhase::Prepared,
+                &files,
+                JournalSecretOperation {
+                    current_ref: current_ref.clone(),
+                    rollback_ref: rollback_ref.clone(),
+                    previous_present: true,
+                    backup_ready: phase != SettingsTransactionPhase::Prepared,
+                    action: JournalSecretAction::Delete,
+                },
+            );
+            write_settings_journal(&runtime, &journal).expect("prepared journal");
+            if phase != SettingsTransactionPhase::Prepared {
+                backup_settings_files(&runtime, &journal, &files).expect("snapshots");
+                store.set(&rollback_ref, "formal-value").expect("rollback");
+                journal.phase = phase;
+                write_settings_journal(&runtime, &journal).expect("phase journal");
+                fs::write(&private, b"candidate-private").expect("candidate private");
+                fs::write(&guardian, b"candidate-guardian").expect("candidate guardian");
+            }
+
+            assert_eq!(
+                store.get(&current_ref).expect("before recovery"),
+                Some("formal-value".into()),
+                "phase {phase:?}"
+            );
+            recover_settings_transaction(&runtime, &private, &guardian, &store)
+                .expect("restart rollback");
+            assert_eq!(
+                store.get(&current_ref).expect("after recovery"),
+                Some("formal-value".into()),
+                "phase {phase:?}"
+            );
+        }
+    }
+
+    #[test]
     fn commit_decision_finishes_deletion_and_retention_after_restart() {
         let directory = tempfile::tempdir().expect("tempdir");
         let runtime = directory.path().join("runtime");
@@ -5326,6 +5561,12 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             45
         );
         assert!(!settings_journal_path(&runtime).exists());
+        assert_eq!(
+            recover_settings_transaction(&runtime, &private, &guardian_path, &store)
+                .expect("idempotent committed recovery"),
+            None
+        );
+        assert_eq!(store.get("settings.removed").expect("secret"), None);
     }
 
     #[test]
@@ -5920,6 +6161,133 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         assert_eq!(
             fake_controller.selected(),
             (NEW_MASTER.into(), NEW_UDP.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn every_terminal_compensation_crash_boundary_restores_a_restart_gate() {
+        let _serial = SELECTOR_COMPENSATION_TEST_LOCK.lock().await;
+        for point in [
+            SettingsCompensationPoint::PendingPersisted,
+            SettingsCompensationPoint::FilesRolledBack,
+            SettingsCompensationPoint::SelectorsRestored,
+        ] {
+            let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+            let directory = tempfile::tempdir().expect("tempdir");
+            let state = AppState::new_for_test(workspace_root.clone(), directory.path());
+            state.set_settings_validation_hook_for_test(|_, _| Ok(()));
+            state.set_settings_compensation_hook_for_test(move |candidate| candidate == point);
+            let fake_controller = FakeSelectorController::start(false, false);
+            install_fake_controller_client(&state, fake_controller.port);
+
+            let mut config = state.private_config().expect("private");
+            config.outlets = vec![OutletConfig {
+                id: "local-a".into(),
+                label: "Local A".into(),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: "socks5h://127.0.0.1:45112".into(),
+                },
+            }];
+            config.save(&state.private_config_path).expect("config");
+            let mut draft = state.settings_view().expect("settings").draft;
+            draft.minimum_improvement_ms += 1;
+            let preview = state
+                .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+                .expect("preview");
+            let pending = state
+                .apply_settings_deferred(SettingsApplyRequest {
+                    draft,
+                    credential_mutations: Vec::new(),
+                    active_outlet_replacement: None,
+                    fail_closed_on_removed_active: false,
+                    preview_fingerprint: preview.request_fingerprint,
+                })
+                .expect("deferred settings");
+            let error = state
+                .compensate_failed_live_settings(
+                    &pending,
+                    &ControllerSelectorSnapshot {
+                        master: OLD_MASTER.into(),
+                        udp: OLD_UDP.into(),
+                    },
+                    "synthetic validation failure",
+                )
+                .await;
+            assert!(error.starts_with("terminal_recovery_pending"));
+            assert!(settings_terminal_gate_path(&state.runtime_directory).exists());
+
+            let restarted = AppState::new_for_test(workspace_root, directory.path());
+            assert!(
+                restarted.settings_terminal_active(),
+                "crash point {point:?}"
+            );
+            assert_eq!(
+                restarted.settings_terminal_status().state,
+                Some(SettingsTerminalState::Pending),
+                "crash point {point:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_terminal_new_file_restores_pending_gate_on_restart() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runtime = directory.path().join("runtime");
+        fs::create_dir_all(&runtime).expect("runtime");
+        fs::write(
+            runtime.join("settings-terminal.json.new"),
+            serde_json::to_vec(&SettingsTerminalGate {
+                version: 1,
+                state: SettingsTerminalState::Pending,
+            })
+            .expect("gate JSON"),
+        )
+        .expect("orphan new gate");
+
+        let restarted = AppState::new_for_test(workspace_root, directory.path());
+        assert_eq!(
+            restarted.settings_terminal_status().state,
+            Some(SettingsTerminalState::Pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_recovery_survives_owned_process_exit_and_app_state_rebuild() {
+        let _serial = SELECTOR_COMPENSATION_TEST_LOCK.lock().await;
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let first = AppState::new_for_test(workspace_root.clone(), directory.path());
+        first
+            .persist_settings_terminal_state(SettingsTerminalState::Pending)
+            .expect("pending gate");
+        let exited_pid = install_fake_owned_controller(&first, 200);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while first.owned_core_pid() == Some(exited_pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(first.owned_core_pid().is_none());
+        drop(first);
+
+        let restarted = AppState::new_for_test(workspace_root, directory.path());
+        assert!(restarted.settings_terminal_active());
+        let fake_controller = FakeSelectorController::start(false, false);
+        install_fake_controller_client(&restarted, fake_controller.port);
+        let recovery_pid = install_fake_owned_controller(&restarted, 30_000);
+        let recovered = restarted
+            .recover_settings_terminal_for_owned_core(recovery_pid)
+            .await
+            .expect("explicit owned-core terminal recovery");
+        assert!(!recovered.active);
+        assert_eq!(
+            fake_controller.selected(),
+            (FAIL_CLOSED_PROXY.into(), FAIL_CLOSED_PROXY.into())
+        );
+        assert!(
+            restarted
+                .stop_owned_core_if_pid(recovery_pid)
+                .expect("stop recovery core")
         );
     }
 

@@ -612,7 +612,11 @@ pub async fn recover_settings_terminal(
 ) -> Result<crate::runtime::SettingsTerminalStatus, String> {
     let _settings_apply = state.lock_settings_apply().await;
     let _transaction = state.lock_routing_transaction().await;
-    let status = state.recover_settings_terminal().await?;
+    let status = if state.settings_terminal_active() && state.controller_client()?.is_none() {
+        start_owned_core_for_terminal_recovery(&app, &state).await?
+    } else {
+        state.recover_settings_terminal().await?
+    };
     let coordinator = app.state::<lifecycle::DesktopCoordinator>();
     coordinator.prepare_config_reload();
     lifecycle::dispatch(
@@ -931,6 +935,63 @@ async fn start_owned_core_verified(
     }
     status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();
     Ok(status)
+}
+
+async fn start_owned_core_for_terminal_recovery(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<crate::runtime::SettingsTerminalStatus, String> {
+    if !state.settings_terminal_active() {
+        return Ok(state.settings_terminal_status());
+    }
+    if state.uses_helper_authority() {
+        return Err(
+            "terminal 专用恢复当前只允许 desktop-owned 核心；不会借用 Helper 或外部 Controller"
+                .into(),
+        );
+    }
+    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let start_epoch = coordinator.prepare_manual_start(&cancel)?;
+    let status = match state.start_development_core_cancellable(&cancel).await {
+        Ok(status) => status,
+        Err(error) => {
+            coordinator.complete_manual_start_failure(start_epoch);
+            return Err(format!(
+                "terminal 专用恢复无法启动初始双 REJECT 核心；安全门保持：{error}"
+            ));
+        }
+    };
+    let Some(pid) = status.pid else {
+        coordinator.complete_manual_start_failure(start_epoch);
+        return Err("terminal 专用恢复核心未发布可验证 PID；安全门保持".into());
+    };
+    if !coordinator.manual_start_allowed(start_epoch)
+        || !state.owned_core_controller_is_running(pid)
+    {
+        let _ = state.stop_supervised_core_if_pid(pid).await;
+        coordinator.complete_manual_start_failure(start_epoch);
+        return Err(
+            "terminal 专用恢复核心未通过 PID/Controller ownership；已停止且安全门保持".into(),
+        );
+    }
+    let recovered = match state.recover_settings_terminal_for_owned_core(pid).await {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = state.stop_supervised_core_if_pid(pid).await;
+            coordinator.complete_manual_start_failure(start_epoch);
+            return Err(format!(
+                "terminal 专用恢复未通过双 REJECT 权威回读；核心已停止且安全门保持：{error}"
+            ));
+        }
+    };
+    if !coordinator.complete_manual_start(pid, start_epoch)
+        || !state.owned_core_controller_is_running(pid)
+    {
+        let _ = state.stop_supervised_core_if_pid(pid).await;
+        return Err("停止请求优先于 terminal 专用恢复结果；核心已清理".into());
+    }
+    Ok(recovered)
 }
 
 #[tauri::command]
