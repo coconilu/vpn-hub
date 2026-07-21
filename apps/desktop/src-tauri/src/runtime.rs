@@ -23,8 +23,8 @@ use vpn_hub_core::{
     MASTER_SELECTOR, OutletConfig, OutletConfigSummary, OutletKind, PrivateRoutingConfig,
     ResolvedSubscriptionUrls, RouteDecision, RouteMode, RoutingEngine, RoutingSession,
     RoutingStateError, SafeSettingsView, SecretStore, SelectorNodeSnapshot, SettingsDiff,
-    SettingsDraft, SettingsOutletDraft, SubscriptionCredentialStatus, SubscriptionNode,
-    SubscriptionSecrets, SystemDurableFileOps, SystemSecretStore, UDP_SELECTOR,
+    SettingsDraft, SettingsImpact, SettingsOutletDraft, SubscriptionCredentialStatus,
+    SubscriptionNode, SubscriptionSecrets, SystemDurableFileOps, SystemSecretStore, UDP_SELECTOR,
     UdpCapabilityEvidence, UdpCapabilityMap, UdpProbeTarget, ValidationIssue,
     classify_subscription_udp, durable_atomic_save_with_backup, durable_remove_if_exists,
     durable_replace, durable_write_new, generate_controller_secret, generate_mihomo_config,
@@ -1164,7 +1164,14 @@ impl AppState {
             .retention_days()
             .map_err(|error| format!("无法读取历史保留策略：{error}"))?;
         let current_draft = SettingsDraft::from_configs(&current, &guardian, retention);
-        let diff = draft.diff(&current_draft);
+        let mut diff = draft.diff(&current_draft);
+        if !credential_intents.is_empty() {
+            diff.add_change(
+                "credentials_changed",
+                "订阅凭据状态将更新并受控重载核心；预览不包含凭据内容",
+                SettingsImpact::ManagedCoreReload,
+            );
+        }
         let mut issues = Vec::new();
         let candidate = match draft.private_candidate(&current) {
             Ok(candidate) => Some(candidate),
@@ -1207,7 +1214,7 @@ impl AppState {
             }
         }
         let requires_managed_core_restart =
-            managed_core_running && (diff.runtime_changed || !credential_intents.is_empty());
+            managed_core_running && diff.requires_managed_core_reload();
         Ok(SettingsPreview {
             can_apply: issues.is_empty()
                 && (!diff.changes.is_empty() || !credential_intents.is_empty()),
@@ -1389,7 +1396,7 @@ impl AppState {
         if ticket.as_deref() != Some(fingerprint.as_str()) {
             return Err("设置预览已失效或已被使用，请重新预览".into());
         }
-        let mut preview = self.evaluate_settings(
+        let preview = self.evaluate_settings(
             &draft,
             &credential_intents,
             active_outlet_replacement.as_deref(),
@@ -1400,12 +1407,6 @@ impl AppState {
                 .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?
                 .is_some(),
         )?;
-        if !credential_intents.is_empty() {
-            preview.diff.changes.push(vpn_hub_core::SettingsChange {
-                code: "credentials_changed".into(),
-                summary: "订阅凭据配置状态将更新；预览不包含凭据内容".into(),
-            });
-        }
         if !preview.issues.is_empty() {
             return Err(format!(
                 "设置校验失败：{}",
@@ -4837,7 +4838,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     }
 
     #[test]
-    fn running_owned_core_requires_restart_but_does_not_block_valid_preview() {
+    fn running_owned_core_keeps_live_policy_online_and_flags_yaml_changes_for_reload() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
         let state = AppState::new_for_test(workspace_root, directory.path());
@@ -4858,8 +4859,61 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             .preview_settings(&preview_request(&draft, None, false, Vec::new()))
             .expect("preview");
         assert!(preview.can_apply);
-        assert!(preview.requires_managed_core_restart);
+        assert!(!preview.requires_managed_core_restart);
+        assert!(preview.diff.has_impact(SettingsImpact::LiveApply));
+        assert!(!preview.diff.requires_managed_core_reload());
         assert!(preview.issues.is_empty());
+
+        let mut reload_draft = state.settings_view().expect("settings").draft;
+        reload_draft.probe_targets[0] = "https://probe.invalid/health".into();
+        let reload_preview = state
+            .preview_settings(&preview_request(&reload_draft, None, false, Vec::new()))
+            .expect("reload preview");
+        assert!(reload_preview.can_apply);
+        assert!(reload_preview.requires_managed_core_restart);
+        assert!(reload_preview.diff.requires_managed_core_reload());
+        assert!(state.stop_owned_core_if_pid(pid).expect("exact stop"));
+    }
+
+    #[test]
+    fn credential_intent_is_explicitly_classified_as_managed_core_reload() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let mut config = state.private_config().expect("private");
+        config.outlets = vec![OutletConfig {
+            id: "sub-a".into(),
+            label: "Subscription A".into(),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: "settings.sub-a".into(),
+                provider_update_seconds: 180,
+            },
+        }];
+        config.save(&state.private_config_path).expect("config");
+        let pid = install_fake_owned_controller(&state, 30_001);
+        let draft = state.settings_view().expect("settings").draft;
+        let preview = state
+            .preview_settings(&preview_request(
+                &draft,
+                None,
+                false,
+                vec![CredentialMutationIntent {
+                    subscription_id: "sub-a".into(),
+                    action: CredentialMutationAction::Set,
+                }],
+            ))
+            .expect("credential preview");
+        assert!(preview.requires_managed_core_restart);
+        assert_eq!(
+            preview
+                .diff
+                .changes
+                .iter()
+                .find(|change| change.code == "credentials_changed")
+                .map(|change| change.impact),
+            Some(SettingsImpact::ManagedCoreReload)
+        );
         assert!(state.stop_owned_core_if_pid(pid).expect("exact stop"));
     }
 
@@ -5062,6 +5116,20 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
                 .expect("preview");
             assert!(preview.can_apply);
             let fingerprint = preview.request_fingerprint.clone();
+            let mut changed_after_preview = draft.clone();
+            changed_after_preview.retention_days += 1;
+            let changed = state.apply_settings(SettingsApplyRequest {
+                draft: changed_after_preview,
+                credential_mutations: Vec::new(),
+                active_outlet_replacement: replacement.map(str::to_owned),
+                fail_closed_on_removed_active: fail_closed,
+                preview_fingerprint: fingerprint.clone(),
+            });
+            assert!(
+                changed
+                    .expect_err("draft change must reject the preview")
+                    .contains("应用内容与最后一次预览不匹配")
+            );
             let result = state
                 .apply_settings(SettingsApplyRequest {
                     draft: draft.clone(),

@@ -11,10 +11,13 @@ import type {
   SafeSettingsView,
   SettingsApplyRequest,
   SettingsApplyResult,
+  SettingsDiff,
+  SettingsDraft,
   SettingsPreview,
   SettingsPreviewRequest,
   SubscriptionNodeCatalog,
   SubscriptionNodeGroup,
+  ValidationIssue,
 } from "../types";
 
 declare global {
@@ -40,11 +43,69 @@ let browserSettings: SafeSettingsView = {
     failure_threshold: 2,
     recovery_threshold: 3,
     retention_days: 30,
-    outlets: [],
+    outlets: [
+      {
+        kind: "subscription",
+        outlet_id: "sub-a",
+        label: "合成订阅 A",
+        enabled: true,
+        provider_update_seconds: 180,
+      },
+      {
+        kind: "local_proxy",
+        outlet_id: "local-a",
+        label: "合成本地出口",
+        enabled: true,
+        protocol: "socks5h",
+        host: "127.0.0.1",
+        port: 45112,
+      },
+    ],
   },
-  credentials: [],
+  credentials: [{ subscription_id: "sub-a", state: "configured" }],
 };
 let browserSettingsPreviewTicket: string | null = null;
+
+function browserSettingsDiff(
+  draft: SettingsDraft,
+  current: SettingsDraft,
+  credentialsChanged: boolean,
+): SettingsDiff {
+  const changes: SettingsDiff["changes"] = [];
+  const add = (code: string, summary: string, impact: SettingsDiff["changes"][number]["impact"]) => {
+    changes.push({ code, summary, impact });
+  };
+  if (JSON.stringify(draft.entry) !== JSON.stringify(current.entry)) {
+    add("entry_changed", "统一入口只能通过专用安全事务更新", "dedicated_transaction");
+  }
+  if (draft.route_mode !== current.route_mode || draft.manual_outlet !== current.manual_outlet) {
+    add("route_policy_changed", "默认路由模式或手动出口将通过 Controller 在线更新", "live_apply");
+  }
+  if (draft.cooldown_seconds !== current.cooldown_seconds
+    || draft.minimum_improvement_ms !== current.minimum_improvement_ms) {
+    add("routing_thresholds_changed", "切换阈值将在线更新", "live_apply");
+  }
+  if (JSON.stringify(draft.probe_targets) !== JSON.stringify(current.probe_targets)) {
+    add("probe_targets_changed", "探测目标影响 Mihomo provider 健康检查，将受控重载核心", "managed_core_reload");
+  }
+  if (JSON.stringify(draft.outlets) !== JSON.stringify(current.outlets)) {
+    add("outlets_changed", "出口定义、provider、启用状态或顺序将受控重载核心", "managed_core_reload");
+  }
+  if (draft.refresh_interval_seconds !== current.refresh_interval_seconds
+    || draft.connect_timeout_ms !== current.connect_timeout_ms
+    || draft.request_timeout_ms !== current.request_timeout_ms
+    || draft.failure_threshold !== current.failure_threshold
+    || draft.recovery_threshold !== current.recovery_threshold) {
+    add("monitor_changed", "Guardian 探测周期与阈值将在线更新", "live_apply");
+  }
+  if (draft.retention_days !== current.retention_days) {
+    add("retention_changed", "历史保留期将在线更新并清理过期数据", "live_apply");
+  }
+  if (credentialsChanged) {
+    add("credentials_changed", "订阅凭据状态将更新并受控重载核心；预览不包含凭据内容", "managed_core_reload");
+  }
+  return { changes };
+}
 let browserNodeCatalog: SubscriptionNodeCatalog = {
   controller_ready: true,
   subscriptions: [
@@ -225,23 +286,30 @@ export async function previewSettings(request: SettingsPreviewRequest): Promise<
       throw new Error("设置预览指纹与请求内容不匹配");
     }
     const draft = request.draft;
-    const issues = draft.outlets.some((outlet) => outlet.enabled)
-      ? []
-      : [{ field: "outlets", code: "enabled_outlet_required", message: "至少需要一个启用出口。" }];
+    const diff = browserSettingsDiff(
+      draft,
+      browserSettings.draft,
+      request.credential_intents.length > 0,
+    );
+    const issues: ValidationIssue[] = [];
+    if (!draft.outlets.some((outlet) => outlet.enabled)) {
+      issues.push({ field: "outlets", code: "enabled_outlet_required", message: "至少需要一个启用出口。" });
+    }
+    if (diff.changes.some((change) => change.impact === "dedicated_transaction")) {
+      issues.push({
+        field: "entry",
+        code: "dedicated_entry_switch_required",
+        message: "统一入口只能通过专用安全切换事务修改。",
+      });
+    }
     const result = {
-      diff: {
-        changes: JSON.stringify(draft) === JSON.stringify(browserSettings.draft)
-          ? []
-          : [{ code: "browser_preview", summary: "浏览器预览：设置将更新" }],
-        runtime_changed: true,
-        monitor_changed: true,
-        retention_changed: draft.retention_days !== browserSettings.draft.retention_days,
-      },
+      diff,
       issues,
       can_apply: issues.length === 0
-        && (JSON.stringify(draft) !== JSON.stringify(browserSettings.draft)
-          || request.credential_intents.length > 0),
-      requires_managed_core_restart: false,
+        && diff.changes.length > 0,
+      requires_managed_core_restart: browserSnapshot.mihomo.managed
+        && browserSnapshot.mihomo.pid !== null
+        && diff.changes.some((change) => change.impact === "managed_core_reload"),
       request_fingerprint: fingerprint,
       tun_plan: {
         requested_enabled: false,
@@ -290,6 +358,11 @@ export async function applySettings(request: SettingsApplyRequest): Promise<Sett
       browserSettingsPreviewTicket,
       request.preview_fingerprint,
     );
+    const diff = browserSettingsDiff(
+      request.draft,
+      browserSettings.draft,
+      request.credential_mutations.length > 0,
+    );
     const previousStates = new Map(browserSettings.credentials.map((item) => [item.subscription_id, item.state]));
     browserSettings = {
       draft: structuredClone(request.draft),
@@ -308,14 +381,11 @@ export async function applySettings(request: SettingsApplyRequest): Promise<Sett
     };
     return {
       settings: structuredClone(browserSettings),
-      diff: {
-        changes: [{ code: "browser_apply", summary: "浏览器预览设置已更新" }],
-        runtime_changed: true,
-        monitor_changed: true,
-        retention_changed: true,
-      },
+      diff,
       removed_history_rows: 0,
-      managed_core_restarted: false,
+      managed_core_restarted: browserSnapshot.mihomo.managed
+        && browserSnapshot.mihomo.pid !== null
+        && diff.changes.some((change) => change.impact === "managed_core_reload"),
     };
   }
   return invoke<SettingsApplyResult>("apply_settings", { request });

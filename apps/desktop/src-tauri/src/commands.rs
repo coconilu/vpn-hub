@@ -235,7 +235,7 @@ pub async fn preview_settings(
     let managed_core_running = core_status.managed && core_status.pid.is_some();
     let mut preview = state.preview_settings_with_core_state(&request, managed_core_running)?;
     if core_status.state == "external"
-        && (preview.diff.runtime_changed || !request.credential_intents.is_empty())
+        && (preview.diff.affects_private_routing() || !request.credential_intents.is_empty())
     {
         preview.issues.push(ValidationIssue::new(
             "runtime",
@@ -246,13 +246,24 @@ pub async fn preview_settings(
     }
     if helper_settings_deployment_required(
         state.uses_helper_authority(),
-        preview.diff.runtime_changed,
+        preview.diff.affects_private_routing(),
         !request.credential_intents.is_empty(),
     ) {
         preview.issues.push(ValidationIssue::new(
             "runtime",
             "helper_settings_deployment_required",
             "Helper 核心使用受保护的 ProgramData 配置；当前设置事务不会越权改写该运行配置",
+        ));
+        preview.can_apply = false;
+    }
+    if managed_core_running
+        && preview.diff.requires_authenticated_controller_apply()
+        && state.controller_client()?.is_none()
+    {
+        preview.issues.push(ValidationIssue::new(
+            "runtime",
+            "authenticated_controller_required",
+            "自管核心未提供受鉴权 Controller；路由策略不会被误报为在线应用",
         ));
         preview.can_apply = false;
     }
@@ -268,14 +279,14 @@ pub async fn apply_settings(
     request: SettingsApplyRequest,
 ) -> Result<SettingsApplyResult, String> {
     let _settings_apply = state.lock_settings_apply().await;
-    let preflight = {
+    let (preflight, managed_core_running) = {
         let _transaction = state.lock_routing_transaction().await;
         let core_status = state.core_status_authoritative().await?;
         let managed_core_running = core_status.managed && core_status.pid.is_some();
         let preview = state.preflight_settings_apply(&request, managed_core_running)?;
         if helper_settings_deployment_required(
             state.uses_helper_authority(),
-            preview.diff.runtime_changed,
+            preview.diff.affects_private_routing(),
             !request.credential_mutations.is_empty(),
         ) {
             return Err(
@@ -283,13 +294,19 @@ pub async fn apply_settings(
             );
         }
         if core_status.state == "external"
-            && (preview.diff.runtime_changed || !request.credential_mutations.is_empty())
+            && (preview.diff.affects_private_routing() || !request.credential_mutations.is_empty())
         {
             return Err(
                 "入口或 Controller ownership 不可证明；不会停止、重启或改写未知核心".into(),
             );
         }
-        preview
+        if managed_core_running
+            && preview.diff.requires_authenticated_controller_apply()
+            && state.controller_client()?.is_none()
+        {
+            return Err("自管核心未提供受鉴权 Controller；不会把路由策略误报为在线应用".into());
+        }
+        (preview, managed_core_running)
     };
     if !preflight.requires_managed_core_restart {
         let _transaction = state.lock_routing_transaction().await;
@@ -297,6 +314,11 @@ pub async fn apply_settings(
         let result = after_successful_settings_commit(state.apply_settings(request), || {
             coordinator.prepare_config_reload();
         })?;
+        if managed_core_running && preflight.diff.requires_authenticated_controller_apply() {
+            record_owned_controller_cycle_locked(&state)
+                .await
+                .map_err(|error| format!("设置已持久化，但 Controller 在线应用未确认：{error}"))?;
+        }
         lifecycle::dispatch(
             &app,
             LifecycleEvent::ConfigReload {
@@ -432,10 +454,10 @@ pub async fn apply_settings(
 
 fn helper_settings_deployment_required(
     helper_owned: bool,
-    runtime_changed: bool,
+    private_routing_changed: bool,
     credentials_changed: bool,
 ) -> bool {
-    helper_owned && (runtime_changed || credentials_changed)
+    helper_owned && (private_routing_changed || credentials_changed)
 }
 
 fn after_successful_settings_commit<T>(

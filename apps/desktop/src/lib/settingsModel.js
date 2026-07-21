@@ -72,6 +72,13 @@ export function isCurrentPreviewResponse(
     && currentFingerprint === responseFingerprint;
 }
 
+export function settingsPreviewOutcome(preview) {
+  if (preview.issues.length > 0) return "error";
+  if (!preview.can_apply) return "no_changes";
+  if (preview.requires_managed_core_restart) return "confirm_reload";
+  return "live_apply";
+}
+
 export function takeCredentialMutations(inputById, intentById) {
   const intents = credentialIntents(intentById);
   const setIds = new Set(intents

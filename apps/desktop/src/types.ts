@@ -243,11 +243,10 @@ export interface ValidationIssue {
   message: string;
 }
 
+export type SettingsImpact = "live_apply" | "managed_core_reload" | "dedicated_transaction";
+
 export interface SettingsDiff {
-  changes: Array<{ code: string; summary: string }>;
-  runtime_changed: boolean;
-  monitor_changed: boolean;
-  retention_changed: boolean;
+  changes: Array<{ code: string; summary: string; impact: SettingsImpact }>;
 }
 
 export interface SettingsPreview {

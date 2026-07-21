@@ -81,6 +81,7 @@ impl SettingsOutletDraft {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SettingsDraft {
     pub entry: EntryConfig,
     pub route_mode: RouteMode,
@@ -135,14 +136,69 @@ impl ValidationIssue {
 pub struct SettingsChange {
     pub code: String,
     pub summary: String,
+    pub impact: SettingsImpact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsImpact {
+    LiveApply,
+    ManagedCoreReload,
+    DedicatedTransaction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SettingsDiff {
     pub changes: Vec<SettingsChange>,
-    pub runtime_changed: bool,
-    pub monitor_changed: bool,
-    pub retention_changed: bool,
+}
+
+impl SettingsDiff {
+    #[must_use]
+    pub fn has_impact(&self, impact: SettingsImpact) -> bool {
+        self.changes.iter().any(|change| change.impact == impact)
+    }
+
+    #[must_use]
+    pub fn requires_managed_core_reload(&self) -> bool {
+        self.has_impact(SettingsImpact::ManagedCoreReload)
+    }
+
+    #[must_use]
+    pub fn affects_private_routing(&self) -> bool {
+        self.changes.iter().any(|change| {
+            matches!(
+                change.code.as_str(),
+                "entry_changed"
+                    | "route_policy_changed"
+                    | "routing_thresholds_changed"
+                    | "probe_targets_changed"
+                    | "outlets_changed"
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn requires_authenticated_controller_apply(&self) -> bool {
+        self.changes.iter().any(|change| {
+            matches!(
+                change.code.as_str(),
+                "route_policy_changed" | "routing_thresholds_changed"
+            )
+        })
+    }
+
+    pub fn add_change(
+        &mut self,
+        code: impl Into<String>,
+        summary: impl Into<String>,
+        impact: SettingsImpact,
+    ) {
+        self.changes.push(SettingsChange {
+            code: code.into(),
+            summary: summary.into(),
+            impact,
+        });
+    }
 }
 
 impl SettingsDraft {
@@ -425,36 +481,48 @@ impl SettingsDraft {
 
     #[must_use]
     pub fn diff(&self, current: &Self) -> SettingsDiff {
-        let mut changes = Vec::new();
-        let mut runtime_changed = false;
-        let mut monitor_changed = false;
-        let mut add = |code: &str, summary: &str| {
-            changes.push(SettingsChange {
-                code: code.into(),
-                summary: summary.into(),
-            });
+        let mut diff = SettingsDiff {
+            changes: Vec::new(),
+        };
+        let mut add = |code: &str, summary: &str, impact: SettingsImpact| {
+            diff.add_change(code, summary, impact);
         };
         if self.entry != current.entry {
-            runtime_changed = true;
-            add("entry_changed", "统一入口将更新");
+            add(
+                "entry_changed",
+                "统一入口只能通过专用安全事务更新",
+                SettingsImpact::DedicatedTransaction,
+            );
         }
         if self.route_mode != current.route_mode || self.manual_outlet != current.manual_outlet {
-            runtime_changed = true;
-            add("route_policy_changed", "默认路由模式或手动出口将更新");
+            add(
+                "route_policy_changed",
+                "默认路由模式或手动出口将通过 Controller 在线更新",
+                SettingsImpact::LiveApply,
+            );
         }
         if self.cooldown_seconds != current.cooldown_seconds
             || self.minimum_improvement_ms != current.minimum_improvement_ms
         {
-            runtime_changed = true;
-            add("routing_thresholds_changed", "切换阈值将更新");
+            add(
+                "routing_thresholds_changed",
+                "切换阈值将在线更新",
+                SettingsImpact::LiveApply,
+            );
         }
         if self.probe_targets != current.probe_targets {
-            runtime_changed = true;
-            add("probe_targets_changed", "探测目标将更新");
+            add(
+                "probe_targets_changed",
+                "探测目标影响 Mihomo provider 健康检查，将受控重载核心",
+                SettingsImpact::ManagedCoreReload,
+            );
         }
         if self.outlets != current.outlets {
-            runtime_changed = true;
-            add("outlets_changed", "出口定义、启用状态或顺序将更新");
+            add(
+                "outlets_changed",
+                "出口定义、provider、启用状态或顺序将受控重载核心",
+                SettingsImpact::ManagedCoreReload,
+            );
         }
         if self.refresh_interval_seconds != current.refresh_interval_seconds
             || self.connect_timeout_ms != current.connect_timeout_ms
@@ -462,19 +530,20 @@ impl SettingsDraft {
             || self.failure_threshold != current.failure_threshold
             || self.recovery_threshold != current.recovery_threshold
         {
-            monitor_changed = true;
-            add("monitor_changed", "Guardian 探测周期与阈值将更新");
+            add(
+                "monitor_changed",
+                "Guardian 探测周期与阈值将在线更新",
+                SettingsImpact::LiveApply,
+            );
         }
-        let retention_changed = self.retention_days != current.retention_days;
-        if retention_changed {
-            add("retention_changed", "历史保留期将更新并清理过期数据");
+        if self.retention_days != current.retention_days {
+            add(
+                "retention_changed",
+                "历史保留期将在线更新并清理过期数据",
+                SettingsImpact::LiveApply,
+            );
         }
-        SettingsDiff {
-            changes,
-            runtime_changed,
-            monitor_changed,
-            retention_changed,
-        }
+        diff
     }
 }
 
@@ -639,5 +708,113 @@ mod tests {
         assert!(!json.contains("settings.sub-a"));
         assert!(!json.contains("secret_ref"));
         assert!(json.contains("configured"));
+    }
+
+    #[test]
+    fn classifies_every_settings_field_by_operational_impact() {
+        fn assert_only_impact(
+            current: &SettingsDraft,
+            mutate: impl FnOnce(&mut SettingsDraft),
+            expected: SettingsImpact,
+        ) {
+            let mut candidate = current.clone();
+            mutate(&mut candidate);
+            let diff = candidate.diff(current);
+            assert_eq!(diff.changes.len(), 1, "unexpected changes: {diff:?}");
+            assert_eq!(diff.changes[0].impact, expected);
+        }
+
+        let current = five_outlet_draft();
+        assert_only_impact(
+            &current,
+            |draft| draft.entry.port += 1,
+            SettingsImpact::DedicatedTransaction,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.route_mode = RouteMode::Fastest,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.manual_outlet = Some("local-a".into()),
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.cooldown_seconds += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.minimum_improvement_ms += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| {
+                draft
+                    .probe_targets
+                    .push("https://probe.invalid/health".into());
+            },
+            SettingsImpact::ManagedCoreReload,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.refresh_interval_seconds += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.connect_timeout_ms += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.request_timeout_ms += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.failure_threshold += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.recovery_threshold += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| draft.retention_days += 1,
+            SettingsImpact::LiveApply,
+        );
+        assert_only_impact(
+            &current,
+            |draft| {
+                let SettingsOutletDraft::Subscription {
+                    provider_update_seconds,
+                    ..
+                } = &mut draft.outlets[0]
+                else {
+                    panic!("expected subscription outlet");
+                };
+                *provider_update_seconds += 60;
+            },
+            SettingsImpact::ManagedCoreReload,
+        );
+    }
+
+    #[test]
+    fn ordinary_settings_draft_rejects_dedicated_capability_fields() {
+        for field in ["system_proxy", "tun", "service"] {
+            let mut value = serde_json::to_value(five_outlet_draft()).expect("serialize draft");
+            let object = value.as_object_mut().expect("draft object");
+            object.insert(field.into(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<SettingsDraft>(value).is_err(),
+                "ordinary settings accepted dedicated field {field}"
+            );
+        }
     }
 }
