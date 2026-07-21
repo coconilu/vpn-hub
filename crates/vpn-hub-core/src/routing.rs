@@ -52,7 +52,7 @@ pub struct RouteDecision {
     pub reason: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingEngine {
     mode: RouteMode,
     manual_outlet: Option<String>,

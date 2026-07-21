@@ -8,6 +8,7 @@ export function settingsRequestFingerprint(draft: SettingsDraft, activeOutletRep
 export function buildSettingsPreviewRequest(draft: SettingsDraft, activeOutletReplacement: string | null, failClosedOnRemovedActive: boolean, intentById: Record<string, CredentialIntentAction>): SettingsPreviewRequest;
 export function isCurrentPreviewResponse(startedGeneration: number, currentGeneration: number, currentFingerprint: string, responseFingerprint: string): boolean;
 export function settingsPreviewOutcome(preview: SettingsPreview): "error" | "no_changes" | "confirm_reload" | "live_apply";
+export function settingsValidationTargetIds(field: string): string[];
 export function takeCredentialMutations(inputById: Map<string, Pick<HTMLInputElement, "value">>, intentById: Record<string, CredentialIntentAction>): CredentialMutation[];
 export function consumeSettingsPreviewTicket(currentTicket: string | null, requestedFingerprint: string): null;
 export function dispatchOneShotSettingsApply<R>(requestWithoutCredentials: Omit<SettingsApplyRequest, "credential_mutations">, inputById: Map<string, Pick<HTMLInputElement, "value">>, intentById: Record<string, CredentialIntentAction>, dispatch: (request: SettingsApplyRequest) => Promise<R>): Promise<R>;

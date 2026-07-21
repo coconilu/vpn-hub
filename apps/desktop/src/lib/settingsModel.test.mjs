@@ -10,6 +10,7 @@ import {
   moveItem,
   settingsPreviewOutcome,
   settingsRequestFingerprint,
+  settingsValidationTargetIds,
 } from "./settingsModel.js";
 
 test("reordering and renaming do not regenerate stable outlet ids", () => {
@@ -134,4 +135,22 @@ test("settings primary action auto-validates and exposes accessible disabled rea
   assert.equal(source.includes("aria-describedby=\"settings-action-reason\""), true);
   assert.equal(source.includes("请从问题摘要跳转到对应字段"), true);
   assert.equal(source.includes("focusValidationField(issue.field)"), true);
+});
+
+test("validation focus targets exact dynamic fields before safe section fallbacks", () => {
+  assert.deepEqual(settingsValidationTargetIds("connect_timeout_ms"), ["settings-connect_timeout_ms"]);
+  assert.deepEqual(settingsValidationTargetIds("recovery_threshold"), ["settings-recovery_threshold"]);
+  assert.deepEqual(settingsValidationTargetIds("outlets.local-a.host"), [
+    "settings-outlets.local-a.host",
+    "settings-outlets",
+  ]);
+  assert.deepEqual(settingsValidationTargetIds("routing"), ["settings-outlets"]);
+  assert.deepEqual(settingsValidationTargetIds("runtime"), ["settings-runtime"]);
+
+  const source = fs.readFileSync(new URL("../SettingsPage.tsx", import.meta.url), "utf8");
+  assert.equal(source.includes("validationAttributes(`outlets.${outlet.outlet_id}.label`)"), true);
+  assert.equal(source.includes("validationAttributes(`outlets.${outlet.outlet_id}.provider_update_seconds`)"), true);
+  assert.equal(source.includes("validationAttributes(`outlets.${outlet.outlet_id}.host`)"), true);
+  assert.equal(source.includes("validationAttributes(`outlets.${outlet.outlet_id}.port`)"), true);
+  assert.equal(source.includes('field === "routing" || field === "runtime"'), false);
 });

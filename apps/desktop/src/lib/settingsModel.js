@@ -79,6 +79,15 @@ export function settingsPreviewOutcome(preview) {
   return "live_apply";
 }
 
+export function settingsValidationTargetIds(field) {
+  if (field === "routing") return ["settings-outlets"];
+  if (field === "runtime") return ["settings-runtime"];
+  const exact = `settings-${field}`;
+  return field.startsWith("outlets.")
+    ? [exact, "settings-outlets"]
+    : [exact];
+}
+
 export function takeCredentialMutations(inputById, intentById) {
   const intents = credentialIntents(intentById);
   const setIds = new Set(intents

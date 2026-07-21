@@ -16,6 +16,13 @@ confirmation.
 | Outlet definitions, order, enabled state and provider period | `managed_core_reload` | Regenerate Mihomo YAML and use the Issue #32 reload path. |
 | Credential set/delete intent | `managed_core_reload` | Stage the protected secret and use the Issue #32 reload path without exposing its value. |
 
+When a managed core is running, a `live_apply` change that affects the
+authenticated Controller stays in the journal's runtime-validation-pending
+phase until the Controller cycle succeeds. A rejected cycle restores the
+previous private and Guardian files plus the exact in-memory routing snapshot,
+cleans the journal, and requires a fresh preview ticket before retrying. A
+configuration-reload signal then schedules a compensating Guardian cycle.
+
 `system_proxy`, `tun`, and `service` are not ordinary settings fields. Unknown
 draft fields are rejected during deserialization, while the known `entry` field
 is rejected during preview and apply. Helper-owned and externally owned cores
@@ -26,3 +33,7 @@ The primary UI action performs preview validation itself. Validation errors
 focus an accessible summary; `live_apply` proceeds with the one-shot ticket;
 and a running managed core plus `managed_core_reload` pauses for one explicit
 confirmation. Editing the draft invalidates that confirmation and fingerprint.
+Validation fields are attributed to their exact editable control, including
+connection timeout, recovery threshold, and per-outlet label, host, port, and
+provider period; generic routing failures fall back to the outlet section
+instead of incorrectly marking the route-mode selector.

@@ -295,6 +295,51 @@ export async function previewSettings(request: SettingsPreviewRequest): Promise<
     if (!draft.outlets.some((outlet) => outlet.enabled)) {
       issues.push({ field: "outlets", code: "enabled_outlet_required", message: "至少需要一个启用出口。" });
     }
+    for (const outlet of draft.outlets) {
+      if (outlet.label.trim().length === 0) {
+        issues.push({
+          field: `outlets.${outlet.outlet_id}.label`,
+          code: "unsafe_outlet_label",
+          message: "出口名称不能为空。",
+        });
+      }
+      if (outlet.kind === "subscription" && outlet.provider_update_seconds < 60) {
+        issues.push({
+          field: `outlets.${outlet.outlet_id}.provider_update_seconds`,
+          code: "provider_update_too_short",
+          message: "订阅 provider 更新周期不能小于 60 秒。",
+        });
+      }
+      if (outlet.kind === "local_proxy"
+        && !["localhost", "127.0.0.1", "::1"].includes(outlet.host.trim().toLowerCase())) {
+        issues.push({
+          field: `outlets.${outlet.outlet_id}.host`,
+          code: "local_proxy_host_not_loopback",
+          message: "本地出口地址必须是 loopback IP 或 localhost。",
+        });
+      }
+      if (outlet.kind === "local_proxy" && (outlet.port < 1 || outlet.port > 65_535)) {
+        issues.push({
+          field: `outlets.${outlet.outlet_id}.port`,
+          code: "local_proxy_port_invalid",
+          message: "本地出口端口必须在 1 到 65535 之间。",
+        });
+      }
+    }
+    if (draft.connect_timeout_ms < 1 || draft.connect_timeout_ms > 120_000) {
+      issues.push({
+        field: "connect_timeout_ms",
+        code: "connect_timeout_out_of_range",
+        message: "连接超时必须在 1 毫秒到 120 秒之间。",
+      });
+    }
+    if (draft.recovery_threshold < 1 || draft.recovery_threshold > 100) {
+      issues.push({
+        field: "recovery_threshold",
+        code: "recovery_threshold_out_of_range",
+        message: "恢复阈值必须在 1 到 100 之间。",
+      });
+    }
     if (diff.changes.some((change) => change.impact === "dedicated_transaction")) {
       issues.push({
         field: "entry",

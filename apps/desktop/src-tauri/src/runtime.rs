@@ -237,6 +237,7 @@ enum SettingsTransactionPhase {
 pub struct DeferredSettingsApply {
     result: SettingsApplyResult,
     transaction_id: String,
+    previous_routing: RoutingEngine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1240,6 +1241,11 @@ impl AppState {
         &self,
         request: SettingsApplyRequest,
     ) -> Result<DeferredSettingsApply, String> {
+        let previous_routing = self
+            .routing_engine
+            .lock()
+            .map_err(|_| "路由策略状态锁已损坏".to_string())?
+            .clone();
         let (result, pending) = self.apply_settings_inner(request, true)?;
         let transaction_id = pending
             .map(|journal| journal.transaction_id)
@@ -1247,7 +1253,31 @@ impl AppState {
         Ok(DeferredSettingsApply {
             result,
             transaction_id,
+            previous_routing,
         })
+    }
+
+    pub async fn apply_settings_with_runtime_validation<F, Fut>(
+        &self,
+        request: SettingsApplyRequest,
+        validate: F,
+    ) -> Result<SettingsApplyResult, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        let mut pending = self.apply_settings_deferred(request)?;
+        match validate().await {
+            Ok(()) => self.finalize_deferred_settings(&mut pending, false),
+            Err(validation_error) => match self.rollback_deferred_settings(&pending) {
+                Ok(()) => Err(format!(
+                    "Controller 在线应用未确认；已恢复旧配置与路由状态，可重新提交：{validation_error}"
+                )),
+                Err(rollback_error) => Err(format!(
+                    "Controller 在线应用未确认且设置回滚未完成；保持 Fail Closed：{validation_error}；{rollback_error}"
+                )),
+            },
+        }
     }
 
     pub fn preflight_settings_apply(
@@ -1597,6 +1627,7 @@ impl AppState {
     pub fn finalize_deferred_settings(
         &self,
         pending: &mut DeferredSettingsApply,
+        managed_core_restarted: bool,
     ) -> Result<SettingsApplyResult, String> {
         let mut journal = read_settings_journal(&self.runtime_directory)?;
         if journal.transaction_id != pending.transaction_id
@@ -1623,7 +1654,7 @@ impl AppState {
             &SystemDurableFileOps,
         );
         pending.result.removed_history_rows = removed;
-        pending.result.managed_core_restarted = true;
+        pending.result.managed_core_restarted = managed_core_restarted;
         Ok(pending.result.clone())
     }
 
@@ -1643,8 +1674,11 @@ impl AppState {
                 .as_ref()
                 .ok_or_else(|| "Windows 受保护凭据存储不可用".to_string())?,
         )?;
-        let restored = self.private_config()?;
-        self.apply_committed_routing_state(&restored, &JournalRoutingAction::FailClosed)
+        *self
+            .routing_engine
+            .lock()
+            .map_err(|_| "路由策略状态锁已损坏".to_string())? = pending.previous_routing.clone();
+        Ok(())
     }
 
     fn prepare_secret_operations(
@@ -4915,6 +4949,93 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             Some(SettingsImpact::ManagedCoreReload)
         );
         assert!(state.stop_owned_core_if_pid(pid).expect("exact stop"));
+    }
+
+    #[tokio::test]
+    async fn failed_live_runtime_validation_restores_snapshot_and_allows_a_fresh_preview() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        state.set_settings_validation_hook_for_test(|_, _| Ok(()));
+
+        let mut config = state.private_config().expect("private");
+        config.route_mode = RouteMode::Manual;
+        config.manual_outlet = Some("local-a".into());
+        config.outlets = vec![OutletConfig {
+            id: "local-a".into(),
+            label: "Local A".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "socks5h://127.0.0.1:45112".into(),
+            },
+        }];
+        config.save(&state.private_config_path).expect("config");
+        {
+            let mut engine = state.routing_engine.lock().expect("engine");
+            engine.set_mode(RouteMode::Manual, Some("local-a".into()));
+            engine.apply(
+                &RouteDecision {
+                    from_outlet: None,
+                    to_outlet: "local-a".into(),
+                    reason: "test-only-current-state".into(),
+                },
+                123,
+            );
+        }
+        let previous_engine = state.routing_engine.lock().expect("engine").clone();
+        let previous_private = fs::read(&state.private_config_path).expect("private bytes");
+        let previous_guardian = fs::read(&state.guardian_config_path).expect("guardian bytes");
+
+        let mut draft = state.settings_view().expect("settings").draft;
+        draft.route_mode = RouteMode::Fastest;
+        draft.manual_outlet = None;
+        let preview = state
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+            .expect("preview");
+        assert!(preview.can_apply);
+        assert!(preview.diff.has_impact(SettingsImpact::LiveApply));
+        let error = state
+            .apply_settings_with_runtime_validation(
+                SettingsApplyRequest {
+                    draft: draft.clone(),
+                    credential_mutations: Vec::new(),
+                    active_outlet_replacement: None,
+                    fail_closed_on_removed_active: false,
+                    preview_fingerprint: preview.request_fingerprint,
+                },
+                || async { Err("synthetic Controller failure".to_string()) },
+            )
+            .await
+            .expect_err("Controller rejection must rollback settings");
+
+        assert!(error.contains("synthetic Controller failure"));
+        assert!(error.contains("可重新提交"));
+        assert_eq!(
+            fs::read(&state.private_config_path).expect("restored private"),
+            previous_private
+        );
+        assert_eq!(
+            fs::read(&state.guardian_config_path).expect("restored guardian"),
+            previous_guardian
+        );
+        assert_eq!(
+            *state.routing_engine.lock().expect("restored engine"),
+            previous_engine
+        );
+        assert!(!settings_journal_path(&state.runtime_directory).exists());
+
+        let retry = state
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+            .expect("fresh retry preview");
+        assert!(retry.can_apply);
+        assert!(
+            retry
+                .diff
+                .changes
+                .iter()
+                .any(|change| change.code == "route_policy_changed")
+        );
+        assert_ne!(retry.request_fingerprint, "");
     }
 
     #[tokio::test]

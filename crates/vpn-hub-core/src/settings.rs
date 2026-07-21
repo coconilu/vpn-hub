@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CredentialState, EntryConfig, GuardianConfig, MonitorConfig, OutletConfig, OutletKind,
-    PrivateRoutingConfig, RouteMode, SubscriptionCredentialStatus,
+    PrivateRoutingConfig, RouteMode, SubscriptionCredentialStatus, normalize_loopback_host,
 };
 
 const MIN_REFRESH_SECONDS: u64 = 5;
@@ -349,11 +349,23 @@ impl SettingsDraft {
         candidate.probe_targets.clone_from(&self.probe_targets);
         candidate.outlets = outlets;
         if let Err(error) = candidate.validate() {
-            issues.push(ValidationIssue::new(
-                "routing",
-                "invalid_routing_config",
-                error.to_string(),
-            ));
+            let message = error.to_string();
+            let field = if message.contains("entry.") {
+                "entry"
+            } else if message.contains("probe target") || message.contains("probe_targets") {
+                "probe_targets"
+            } else if message.contains("manual_outlet") {
+                "manual_outlet"
+            } else {
+                "outlets"
+            };
+            if !issues.iter().any(|issue| issue.field == field) {
+                issues.push(ValidationIssue::new(
+                    field,
+                    "invalid_routing_config",
+                    message,
+                ));
+            }
         }
         if let Some(manual) = candidate.manual_outlet.as_deref()
             && !candidate
@@ -387,6 +399,7 @@ impl SettingsDraft {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn basic_validation_issues(&self) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
         if self.outlets.is_empty() || !self.outlets.iter().any(SettingsOutletDraft::enabled) {
@@ -414,7 +427,8 @@ impl SettingsDraft {
             }
             let label = outlet.label();
             let lower = label.to_ascii_lowercase();
-            if label.len() > 80
+            if label.trim().is_empty()
+                || label.len() > 80
                 || label.chars().any(char::is_control)
                 || label.contains("://")
                 || ["token", "secret", "password", "controller"]
@@ -427,6 +441,57 @@ impl SettingsDraft {
                     "出口名称不能包含 URL、凭据形态或控制字符",
                 ));
             }
+            match outlet {
+                SettingsOutletDraft::Subscription {
+                    outlet_id,
+                    provider_update_seconds,
+                    ..
+                } if *provider_update_seconds < 60 => issues.push(ValidationIssue::new(
+                    format!("outlets.{outlet_id}.provider_update_seconds"),
+                    "provider_update_too_short",
+                    "订阅 provider 更新周期不能小于 60 秒",
+                )),
+                SettingsOutletDraft::LocalProxy {
+                    outlet_id,
+                    host,
+                    port,
+                    ..
+                } => {
+                    if normalize_loopback_host(host).is_none() {
+                        issues.push(ValidationIssue::new(
+                            format!("outlets.{outlet_id}.host"),
+                            "local_proxy_host_not_loopback",
+                            "本地出口地址必须是 loopback IP 或 localhost",
+                        ));
+                    }
+                    if *port == 0 {
+                        issues.push(ValidationIssue::new(
+                            format!("outlets.{outlet_id}.port"),
+                            "local_proxy_port_invalid",
+                            "本地出口端口必须在 1 到 65535 之间",
+                        ));
+                    }
+                }
+                SettingsOutletDraft::Subscription { .. } => {}
+            }
+        }
+        if self.route_mode == RouteMode::Manual && self.manual_outlet.is_none() {
+            issues.push(ValidationIssue::new(
+                "manual_outlet",
+                "manual_outlet_required",
+                "手动模式必须选择一个已启用出口",
+            ));
+        }
+        if self.probe_targets.len() < 2
+            || self.probe_targets.iter().any(|target| {
+                reqwest::Url::parse(target).map_or(true, |url| url.scheme() != "https")
+            })
+        {
+            issues.push(ValidationIssue::new(
+                "probe_targets",
+                "invalid_probe_targets",
+                "探测目标至少需要两个有效 HTTPS URL",
+            ));
         }
         if !(MIN_REFRESH_SECONDS..=MAX_REFRESH_SECONDS).contains(&self.refresh_interval_seconds) {
             issues.push(ValidationIssue::new(
@@ -435,24 +500,42 @@ impl SettingsDraft {
                 "刷新周期必须在 5 秒到 24 小时之间",
             ));
         }
-        if self.connect_timeout_ms == 0
-            || self.connect_timeout_ms > MAX_TIMEOUT_MS
-            || self.request_timeout_ms < self.connect_timeout_ms
-            || self.request_timeout_ms > MAX_TIMEOUT_MS
+        if self.connect_timeout_ms == 0 || self.connect_timeout_ms > MAX_TIMEOUT_MS {
+            issues.push(ValidationIssue::new(
+                "connect_timeout_ms",
+                "connect_timeout_out_of_range",
+                "连接超时必须在 1 毫秒到 120 秒之间",
+            ));
+        }
+        if self.request_timeout_ms == 0 || self.request_timeout_ms > MAX_TIMEOUT_MS {
+            issues.push(ValidationIssue::new(
+                "request_timeout_ms",
+                "request_timeout_out_of_range",
+                "请求超时必须在 1 毫秒到 120 秒之间",
+            ));
+        }
+        if (1..=MAX_TIMEOUT_MS).contains(&self.connect_timeout_ms)
+            && (1..=MAX_TIMEOUT_MS).contains(&self.request_timeout_ms)
+            && self.request_timeout_ms < self.connect_timeout_ms
         {
             issues.push(ValidationIssue::new(
                 "request_timeout_ms",
-                "timeout_out_of_range",
-                "请求超时必须不小于连接超时，且不超过 120 秒",
+                "request_timeout_before_connect_timeout",
+                "请求超时不能小于连接超时",
             ));
         }
-        if !(1..=MAX_THRESHOLD).contains(&self.failure_threshold)
-            || !(1..=MAX_THRESHOLD).contains(&self.recovery_threshold)
-        {
+        if !(1..=MAX_THRESHOLD).contains(&self.failure_threshold) {
             issues.push(ValidationIssue::new(
                 "failure_threshold",
-                "threshold_out_of_range",
-                "失败与恢复阈值必须在 1 到 100 之间",
+                "failure_threshold_out_of_range",
+                "失败阈值必须在 1 到 100 之间",
+            ));
+        }
+        if !(1..=MAX_THRESHOLD).contains(&self.recovery_threshold) {
+            issues.push(ValidationIssue::new(
+                "recovery_threshold",
+                "recovery_threshold_out_of_range",
+                "恢复阈值必须在 1 到 100 之间",
             ));
         }
         if !(1..=3650).contains(&self.retention_days) {
@@ -669,7 +752,7 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|issue| issue.code == "threshold_out_of_range")
+                .any(|issue| issue.code == "failure_threshold_out_of_range")
         );
 
         let mut draft = five_outlet_draft();
@@ -689,7 +772,8 @@ mod tests {
         assert!(
             issues
                 .iter()
-                .any(|issue| issue.code == "invalid_routing_config")
+                .any(|issue| issue.code == "local_proxy_host_not_loopback"
+                    && issue.field == "outlets.local-a.host")
         );
     }
 
@@ -816,5 +900,60 @@ mod tests {
                 "ordinary settings accepted dedicated field {field}"
             );
         }
+    }
+
+    #[test]
+    fn validation_issues_identify_the_exact_editable_field() {
+        let current = PrivateRoutingConfig::default();
+
+        let mut connect = five_outlet_draft();
+        connect.connect_timeout_ms = 0;
+        let issues = connect.basic_validation_issues();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.field == "connect_timeout_ms")
+        );
+        assert!(!issues.iter().any(|issue| {
+            issue.code == "connect_timeout_out_of_range" && issue.field == "request_timeout_ms"
+        }));
+
+        let mut recovery = five_outlet_draft();
+        recovery.recovery_threshold = 0;
+        let issues = recovery.basic_validation_issues();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.field == "recovery_threshold")
+        );
+        assert!(!issues.iter().any(|issue| {
+            issue.code == "recovery_threshold_out_of_range" && issue.field == "failure_threshold"
+        }));
+
+        let mut manual = five_outlet_draft();
+        manual.route_mode = RouteMode::Manual;
+        manual.manual_outlet = None;
+        let issues = manual.basic_validation_issues();
+        assert!(issues.iter().any(|issue| issue.field == "manual_outlet"));
+
+        let mut probes = five_outlet_draft();
+        probes.probe_targets.truncate(1);
+        let issues = probes.basic_validation_issues();
+        assert!(issues.iter().any(|issue| issue.field == "probe_targets"));
+
+        let mut outlet = five_outlet_draft();
+        let SettingsOutletDraft::LocalProxy { host, .. } = &mut outlet.outlets[3] else {
+            panic!("expected local outlet");
+        };
+        *host = "192.0.2.1".into();
+        let Err(issues) = outlet.private_candidate(&current) else {
+            panic!("remote outlet must fail");
+        };
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.field == "outlets.local-a.host")
+        );
+        assert!(!issues.iter().any(|issue| issue.field == "route_mode"));
     }
 }

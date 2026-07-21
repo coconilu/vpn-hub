@@ -8,6 +8,7 @@ import {
   isCurrentPreviewResponse,
   moveItem,
   settingsPreviewOutcome,
+  settingsValidationTargetIds,
 } from "./lib/settingsModel";
 import { buildEntrySwitchFoundationPreview } from "./lib/entrySwitchModel";
 import type { CredentialState, LocalProxyProtocol, SafeSettingsView, SettingsDraft, SettingsOutlet, SettingsPreview } from "./types";
@@ -165,10 +166,9 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     dedicated_transaction: "专用安全事务",
   } as const;
   const focusValidationField = (field: string) => {
-    const direct = document.getElementById(`settings-${field}`);
-    const target = direct
-      ?? (field.startsWith("outlets") ? document.getElementById("settings-outlets") : null)
-      ?? (field === "routing" || field === "runtime" ? document.getElementById("settings-route_mode") : null);
+    const target = settingsValidationTargetIds(field)
+      .map((id) => document.getElementById(id))
+      .find((element) => element !== null);
     target?.focus();
   };
   const validationAttributes = (field: string) => {
@@ -290,7 +290,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
               </div>
               <div className="outlet-body">
                 <div className="outlet-head">
-                  <label className="field outlet-name-field"><span>名称</span><input value={outlet.label} onChange={(event) => updateOutlet(index, (current) => ({ ...current, label: event.target.value }))} /></label>
+                  <label className="field outlet-name-field"><span>名称</span><input {...validationAttributes(`outlets.${outlet.outlet_id}.label`)} value={outlet.label} onChange={(event) => updateOutlet(index, (current) => ({ ...current, label: event.target.value }))} /></label>
                   <span className={`kind-badge ${outlet.kind === "subscription" ? "is-subscription" : "is-local"}`}>{outlet.kind === "subscription" ? "订阅" : "本地"}</span>
                   <label className="check-field"><input type="checkbox" checked={outlet.enabled} onChange={(event) => updateOutlet(index, (current) => ({ ...current, enabled: event.target.checked }))} />启用</label>
                   <code className="outlet-id" title="稳定出口 ID">{outlet.outlet_id}</code>
@@ -316,7 +316,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
                         }}
                       />
                     </label>
-                    <label className="field interval-field"><span>更新周期（秒）</span><input type="number" min="60" value={outlet.provider_update_seconds} onChange={(event) => updateOutlet(index, (current) => current.kind === "subscription" ? { ...current, provider_update_seconds: Number(event.target.value) } : current)} /></label>
+                    <label className="field interval-field"><span>更新周期（秒）</span><input {...validationAttributes(`outlets.${outlet.outlet_id}.provider_update_seconds`)} type="number" min="60" value={outlet.provider_update_seconds} onChange={(event) => updateOutlet(index, (current) => current.kind === "subscription" ? { ...current, provider_update_seconds: Number(event.target.value) } : current)} /></label>
                     <button className="text-danger" type="button" onClick={() => { const input = credentialInputs.current.get(outlet.outlet_id); if (input) input.value = ""; setCredentialIntentById((current) => ({ ...current, [outlet.outlet_id]: "delete" })); invalidatePreview(); }}>删除凭据</button>
                   </div>
                 ) : (
@@ -329,8 +329,8 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
                         <option value="http">HTTP</option>
                       </select>
                     </label>
-                    <label className="field host-field"><span>Loopback 地址</span><input value={outlet.host} onChange={(event) => updateOutlet(index, (current) => current.kind === "local_proxy" ? { ...current, host: event.target.value } : current)} /></label>
-                    <label className="field port-field"><span>端口</span><input type="number" min="1" max="65535" value={outlet.port} onChange={(event) => updateOutlet(index, (current) => current.kind === "local_proxy" ? { ...current, port: Number(event.target.value) } : current)} /></label>
+                    <label className="field host-field"><span>Loopback 地址</span><input {...validationAttributes(`outlets.${outlet.outlet_id}.host`)} value={outlet.host} onChange={(event) => updateOutlet(index, (current) => current.kind === "local_proxy" ? { ...current, host: event.target.value } : current)} /></label>
+                    <label className="field port-field"><span>端口</span><input {...validationAttributes(`outlets.${outlet.outlet_id}.port`)} type="number" min="1" max="65535" value={outlet.port} onChange={(event) => updateOutlet(index, (current) => current.kind === "local_proxy" ? { ...current, port: Number(event.target.value) } : current)} /></label>
                   </div>
                 )}
               </div>
@@ -340,7 +340,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
         </div>
       </section>
 
-      <section className="settings-card">
+      <section id="settings-runtime" className="settings-card" tabIndex={-1}>
         <div className="card-head">
           <div className="card-title">
             <Gauge aria-hidden="true" />

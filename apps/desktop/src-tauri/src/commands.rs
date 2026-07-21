@@ -310,15 +310,36 @@ pub async fn apply_settings(
     };
     if !preflight.requires_managed_core_restart {
         let _transaction = state.lock_routing_transaction().await;
-        let coordinator = app.state::<lifecycle::DesktopCoordinator>();
-        let result = after_successful_settings_commit(state.apply_settings(request), || {
-            coordinator.prepare_config_reload();
-        })?;
-        if managed_core_running && preflight.diff.requires_authenticated_controller_apply() {
-            record_owned_controller_cycle_locked(&state)
+        let requires_controller_confirmation =
+            managed_core_running && preflight.diff.requires_authenticated_controller_apply();
+        let apply_result = if requires_controller_confirmation {
+            state
+                .apply_settings_with_runtime_validation(request, || async {
+                    record_owned_controller_cycle_locked(&state)
+                        .await
+                        .map(|_| ())
+                })
                 .await
-                .map_err(|error| format!("设置已持久化，但 Controller 在线应用未确认：{error}"))?;
-        }
+        } else {
+            state.apply_settings(request)
+        };
+        let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+        let result = match after_successful_settings_commit(apply_result, || {
+            coordinator.prepare_config_reload();
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                if requires_controller_confirmation {
+                    lifecycle::dispatch(
+                        &app,
+                        LifecycleEvent::ConfigReload {
+                            now_ms: unix_time_ms(),
+                        },
+                    );
+                }
+                return Err(error);
+            }
+        };
         lifecycle::dispatch(
             &app,
             LifecycleEvent::ConfigReload {
@@ -415,7 +436,7 @@ pub async fn apply_settings(
 
     let finalized = {
         let _transaction = state.lock_routing_transaction().await;
-        state.finalize_deferred_settings(&mut pending)
+        state.finalize_deferred_settings(&mut pending, true)
     };
     match finalized {
         Ok(result) => Ok(result),
