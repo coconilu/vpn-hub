@@ -1,9 +1,9 @@
 export function filterSubscriptionNodes(nodes, query) {
-  const needle = query.trim().toLocaleLowerCase();
+  const needle = query.trim().toLowerCase();
   if (!needle) return nodes;
   return nodes.filter((node) => (
-    node.name.toLocaleLowerCase().includes(needle)
-      || node.proxy_type.toLocaleLowerCase().includes(needle)
+    node.name.toLowerCase().includes(needle)
+      || node.proxy_type.toLowerCase().includes(needle)
   ));
 }
 

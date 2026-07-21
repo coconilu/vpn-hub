@@ -60,7 +60,6 @@ h1, h2, p { margin: 0; }
 .icon-button svg { width: 17px; height: 17px; }
 .secondary-button:disabled, .icon-button:disabled { cursor: wait; opacity: .6; }
 .spin { animation: spin 700ms linear infinite; }
-.is-spinning { animation: spin 700ms linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .notice { position: fixed; z-index: 20; top: 76px; right: 30px; max-width: 520px; padding: 10px 14px; border: 1px solid #b9d3f5; border-radius: 8px; color: #174a85; background: #f4f9ff; font-size: 12px; box-shadow: 0 8px 26px rgb(34 68 110 / 12%); }

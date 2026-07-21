@@ -1690,57 +1690,59 @@ impl AppState {
             .map(|status| (status.subscription_id, status.state))
             .collect::<HashMap<_, _>>();
         let controller = self.controller_client()?;
-        let controller_ready = controller.is_some();
-        let mut subscriptions = Vec::new();
+        let eligible_outlets = config
+            .enabled_outlets()
+            .filter(|outlet| {
+                matches!(outlet.kind, OutletKind::Subscription { .. })
+                    && credential_states.get(&outlet.id) == Some(&CredentialState::Configured)
+            })
+            .collect::<Vec<_>>();
+        let selectors = eligible_outlets
+            .iter()
+            .map(|outlet| outlet_proxy_name(&outlet.id))
+            .collect::<Vec<_>>();
+        let mut controller_ready = controller.is_some();
+        let mut subscriptions = Vec::with_capacity(eligible_outlets.len());
 
-        for outlet in config.enabled_outlets() {
-            if !matches!(outlet.kind, OutletKind::Subscription { .. })
-                || credential_states.get(&outlet.id) != Some(&CredentialState::Configured)
-            {
-                continue;
-            }
-            let group = match controller.as_ref() {
-                Some(controller) => {
-                    match controller
-                        .selector_nodes(&outlet_proxy_name(&outlet.id))
-                        .await
-                    {
-                        Ok(snapshot) if !snapshot.nodes.is_empty() => subscription_node_group(
-                            outlet,
-                            SubscriptionNodeGroupState::Available,
-                            snapshot,
-                        ),
-                        Ok(snapshot) => subscription_node_group(
-                            outlet,
-                            SubscriptionNodeGroupState::ProviderUnavailable,
-                            snapshot,
-                        ),
-                        Err(_) => subscription_node_group(
-                            outlet,
-                            SubscriptionNodeGroupState::ProviderUnavailable,
-                            SelectorNodeSnapshot {
-                                current_node: None,
-                                nodes: Vec::new(),
-                            },
-                        ),
+        match controller.as_ref() {
+            Some(controller) if !selectors.is_empty() => {
+                if let Ok(mut snapshots) = controller.selector_nodes_for(&selectors).await {
+                    for (outlet, selector) in eligible_outlets.iter().zip(&selectors) {
+                        let snapshot = snapshots
+                            .remove(selector)
+                            .unwrap_or_else(empty_selector_node_snapshot);
+                        let state = if snapshot.nodes.is_empty() {
+                            SubscriptionNodeGroupState::ProviderUnavailable
+                        } else {
+                            SubscriptionNodeGroupState::Available
+                        };
+                        subscriptions.push(subscription_node_group(outlet, state, snapshot));
                     }
+                } else {
+                    controller_ready = false;
+                    subscriptions.extend(eligible_outlets.iter().map(|outlet| {
+                        subscription_node_group(
+                            outlet,
+                            SubscriptionNodeGroupState::CoreUnavailable,
+                            empty_selector_node_snapshot(),
+                        )
+                    }));
                 }
-                None => subscription_node_group(
+            }
+            Some(_) => {}
+            None => subscriptions.extend(eligible_outlets.iter().map(|outlet| {
+                subscription_node_group(
                     outlet,
                     SubscriptionNodeGroupState::CoreUnavailable,
-                    SelectorNodeSnapshot {
-                        current_node: None,
-                        nodes: Vec::new(),
-                    },
-                ),
-            };
-            subscriptions.push(group);
+                    empty_selector_node_snapshot(),
+                )
+            })),
         }
 
         let message = if subscriptions.is_empty() {
             "没有已启用且凭据可用的订阅出口；请先在设置中完成订阅配置".into()
         } else if !controller_ready {
-            "节点列表仅来自本应用自管 Mihomo；请先启动开发核心".into()
+            "本应用自管 Mihomo Controller 当前不可用；请检查核心状态后刷新".into()
         } else if subscriptions
             .iter()
             .any(|group| group.state == SubscriptionNodeGroupState::ProviderUnavailable)
@@ -1786,12 +1788,7 @@ impl AppState {
         let snapshot = controller
             .select_selector_node(&outlet_proxy_name(subscription_id), node_name)
             .await
-            .map_err(|error| match error {
-                ControllerError::TargetUnavailable => {
-                    "节点列表已变化，请刷新后重试；原节点选择保持不变".to_string()
-                }
-                _ => "无法切换订阅节点；原节点选择保持不变".to_string(),
-            })?;
+            .map_err(|error| subscription_node_selection_error(&error))?;
         Ok(subscription_node_group(
             outlet,
             SubscriptionNodeGroupState::Available,
@@ -2710,6 +2707,23 @@ fn subscription_node_group(
     }
 }
 
+fn empty_selector_node_snapshot() -> SelectorNodeSnapshot {
+    SelectorNodeSnapshot {
+        current_node: None,
+        nodes: Vec::new(),
+    }
+}
+
+fn subscription_node_selection_error(error: &ControllerError) -> String {
+    match error {
+        ControllerError::TargetUnavailable => {
+            "节点列表已变化，请刷新后重试；原节点选择保持不变".into()
+        }
+        ControllerError::SelectionUnconfirmed => "切换结果未能确认，请刷新后查看实际状态".into(),
+        _ => "无法切换订阅节点；原节点选择保持不变".into(),
+    }
+}
+
 fn helper_core_status(reply: RuntimeReply) -> CoreStatus {
     let managed = reply.ok && reply.state == "running" && reply.owned_pid.is_some();
     CoreStatus {
@@ -3346,6 +3360,18 @@ mod tests {
     #[derive(Default)]
     struct TestSecretStore {
         values: Mutex<BTreeMap<String, String>>,
+    }
+
+    #[test]
+    fn selection_unconfirmed_message_requires_authoritative_refresh() {
+        assert_eq!(
+            subscription_node_selection_error(&ControllerError::SelectionUnconfirmed),
+            "切换结果未能确认，请刷新后查看实际状态"
+        );
+        assert_eq!(
+            subscription_node_selection_error(&ControllerError::TargetUnavailable),
+            "节点列表已变化，请刷新后重试；原节点选择保持不变"
+        );
     }
 
     struct FailingDurableOps {

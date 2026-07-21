@@ -37,6 +37,7 @@ export function NodesPage() {
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
+    setNotice(null);
     try {
       const next = await getSubscriptionNodeCatalog();
       setCatalog(next);
@@ -92,7 +93,7 @@ export function NodesPage() {
           <p>只管理 VPN Hub 自管 Mihomo 中的订阅节点；节点信息仅停留在当前运行时界面。</p>
         </div>
         <button className="secondary-button" disabled={loading || selecting !== null} onClick={() => void load()} type="button">
-          <RefreshCw aria-hidden="true" className={loading ? "is-spinning" : ""} />
+          <RefreshCw aria-hidden="true" className={loading ? "spin" : ""} />
           刷新列表
         </button>
       </header>
@@ -107,7 +108,7 @@ export function NodesPage() {
       {notice && <div className="node-feedback is-success" role="status"><CheckCircle2 aria-hidden="true" />{notice}</div>}
 
       {loading && !catalog ? (
-        <div className="node-empty"><RefreshCw aria-hidden="true" className="is-spinning" /><p>正在读取本机订阅节点…</p></div>
+        <div className="node-empty"><RefreshCw aria-hidden="true" className="spin" /><p>正在读取本机订阅节点…</p></div>
       ) : !catalog || catalog.subscriptions.length === 0 ? (
         <div className="node-empty"><Network aria-hidden="true" /><h2>暂无可管理的订阅</h2><p>请先在设置中启用订阅并保存有效凭据。</p></div>
       ) : (

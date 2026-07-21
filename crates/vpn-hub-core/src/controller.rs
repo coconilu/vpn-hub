@@ -24,6 +24,8 @@ pub enum ControllerError {
     Response,
     #[error("selector target is unavailable")]
     TargetUnavailable,
+    #[error("selector update could not be confirmed")]
+    SelectionUnconfirmed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -180,6 +182,34 @@ impl ControllerClient {
         &self,
         selector: &str,
     ) -> Result<SelectorNodeSnapshot, ControllerError> {
+        let response = self.proxies_response().await?;
+        selector_snapshot(selector, &response)
+    }
+
+    /// Reads several selector snapshots from one Controller response.
+    ///
+    /// Missing selectors are omitted so callers can distinguish a reachable
+    /// Controller from a provider-backed selector that is not ready yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns sanitized transport, HTTP, or response errors for the shared
+    /// Controller request.
+    pub async fn selector_nodes_for(
+        &self,
+        selectors: &[String],
+    ) -> Result<BTreeMap<String, SelectorNodeSnapshot>, ControllerError> {
+        let response = self.proxies_response().await?;
+        let mut snapshots = BTreeMap::new();
+        for selector in selectors {
+            if response.proxies.contains_key(selector) {
+                snapshots.insert(selector.clone(), selector_snapshot(selector, &response)?);
+            }
+        }
+        Ok(snapshots)
+    }
+
+    async fn proxies_response(&self) -> Result<ProxiesResponse, ControllerError> {
         let url = self.endpoint(&["proxies"])?;
         let response = self
             .client
@@ -191,11 +221,10 @@ impl ControllerClient {
         if !response.status().is_success() {
             return Err(ControllerError::Http(response.status()));
         }
-        let response = response
+        response
             .json::<ProxiesResponse>()
             .await
-            .map_err(|_| ControllerError::Response)?;
-        selector_snapshot(selector, &response)
+            .map_err(|_| ControllerError::Response)
     }
 
     /// Selects a member that was present in the selector's latest Controller
@@ -213,10 +242,18 @@ impl ControllerClient {
         if !before.nodes.iter().any(|node| node.name == target) {
             return Err(ControllerError::TargetUnavailable);
         }
-        self.select(selector, target).await?;
-        let after = self.selector_nodes(selector).await?;
+        self.select(selector, target)
+            .await
+            .map_err(|error| match error {
+                ControllerError::Request => ControllerError::SelectionUnconfirmed,
+                other => other,
+            })?;
+        let after = self
+            .selector_nodes(selector)
+            .await
+            .map_err(|_| ControllerError::SelectionUnconfirmed)?;
         if after.current_node.as_deref() != Some(target) {
-            return Err(ControllerError::Response);
+            return Err(ControllerError::SelectionUnconfirmed);
         }
         Ok(after)
     }
@@ -549,6 +586,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reads_multiple_selector_snapshots_with_one_controller_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback Controller");
+        let address = listener.local_addr().expect("Controller address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("Controller connection");
+            let request = read_request(&mut stream);
+            assert!(request.starts_with("GET /proxies "));
+            assert!(request.contains("authorization: Bearer test-secret"));
+            write_json_response(
+                &mut stream,
+                &serde_json::json!({
+                    "proxies": {
+                        "vpn-hub-outlet-a": {
+                            "type": "URLTest",
+                            "now": "Synthetic Alpha",
+                            "all": ["Synthetic Alpha"]
+                        },
+                        "vpn-hub-outlet-b": {
+                            "type": "URLTest",
+                            "now": "Synthetic Beta",
+                            "all": ["Synthetic Beta"]
+                        },
+                        "Synthetic Alpha": {"type": "Vless", "alive": true},
+                        "Synthetic Beta": {"type": "Trojan", "alive": true}
+                    }
+                }),
+            );
+        });
+        let client =
+            ControllerClient::new(&format!("http://{address}"), "test-secret".into(), 2_000)
+                .expect("Controller client");
+
+        let snapshots = client
+            .selector_nodes_for(&[
+                "vpn-hub-outlet-a".into(),
+                "vpn-hub-outlet-b".into(),
+                "vpn-hub-outlet-missing".into(),
+            ])
+            .await
+            .expect("selector catalog");
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(
+            snapshots["vpn-hub-outlet-a"].current_node.as_deref(),
+            Some("Synthetic Alpha")
+        );
+        assert!(!snapshots.contains_key("vpn-hub-outlet-missing"));
+        server.join().expect("Controller server");
+    }
+
+    #[tokio::test]
     async fn validates_candidate_selects_and_reads_authoritative_node_back() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("loopback Controller");
         let address = listener.local_addr().expect("Controller address");
@@ -595,6 +682,52 @@ mod tests {
             .await
             .expect("confirmed selection");
         assert_eq!(snapshot.current_node.as_deref(), Some("Synthetic Beta"));
+        server.join().expect("Controller server");
+    }
+
+    #[tokio::test]
+    async fn reports_unconfirmed_when_selection_readback_disagrees() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback Controller");
+        let address = listener.local_addr().expect("Controller address");
+        let server = thread::spawn(move || {
+            for step in 0..3 {
+                let (mut stream, _) = listener.accept().expect("Controller connection");
+                let request = read_request(&mut stream);
+                if step == 1 {
+                    assert!(request.starts_with("PUT /proxies/vpn-hub-outlet-demo "));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .expect("selection response");
+                    continue;
+                }
+                assert!(request.starts_with("GET /proxies "));
+                write_json_response(
+                    &mut stream,
+                    &serde_json::json!({
+                        "proxies": {
+                            "vpn-hub-outlet-demo": {
+                                "type": "URLTest",
+                                "now": "Synthetic Alpha",
+                                "all": ["Synthetic Alpha", "Synthetic Beta"]
+                            },
+                            "Synthetic Alpha": {"type": "Vless", "alive": true},
+                            "Synthetic Beta": {"type": "Trojan", "alive": true}
+                        }
+                    }),
+                );
+            }
+        });
+        let client =
+            ControllerClient::new(&format!("http://{address}"), "test-secret".into(), 2_000)
+                .expect("Controller client");
+
+        let error = client
+            .select_selector_node("vpn-hub-outlet-demo", "Synthetic Beta")
+            .await
+            .expect_err("mismatched readback must not report success");
+        assert!(matches!(error, ControllerError::SelectionUnconfirmed));
         server.join().expect("Controller server");
     }
 }
