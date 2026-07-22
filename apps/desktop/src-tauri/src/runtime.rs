@@ -570,6 +570,7 @@ fn validate_credential_mutations(
 }
 
 fn settings_routing_action(
+    current: &PrivateRoutingConfig,
     candidate: &PrivateRoutingConfig,
     current_active: Option<&str>,
     replacement: Option<&str>,
@@ -597,9 +598,10 @@ fn settings_routing_action(
         ));
     }
     let active_removed = current_active.is_some_and(|active| {
-        !candidate
-            .enabled_outlets()
-            .any(|outlet| outlet.id == active)
+        current.enabled_outlets().any(|outlet| outlet.id == active)
+            && !candidate
+                .enabled_outlets()
+                .any(|outlet| outlet.id == active)
     });
     if !active_removed {
         return JournalRoutingAction::Keep;
@@ -1745,6 +1747,7 @@ impl AppState {
                 .current_outlet()
                 .map(str::to_owned);
             let _ = settings_routing_action(
+                &current,
                 candidate,
                 current_active.as_deref(),
                 options.active_outlet_replacement,
@@ -2314,6 +2317,7 @@ impl AppState {
             .map(str::to_owned);
         let mut routing_issues = Vec::new();
         let routing_action = settings_routing_action(
+            &current,
             &candidate,
             current_active.as_deref(),
             active_outlet_replacement.as_deref(),
@@ -8032,7 +8036,7 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     }
 
     #[test]
-    fn deleting_current_outlet_requires_replacement_or_explicit_fail_closed() {
+    fn deleting_current_outlet_requires_replacement_but_stale_route_does_not() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
         let state = AppState::new_for_test(workspace_root, directory.path());
@@ -8097,6 +8101,40 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             .expect("fail closed preview");
         assert!(
             fail_closed
+                .issues
+                .iter()
+                .all(|issue| issue.code != "active_outlet_replacement_required")
+        );
+
+        let committed = draft
+            .private_candidate(&config)
+            .expect("committed settings without the old outlet");
+        committed
+            .save(&state.private_config_path)
+            .expect("persist committed settings");
+        let target = ProbePortLease::reserve_excluding(&[port_a, port_b, committed.entry.port])
+            .expect("entry target");
+        let target_entry = EntryConfig {
+            host: "127.0.0.1".into(),
+            port: target.port(),
+        };
+        drop(target);
+
+        let entry_preview = state
+            .prepare_entry_switch_preview(
+                target_entry,
+                false,
+                EntrySwitchPreviewChecks {
+                    confirmed: EntrySwitchCheck::Passed,
+                    managed_core_ready: EntrySwitchCheck::Passed,
+                    target_available: EntrySwitchCheck::Passed,
+                    proxy_scope_supported: EntrySwitchCheck::Passed,
+                },
+            )
+            .expect("entry preview with stale runtime outlet");
+        assert!(entry_preview.can_execute);
+        assert!(
+            entry_preview
                 .issues
                 .iter()
                 .all(|issue| issue.code != "active_outlet_replacement_required")
