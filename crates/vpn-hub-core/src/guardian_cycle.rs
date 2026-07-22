@@ -24,6 +24,13 @@ pub enum RoutingStateError {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardianCommitStatus {
+    Busy,
+    Stale,
+    Committed,
+}
+
 pub trait RoutingSession {
     /// Returns the current monotonic configuration generation.
     ///
@@ -65,15 +72,23 @@ pub trait RoutingSession {
     /// # Errors
     ///
     /// Returns an error when the durable commit or routing update fails.
-    fn commit_cycle_if_current<F>(
+    fn try_commit_cycle_if_current<F>(
         &self,
         expected_generation: u64,
         decision: Option<&RouteDecision>,
         now_ms: u64,
-        durable_commit: F,
-    ) -> Result<bool, GuardianCycleError>
+        durable_commit: &mut F,
+    ) -> Result<GuardianCommitStatus, GuardianCycleError>
     where
-        F: FnOnce() -> Result<(), GuardianCycleError>;
+        F: FnMut() -> Result<(), GuardianCycleError>;
+
+    /// Persists an application-level terminal gate when the Controller cannot
+    /// authoritatively confirm both fail-closed selectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the terminal state cannot be durably recorded.
+    fn persist_fail_closed_unconfirmed(&self) -> Result<(), RoutingStateError>;
 }
 
 impl RoutingSession for std::sync::Mutex<RoutingEngine> {
@@ -105,24 +120,31 @@ impl RoutingSession for std::sync::Mutex<RoutingEngine> {
         Ok(())
     }
 
-    fn commit_cycle_if_current<F>(
+    fn try_commit_cycle_if_current<F>(
         &self,
         expected_generation: u64,
         decision: Option<&RouteDecision>,
         now_ms: u64,
-        durable_commit: F,
-    ) -> Result<bool, GuardianCycleError>
+        durable_commit: &mut F,
+    ) -> Result<GuardianCommitStatus, GuardianCycleError>
     where
-        F: FnOnce() -> Result<(), GuardianCycleError>,
+        F: FnMut() -> Result<(), GuardianCycleError>,
     {
         if expected_generation != 0 {
-            return Ok(false);
+            return Ok(GuardianCommitStatus::Stale);
         }
         durable_commit()?;
         if let Some(decision) = decision {
             self.apply_route(decision, now_ms)?;
         }
-        Ok(true)
+        Ok(GuardianCommitStatus::Committed)
+    }
+
+    fn persist_fail_closed_unconfirmed(&self) -> Result<(), RoutingStateError> {
+        self.lock()
+            .map_err(|_| RoutingStateError::Unavailable)?
+            .restore_current(None, None);
+        Ok(())
     }
 }
 
@@ -138,6 +160,10 @@ pub enum GuardianCycleError {
     Cancelled,
     #[error("Guardian cycle exceeded its end-to-end deadline")]
     Deadline,
+    #[error(
+        "Guardian could not authoritatively confirm both fail-closed selectors; terminal gate persisted"
+    )]
+    FailClosedUnconfirmed,
 }
 
 pub const DEFAULT_GUARDIAN_CYCLE_BUDGET: Duration = Duration::from_secs(8);
@@ -209,6 +235,8 @@ pub async fn run_controller_guardian_cycle_controlled(
 ) -> Result<GuardianCycleOutcome, GuardianCycleError> {
     let cycle_started = Instant::now();
     let deadline = TokioInstant::now() + budget;
+    let cleanup_reserve = FAIL_CLOSED_CLEANUP_BUDGET.min(budget / 3);
+    let work_deadline = deadline - cleanup_reserve;
     let expected_generation = routing.config_generation()?;
     let observed = probe_configured_outlets(
         controller,
@@ -216,18 +244,28 @@ pub async fn run_controller_guardian_cycle_controlled(
         resolved,
         monitor.request_timeout_ms,
         Arc::clone(&cancel),
-        deadline,
+        work_deadline,
         concurrency,
     )
     .await;
 
     if cancel.load(Ordering::Acquire) || routing.config_generation()? != expected_generation {
-        force_controller_fail_closed_bounded(controller).await;
-        return Err(GuardianCycleError::Cancelled);
+        return abort_cycle_fail_closed(
+            controller,
+            routing,
+            deadline,
+            GuardianCycleError::Cancelled,
+        )
+        .await;
     }
-    if TokioInstant::now() >= deadline {
-        force_controller_fail_closed_bounded(controller).await;
-        return Err(GuardianCycleError::Deadline);
+    if TokioInstant::now() >= work_deadline {
+        return abort_cycle_fail_closed(
+            controller,
+            routing,
+            deadline,
+            GuardianCycleError::Deadline,
+        )
+        .await;
     }
 
     let health = store.project_probe_health(
@@ -242,24 +280,33 @@ pub async fn run_controller_guardian_cycle_controlled(
     };
     let decision = routing.evaluate_route(now_ms, &health, &policy)?;
     if cycle_invalid(routing, expected_generation, &cancel)? {
-        force_controller_fail_closed_bounded(controller).await;
-        return Err(GuardianCycleError::Cancelled);
+        return abort_cycle_fail_closed(
+            controller,
+            routing,
+            deadline,
+            GuardianCycleError::Cancelled,
+        )
+        .await;
     }
     if let Some(decision) = &decision
         && let Err(error) = select_before_deadline(
             controller,
-            deadline,
+            work_deadline,
             crate::MASTER_SELECTOR,
             &outlet_proxy_name(&decision.to_outlet),
         )
         .await
     {
-        force_controller_fail_closed_bounded(controller).await;
-        return Err(error);
+        return abort_cycle_fail_closed(controller, routing, deadline, error).await;
     }
     if cycle_invalid(routing, expected_generation, &cancel)? {
-        force_controller_fail_closed_bounded(controller).await;
-        return Err(GuardianCycleError::Cancelled);
+        return abort_cycle_fail_closed(
+            controller,
+            routing,
+            deadline,
+            GuardianCycleError::Cancelled,
+        )
+        .await;
     }
     let selected_outlet = decision
         .as_ref()
@@ -268,49 +315,100 @@ pub async fn run_controller_guardian_cycle_controlled(
     let udp_capabilities = store.udp_capabilities()?;
     let udp_target = udp_selector_target(private, selected_outlet.as_deref(), &udp_capabilities);
     if let Err(error) =
-        select_before_deadline(controller, deadline, UDP_SELECTOR, &udp_target).await
+        select_before_deadline(controller, work_deadline, UDP_SELECTOR, &udp_target).await
     {
-        force_controller_fail_closed_bounded(controller).await;
-        return Err(error);
+        return abort_cycle_fail_closed(controller, routing, deadline, error).await;
     }
     if cycle_invalid(routing, expected_generation, &cancel)? {
-        force_controller_fail_closed_bounded(controller).await;
-        return Err(GuardianCycleError::Cancelled);
+        return abort_cycle_fail_closed(
+            controller,
+            routing,
+            deadline,
+            GuardianCycleError::Cancelled,
+        )
+        .await;
     }
 
     let duration_ms = u64::try_from(cycle_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let committed =
-        routing.commit_cycle_if_current(expected_generation, decision.as_ref(), now_ms, || {
-            for outlet in private.enabled_outlets() {
-                store.ensure_udp_capability(
-                    &outlet.id,
-                    &outlet.label,
-                    &unknown_udp_evidence(outlet, "not_yet_validated"),
-                )?;
+    let initial_udp = private
+        .enabled_outlets()
+        .map(|outlet| {
+            (
+                outlet.id.clone(),
+                outlet.label.clone(),
+                unknown_udp_evidence(outlet, "not_yet_validated"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let route_event = decision.as_ref().map(|decision| RouteSwitchEvent {
+        occurred_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        from_outlet: decision.from_outlet.clone(),
+        to_outlet: decision.to_outlet.clone(),
+        mode: private.route_mode.as_str().into(),
+        reason: decision.reason.clone(),
+        duration_ms,
+    });
+    let durable_deadline = work_deadline.into_std();
+    let mut durable_commit = || {
+        store
+            .commit_guardian_cycle_batch(
+                &initial_udp,
+                &observed,
+                monitor.failure_threshold,
+                monitor.recovery_threshold,
+                route_event.as_ref(),
+                durable_deadline,
+            )
+            .map_err(|error| match error {
+                StoreError::Deadline => GuardianCycleError::Deadline,
+                other => GuardianCycleError::Store(other),
+            })
+    };
+    loop {
+        if cycle_invalid(routing, expected_generation, &cancel)? {
+            return abort_cycle_fail_closed(
+                controller,
+                routing,
+                deadline,
+                GuardianCycleError::Cancelled,
+            )
+            .await;
+        }
+        if TokioInstant::now() >= work_deadline {
+            return abort_cycle_fail_closed(
+                controller,
+                routing,
+                deadline,
+                GuardianCycleError::Deadline,
+            )
+            .await;
+        }
+        match routing.try_commit_cycle_if_current(
+            expected_generation,
+            decision.as_ref(),
+            now_ms,
+            &mut durable_commit,
+        ) {
+            Ok(GuardianCommitStatus::Committed) => break,
+            Ok(GuardianCommitStatus::Stale) => {
+                return abort_cycle_fail_closed(
+                    controller,
+                    routing,
+                    deadline,
+                    GuardianCycleError::Cancelled,
+                )
+                .await;
             }
-            for (outlet, result) in &observed {
-                store.record_probe(
-                    outlet,
-                    result,
-                    monitor.failure_threshold,
-                    monitor.recovery_threshold,
-                )?;
+            Ok(GuardianCommitStatus::Busy) => {
+                tokio::time::sleep_until(
+                    (TokioInstant::now() + Duration::from_millis(5)).min(work_deadline),
+                )
+                .await;
             }
-            if let Some(decision) = &decision {
-                store.record_route_switch(&RouteSwitchEvent {
-                    occurred_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                    from_outlet: decision.from_outlet.clone(),
-                    to_outlet: decision.to_outlet.clone(),
-                    mode: private.route_mode.as_str().into(),
-                    reason: decision.reason.clone(),
-                    duration_ms,
-                })?;
+            Err(error) => {
+                return abort_cycle_fail_closed(controller, routing, deadline, error).await;
             }
-            Ok(())
-        })?;
-    if !committed {
-        force_controller_fail_closed_bounded(controller).await;
-        return Err(GuardianCycleError::Cancelled);
+        }
     }
 
     Ok(GuardianCycleOutcome {
@@ -344,18 +442,53 @@ async fn select_before_deadline(
 
 const FAIL_CLOSED_CLEANUP_BUDGET: Duration = Duration::from_millis(500);
 
-async fn force_controller_fail_closed_bounded(controller: &ControllerClient) {
-    let deadline = TokioInstant::now() + FAIL_CLOSED_CLEANUP_BUDGET;
-    for selector in [crate::MASTER_SELECTOR, UDP_SELECTOR] {
-        if TokioInstant::now() >= deadline {
-            break;
-        }
-        let _ = tokio::time::timeout_at(
-            deadline,
-            controller.select(selector, crate::FAIL_CLOSED_PROXY),
-        )
-        .await;
+async fn abort_cycle_fail_closed<T>(
+    controller: &ControllerClient,
+    routing: &impl RoutingSession,
+    deadline: TokioInstant,
+    original: GuardianCycleError,
+) -> Result<T, GuardianCycleError> {
+    if force_controller_fail_closed_confirmed(controller, deadline).await {
+        return Err(original);
     }
+    routing.persist_fail_closed_unconfirmed()?;
+    Err(GuardianCycleError::FailClosedUnconfirmed)
+}
+
+async fn force_controller_fail_closed_confirmed(
+    controller: &ControllerClient,
+    deadline: TokioInstant,
+) -> bool {
+    let now = TokioInstant::now();
+    if now >= deadline {
+        return false;
+    }
+    let put_deadline = now + deadline.duration_since(now) / 2;
+    let (master_put, udp_put) = tokio::join!(
+        tokio::time::timeout_at(
+            put_deadline,
+            controller.select(crate::MASTER_SELECTOR, crate::FAIL_CLOSED_PROXY),
+        ),
+        tokio::time::timeout_at(
+            put_deadline,
+            controller.select(UDP_SELECTOR, crate::FAIL_CLOSED_PROXY),
+        ),
+    );
+    let _ = (master_put, udp_put);
+    if TokioInstant::now() >= deadline {
+        return false;
+    }
+    let (master, udp) = tokio::join!(
+        tokio::time::timeout_at(
+            deadline,
+            controller.is_selected(crate::MASTER_SELECTOR, crate::FAIL_CLOSED_PROXY),
+        ),
+        tokio::time::timeout_at(
+            deadline,
+            controller.is_selected(UDP_SELECTOR, crate::FAIL_CLOSED_PROXY),
+        ),
+    );
+    matches!(master, Ok(Ok(true))) && matches!(udp, Ok(Ok(true)))
 }
 
 pub(crate) fn udp_selector_target(
@@ -623,6 +756,7 @@ mod tests {
     ) -> (
         ControllerClient,
         Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<(String, String)>>,
         tokio::task::JoinHandle<()>,
     ) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -631,6 +765,11 @@ mod tests {
         let address = listener.local_addr().expect("controller address");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&requests);
+        let selected = Arc::new(Mutex::new((
+            "vpn-hub-outlet-old".to_string(),
+            "vpn-hub-outlet-old".to_string(),
+        )));
+        let selected_view = Arc::clone(&selected);
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((mut stream, _)) = listener.accept().await else {
@@ -638,6 +777,7 @@ mod tests {
                 };
                 let captured = Arc::clone(&captured);
                 let slow_next_put = Arc::clone(&slow_next_put);
+                let selected = Arc::clone(&selected);
                 tokio::spawn(async move {
                     let mut request = vec![0_u8; 8_192];
                     let Ok(read) = stream.read(&mut request).await else {
@@ -648,17 +788,38 @@ mod tests {
                     captured.lock().expect("requests").push(request.clone());
                     let is_put = request.starts_with("PUT ");
                     if is_put && slow_next_put.swap(false, Ordering::AcqRel) {
-                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        tokio::time::sleep(Duration::from_millis(400)).await;
                     }
-                    let (status, body) = if partial_probe
+                    let body_text = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                    let target = body_text
+                        .split("\"name\":\"")
+                        .nth(1)
+                        .and_then(|tail| tail.split('"').next());
+                    if is_put && let Some(target) = target {
+                        let mut selected = selected.lock().expect("selected");
+                        if request.contains(UDP_SELECTOR) {
+                            selected.1 = target.into();
+                        } else if request.contains(crate::MASTER_SELECTOR) {
+                            selected.0 = target.into();
+                        }
+                    }
+                    let (status, body): (&str, String) = if partial_probe
                         && request.starts_with("GET ")
                         && request.contains("probe-b.invalid")
                     {
-                        ("503 Service Unavailable", "")
-                    } else if request.starts_with("GET ") {
-                        ("200 OK", r#"{"delay":42}"#)
+                        ("503 Service Unavailable", String::new())
+                    } else if request.starts_with("GET ") && request.contains("/delay?") {
+                        ("200 OK", r#"{"delay":42}"#.into())
+                    } else if request.starts_with("GET ") && request.contains(UDP_SELECTOR) {
+                        let current = selected.lock().expect("selected").1.clone();
+                        ("200 OK", format!(r#"{{"now":"{current}"}}"#))
+                    } else if request.starts_with("GET ")
+                        && request.contains(crate::MASTER_SELECTOR)
+                    {
+                        let current = selected.lock().expect("selected").0.clone();
+                        ("200 OK", format!(r#"{{"now":"{current}"}}"#))
                     } else {
-                        ("204 No Content", "")
+                        ("204 No Content", String::new())
                     };
                     let response = format!(
                         "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -674,12 +835,14 @@ mod tests {
             3_000,
         )
         .expect("controller client");
-        (controller, requests, handle)
+        (controller, requests, selected_view, handle)
     }
 
     struct GenerationRoutingSession {
         generation: AtomicU64,
         invalidate_on_commit: AtomicBool,
+        terminal_unconfirmed: AtomicBool,
+        busy_until: Mutex<Option<TokioInstant>>,
         engine: Mutex<RoutingEngine>,
     }
 
@@ -690,8 +853,14 @@ mod tests {
             Self {
                 generation: AtomicU64::new(7),
                 invalidate_on_commit: AtomicBool::new(invalidate_on_commit),
+                terminal_unconfirmed: AtomicBool::new(false),
+                busy_until: Mutex::new(None),
                 engine: Mutex::new(engine),
             }
+        }
+
+        fn hold_commit_gate_for(&self, duration: Duration) {
+            *self.busy_until.lock().expect("busy gate") = Some(TokioInstant::now() + duration);
         }
     }
 
@@ -734,27 +903,44 @@ mod tests {
             Ok(())
         }
 
-        fn commit_cycle_if_current<F>(
+        fn try_commit_cycle_if_current<F>(
             &self,
             expected_generation: u64,
             decision: Option<&RouteDecision>,
             now_ms: u64,
-            durable_commit: F,
-        ) -> Result<bool, GuardianCycleError>
+            durable_commit: &mut F,
+        ) -> Result<GuardianCommitStatus, GuardianCycleError>
         where
-            F: FnOnce() -> Result<(), GuardianCycleError>,
+            F: FnMut() -> Result<(), GuardianCycleError>,
         {
+            if self
+                .busy_until
+                .lock()
+                .map_err(|_| RoutingStateError::Unavailable)?
+                .is_some_and(|deadline| TokioInstant::now() < deadline)
+            {
+                return Ok(GuardianCommitStatus::Busy);
+            }
             if self.invalidate_on_commit.swap(false, Ordering::AcqRel) {
                 self.generation.fetch_add(1, Ordering::AcqRel);
             }
             if self.generation.load(Ordering::Acquire) != expected_generation {
-                return Ok(false);
+                return Ok(GuardianCommitStatus::Stale);
             }
             durable_commit()?;
             if let Some(decision) = decision {
                 self.apply_route(decision, now_ms)?;
             }
-            Ok(true)
+            Ok(GuardianCommitStatus::Committed)
+        }
+
+        fn persist_fail_closed_unconfirmed(&self) -> Result<(), RoutingStateError> {
+            self.terminal_unconfirmed.store(true, Ordering::Release);
+            self.engine
+                .lock()
+                .map_err(|_| RoutingStateError::Unavailable)?
+                .restore_current(None, None);
+            Ok(())
         }
     }
 
@@ -866,7 +1052,7 @@ mod tests {
 
     #[tokio::test]
     async fn generation_change_at_final_commit_discards_cycle_and_restores_reject() {
-        let (controller, requests, server) =
+        let (controller, requests, _selected, server) =
             tracking_controller(false, Arc::new(AtomicBool::new(false))).await;
         let mut private = concurrent_fixture();
         private.outlets.truncate(1);
@@ -909,7 +1095,7 @@ mod tests {
 
     #[tokio::test]
     async fn selector_timeout_shares_cycle_deadline_after_partial_probe_and_is_bounded() {
-        let (controller, requests, server) =
+        let (controller, requests, _selected, server) =
             tracking_controller(true, Arc::new(AtomicBool::new(true))).await;
         let mut private = concurrent_fixture();
         private.outlets.truncate(1);
@@ -957,5 +1143,100 @@ mod tests {
                 .expect("selector request");
             assert!(last.contains(r#""name":"REJECT""#), "{last}");
         }
+    }
+
+    #[tokio::test]
+    async fn one_stalled_fail_closed_selector_persists_terminal_gate_even_if_it_applies_late() {
+        let (controller, requests, selected, server) =
+            tracking_controller(false, Arc::new(AtomicBool::new(true))).await;
+        let mut private = concurrent_fixture();
+        private.outlets.clear();
+        private.probe_targets.clear();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = GuardianStore::open(directory.path().join("guardian.db")).expect("store");
+        let routing = GenerationRoutingSession::new(false, Some("local-old".into()));
+        let started = TokioInstant::now();
+
+        let result = run_controller_guardian_cycle_controlled(
+            &controller,
+            &private,
+            &crate::ResolvedSubscriptionUrls::new(),
+            &monitor_fixture(),
+            &mut store,
+            &routing,
+            1_000,
+            Arc::new(AtomicBool::new(true)),
+            Duration::from_millis(300),
+            2,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(matches!(
+            result,
+            Err(GuardianCycleError::FailClosedUnconfirmed)
+        ));
+        assert!(elapsed < Duration::from_millis(450), "elapsed={elapsed:?}");
+        assert!(routing.terminal_unconfirmed.load(Ordering::Acquire));
+        assert_eq!(routing.current_outlet().expect("route"), None);
+        {
+            let captured = requests.lock().expect("requests");
+            for selector in [crate::MASTER_SELECTOR, UDP_SELECTOR] {
+                assert!(captured.iter().any(|request| {
+                    request.starts_with("PUT ")
+                        && request.contains(selector)
+                        && request.contains("\"name\":\"REJECT\"")
+                }));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        let selected = selected.lock().expect("selected");
+        assert!(selected.0 == crate::FAIL_CLOSED_PROXY || selected.1 == crate::FAIL_CLOSED_PROXY);
+        drop(selected);
+        assert!(
+            routing.terminal_unconfirmed.load(Ordering::Acquire),
+            "a late Controller application cannot clear the durable terminal intent"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn busy_generation_gate_consumes_cycle_deadline_and_discards_the_atomic_batch() {
+        let (controller, _requests, _selected, server) =
+            tracking_controller(false, Arc::new(AtomicBool::new(false))).await;
+        let mut private = concurrent_fixture();
+        private.outlets.truncate(1);
+        private.probe_targets.truncate(1);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = GuardianStore::open(directory.path().join("guardian.db")).expect("store");
+        let routing = GenerationRoutingSession::new(false, None);
+        routing.hold_commit_gate_for(Duration::from_millis(500));
+        let started = TokioInstant::now();
+
+        let result = run_controller_guardian_cycle_controlled(
+            &controller,
+            &private,
+            &crate::ResolvedSubscriptionUrls::new(),
+            &monitor_fixture(),
+            &mut store,
+            &routing,
+            1_000,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(240),
+            2,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        server.abort();
+
+        assert!(matches!(result, Err(GuardianCycleError::Deadline)));
+        assert!(elapsed < Duration::from_millis(350), "elapsed={elapsed:?}");
+        assert!(store.recent_samples(10).expect("samples").is_empty());
+        assert!(store.recent_events(10).expect("events").is_empty());
+        assert!(store.recent_route_switches(10).expect("routes").is_empty());
+        assert!(store.udp_capabilities().expect("udp").is_empty());
+        assert_eq!(routing.current_outlet().expect("route"), None);
+        assert!(!routing.terminal_unconfirmed.load(Ordering::Acquire));
     }
 }

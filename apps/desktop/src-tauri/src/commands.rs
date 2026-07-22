@@ -31,6 +31,7 @@ use crate::{
 };
 
 const FOREGROUND_FALLBACK_BUDGET: Duration = Duration::from_secs(10);
+const FOREGROUND_LIVE_POLICY_RECOVERY_RESERVE: Duration = Duration::from_secs(2);
 
 async fn await_foreground_step<T>(
     deadline: tokio::time::Instant,
@@ -40,6 +41,113 @@ async fn await_foreground_step<T>(
     tokio::time::timeout_at(deadline, future)
         .await
         .map_err(|_| format!("{label} 超过前台回退总预算 10 秒"))
+}
+
+async fn wait_for_foreground_cancel(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn await_foreground_active<T>(
+    deadline: tokio::time::Instant,
+    label: &str,
+    operation: &crate::runtime::ForegroundOperation<'_>,
+    future: impl Future<Output = T>,
+) -> Result<T, String> {
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        () = wait_for_foreground_cancel(operation.cancel_flag()) => {
+            Err(format!("{label} 已取消；正在执行事务补偿"))
+        }
+        result = &mut future => {
+            operation.ensure_active()?;
+            Ok(result)
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            Err(format!("{label} 超过前台策略事务总预算"))
+        }
+    }
+}
+
+async fn apply_live_policy_settings_transaction(
+    state: &AppState,
+    request: SettingsApplyRequest,
+    operation: &crate::runtime::ForegroundOperation<'_>,
+    deadline: tokio::time::Instant,
+) -> Result<SettingsApplyResult, String> {
+    let active_deadline = deadline
+        .checked_sub(FOREGROUND_LIVE_POLICY_RECOVERY_RESERVE)
+        .unwrap_or(deadline);
+    let _transaction = await_foreground_active(
+        active_deadline,
+        "等待路由事务锁",
+        operation,
+        state.lock_routing_transaction(),
+    )
+    .await?;
+    let selector_snapshot = await_foreground_active(
+        active_deadline,
+        "读取 Controller selector 快照",
+        operation,
+        state.capture_controller_selector_snapshot(),
+    )
+    .await??;
+    let mut pending = state.apply_settings_deferred(request)?;
+    let validation = await_foreground_active(
+        active_deadline,
+        "Controller 在线策略应用与权威回读",
+        operation,
+        state.apply_runtime_policy_verified(),
+    )
+    .await
+    .and_then(std::convert::identity);
+    if let Err(error) = validation {
+        operation.set_stage(ForegroundOperationStage::Rollback);
+        return Err(state
+            .compensate_failed_live_settings_before(
+                &pending,
+                &selector_snapshot,
+                &format!("Controller 在线应用未确认：{error}"),
+                deadline,
+            )
+            .await);
+    }
+    if tokio::time::Instant::now() >= active_deadline {
+        operation.set_stage(ForegroundOperationStage::Rollback);
+        return Err(state
+            .compensate_failed_live_settings_before(
+                &pending,
+                &selector_snapshot,
+                "Controller 在线应用完成时已耗尽可提交预算",
+                deadline,
+            )
+            .await);
+    }
+    if let Err(error) = operation.enter_commit_barrier() {
+        operation.set_stage(ForegroundOperationStage::Rollback);
+        return Err(state
+            .compensate_failed_live_settings_before(&pending, &selector_snapshot, &error, deadline)
+            .await);
+    }
+    match state.finalize_deferred_settings(&mut pending, false) {
+        Ok(result) => Ok(result),
+        Err(error) if state.deferred_settings_commit_decided(&pending) => Err(format!(
+            "settings_commit_recovery_pending：提交决定已持久化；后续收尾失败，只会幂等前滚且不会伪装回滚：{error}"
+        )),
+        Err(error) => {
+            operation.set_stage(ForegroundOperationStage::Rollback);
+            Err(state
+                .compensate_failed_live_settings_before(
+                    &pending,
+                    &selector_snapshot,
+                    &format!("设置最终提交失败：{error}"),
+                    deadline,
+                )
+                .await)
+        }
+    }
 }
 use crate::{
     lifecycle::{self, LifecycleEvent},
@@ -939,17 +1047,20 @@ async fn apply_settings_inner(
     };
     if !preflight.requires_managed_core_restart {
         operation.set_stage(ForegroundOperationStage::Applying);
-        operation.enter_commit_barrier()?;
-        let _transaction = state.lock_routing_transaction().await;
+        let live_deadline = tokio::time::Instant::now() + FOREGROUND_FALLBACK_BUDGET;
         let requires_controller_confirmation =
             managed_core_running && preflight.diff.requires_authenticated_controller_apply();
         let apply_result = if requires_controller_confirmation {
-            state
-                .apply_settings_with_runtime_validation(request, || {
-                    state.apply_runtime_policy_verified()
-                })
-                .await
+            apply_live_policy_settings_transaction(state, request, &operation, live_deadline).await
         } else {
+            let _transaction = await_foreground_active(
+                live_deadline,
+                "等待普通设置事务锁",
+                &operation,
+                state.lock_routing_transaction(),
+            )
+            .await?;
+            operation.enter_commit_barrier()?;
             state.apply_settings(request)
         };
         let result = match after_successful_settings_commit(apply_result, || {
@@ -1958,6 +2069,217 @@ mod tests {
         .expect_err("second step must consume only the remaining time");
         assert!(error.contains("总预算 10 秒"));
         assert!(started.elapsed() < Duration::from_millis(180));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn live_policy_command_path_cancels_slow_controller_and_restores_without_partial_commit()
+    {
+        use std::sync::Mutex;
+
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        use vpn_hub_core::{ControllerClient, PrivateRoutingConfig, outlet_proxy_name};
+
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let initial = AppState::new_for_test(workspace_root.clone(), directory.path());
+        let mut private = PrivateRoutingConfig::default();
+        private.route_mode = RouteMode::Priority;
+        private.manual_outlet = None;
+        private.outlets = vec![
+            OutletConfig {
+                id: "local-a".into(),
+                label: "Local A".into(),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: "socks5h://127.0.0.1:45112".into(),
+                },
+            },
+            OutletConfig {
+                id: "local-b".into(),
+                label: "Local B".into(),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: "socks5h://127.0.0.1:45113".into(),
+                },
+            },
+        ];
+        private
+            .save(initial.private_config_path_for_test())
+            .expect("initial config");
+        drop(initial);
+        let state = AppState::new_for_test(workspace_root, directory.path());
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("controller listener");
+        let address = listener.local_addr().expect("controller address");
+        let old_master = outlet_proxy_name("local-a");
+        let candidate_master = outlet_proxy_name("local-b");
+        let selected = Arc::new(Mutex::new((
+            old_master.clone(),
+            vpn_hub_core::FAIL_CLOSED_PROXY.to_string(),
+        )));
+        let candidate_seen = Arc::new(AtomicBool::new(false));
+        let candidate_response_finished = Arc::new(AtomicBool::new(false));
+        let server_selected = Arc::clone(&selected);
+        let server_candidate_seen = Arc::clone(&candidate_seen);
+        let server_candidate_finished = Arc::clone(&candidate_response_finished);
+        let server_candidate = candidate_master.clone();
+        let server_old_master = old_master.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let selected = Arc::clone(&server_selected);
+                let candidate_seen = Arc::clone(&server_candidate_seen);
+                let candidate_finished = Arc::clone(&server_candidate_finished);
+                let candidate = server_candidate.clone();
+                let old_master = server_old_master.clone();
+                tokio::spawn(async move {
+                    let mut bytes = vec![0_u8; 8_192];
+                    let Ok(read) = stream.read(&mut bytes).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&bytes[..read]).into_owned();
+                    let path = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or_default();
+                    let body_text = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                    let target = body_text
+                        .split("\"name\":\"")
+                        .nth(1)
+                        .and_then(|tail| tail.split('"').next());
+                    let mut slow = false;
+                    if request.starts_with("PUT ")
+                        && let Some(target) = target
+                    {
+                        let mut current = selected.lock().expect("selected");
+                        if request.contains(vpn_hub_core::UDP_SELECTOR) {
+                            current.1 = target.into();
+                        } else if request.contains(vpn_hub_core::MASTER_SELECTOR) {
+                            current.0 = target.into();
+                            if target == candidate {
+                                candidate_seen.store(true, Ordering::Release);
+                                slow = true;
+                            }
+                        }
+                    }
+                    if slow {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                        candidate_finished.store(true, Ordering::Release);
+                    }
+                    let (status, body) = if request.starts_with("GET ") && path == "/proxies" {
+                        let current = selected.lock().expect("selected").clone();
+                        (
+                            "200 OK",
+                            format!(
+                                r#"{{"proxies":{{"{}":{{"type":"Selector","now":"{}","all":["{}","{}"]}},"{}":{{"type":"Selector","now":"{}","all":["REJECT"]}}}}}}"#,
+                                vpn_hub_core::MASTER_SELECTOR,
+                                current.0,
+                                old_master,
+                                candidate,
+                                vpn_hub_core::UDP_SELECTOR,
+                                current.1,
+                            ),
+                        )
+                    } else if request.starts_with("GET ")
+                        && request.contains(vpn_hub_core::UDP_SELECTOR)
+                    {
+                        let current = selected.lock().expect("selected").1.clone();
+                        ("200 OK", format!(r#"{{"now":"{current}"}}"#))
+                    } else if request.starts_with("GET ")
+                        && request.contains(vpn_hub_core::MASTER_SELECTOR)
+                    {
+                        let current = selected.lock().expect("selected").0.clone();
+                        ("200 OK", format!(r#"{{"now":"{current}"}}"#))
+                    } else {
+                        ("204 No Content", String::new())
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let controller =
+            ControllerClient::new(&format!("http://{address}"), "test-secret".into(), 2_000)
+                .expect("controller");
+        state.set_controller_client_for_test(controller);
+
+        let mut draft = state.settings_view().expect("view").draft;
+        draft.route_mode = RouteMode::Manual;
+        draft.manual_outlet = Some("local-b".into());
+        let fingerprint = crate::runtime::settings_request_fingerprint(&draft, None, false, &[])
+            .expect("fingerprint");
+        let preview = state
+            .preview_settings(&SettingsPreviewRequest {
+                draft: draft.clone(),
+                credential_intents: Vec::new(),
+                active_outlet_replacement: None,
+                fail_closed_on_removed_active: false,
+                request_fingerprint: fingerprint,
+            })
+            .expect("preview");
+        let request = SettingsApplyRequest {
+            draft,
+            credential_mutations: Vec::new(),
+            active_outlet_replacement: None,
+            fail_closed_on_removed_active: false,
+            preview_fingerprint: preview.request_fingerprint,
+        };
+        let operation = state
+            .begin_foreground_operation("slow-live-policy")
+            .expect("operation");
+        let started = tokio::time::Instant::now();
+        let apply = apply_live_policy_settings_transaction(
+            &state,
+            request,
+            &operation,
+            started + Duration::from_secs(4),
+        );
+        let cancel = async {
+            while !candidate_seen.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            (
+                state.cancel_foreground_operation("slow-live-policy"),
+                !candidate_response_finished.load(Ordering::Acquire),
+            )
+        };
+        let (result, (cancelled, cancelled_while_request_in_flight)) = tokio::join!(apply, cancel);
+        server.abort();
+
+        assert!(cancelled);
+        assert!(cancelled_while_request_in_flight);
+        let error = result.expect_err("cancelled live policy must not commit");
+        assert!(error.contains("已恢复旧配置、路由状态与 Controller selectors"));
+        // Windows durable rollback includes atomic file flushes, so the bound
+        // deliberately allows that local cost while proving cancellation does
+        // not wait for the four-second command deadline or leave recovery work
+        // running in the foreground indefinitely.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "elapsed={:?}, error={error}, selected={:?}",
+            started.elapsed(),
+            selected.lock().expect("selected debug")
+        );
+        let current = selected.lock().expect("selected").clone();
+        assert_eq!(current.0, old_master);
+        assert_eq!(current.1, vpn_hub_core::FAIL_CLOSED_PROXY);
+        let restored = state.settings_view().expect("restored settings").draft;
+        assert_eq!(restored.route_mode, RouteMode::Priority);
+        assert_eq!(restored.manual_outlet, None);
+        assert!(!state.settings_recovery_pending());
+        assert!(!state.settings_terminal_active());
     }
 
     #[test]

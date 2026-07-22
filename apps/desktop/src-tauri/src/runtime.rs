@@ -462,7 +462,7 @@ pub struct DeferredSettingsApply {
     previous_routing: RoutingEngine,
 }
 
-struct ControllerSelectorSnapshot {
+pub(crate) struct ControllerSelectorSnapshot {
     master: String,
     udp: String,
 }
@@ -1128,28 +1128,52 @@ impl RoutingSession for AppState {
         Ok(())
     }
 
-    fn commit_cycle_if_current<F>(
+    fn try_commit_cycle_if_current<F>(
         &self,
         expected_generation: u64,
         decision: Option<&RouteDecision>,
         now_ms: u64,
-        durable_commit: F,
-    ) -> Result<bool, vpn_hub_core::GuardianCycleError>
+        durable_commit: &mut F,
+    ) -> Result<vpn_hub_core::GuardianCommitStatus, vpn_hub_core::GuardianCycleError>
     where
-        F: FnOnce() -> Result<(), vpn_hub_core::GuardianCycleError>,
+        F: FnMut() -> Result<(), vpn_hub_core::GuardianCycleError>,
     {
-        let _gate = self
-            .guardian_commit_gate
-            .lock()
-            .map_err(|_| RoutingStateError::Unavailable)?;
+        let _gate = match self.guardian_commit_gate.try_lock() {
+            Ok(gate) => gate,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Ok(vpn_hub_core::GuardianCommitStatus::Busy);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(RoutingStateError::Unavailable.into());
+            }
+        };
         if self.config_generation() != expected_generation {
-            return Ok(false);
+            return Ok(vpn_hub_core::GuardianCommitStatus::Stale);
         }
         durable_commit()?;
         if let Some(decision) = decision {
             self.apply_route(decision, now_ms)?;
         }
-        Ok(true)
+        Ok(vpn_hub_core::GuardianCommitStatus::Committed)
+    }
+
+    fn persist_fail_closed_unconfirmed(&self) -> Result<(), RoutingStateError> {
+        if self
+            .persist_settings_terminal_state(SettingsTerminalState::FailClosedUnconfirmed)
+            .is_err()
+        {
+            let pid = self
+                .owned_core_pid()
+                .ok_or(RoutingStateError::Unavailable)?;
+            if !self
+                .stop_owned_core_if_pid(pid)
+                .map_err(|_| RoutingStateError::Unavailable)?
+            {
+                return Err(RoutingStateError::Unavailable);
+            }
+        }
+        self.clear_current_route_for_terminal_recovery()
+            .map_err(|_| RoutingStateError::Unavailable)
     }
 }
 
@@ -1450,7 +1474,7 @@ impl AppState {
     }
 
     #[cfg(test)]
-    fn set_controller_client_for_test(&self, controller: ControllerClient) {
+    pub(crate) fn set_controller_client_for_test(&self, controller: ControllerClient) {
         *self
             .controller_client_override
             .lock()
@@ -1965,6 +1989,7 @@ impl AppState {
         })
     }
 
+    #[cfg(test)]
     pub async fn apply_settings_with_runtime_validation<F, Fut>(
         &self,
         request: SettingsApplyRequest,
@@ -1995,7 +2020,7 @@ impl AppState {
             .await)
     }
 
-    async fn capture_controller_selector_snapshot(
+    pub(crate) async fn capture_controller_selector_snapshot(
         &self,
     ) -> Result<ControllerSelectorSnapshot, String> {
         let controller = self
@@ -2048,6 +2073,33 @@ impl AppState {
             Ok(())
         } else {
             Err("Controller selector 恢复回读不一致".into())
+        }
+    }
+
+    async fn select_and_confirm_controller_targets_before(
+        controller: &ControllerClient,
+        master: &str,
+        udp: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Controller selector 补偿已耗尽前台总预算".into());
+        }
+        let (master_put, udp_put) = tokio::join!(
+            tokio::time::timeout_at(deadline, controller.select(MASTER_SELECTOR, master)),
+            tokio::time::timeout_at(deadline, controller.select(UDP_SELECTOR, udp)),
+        );
+        if !matches!(master_put, Ok(Ok(()))) || !matches!(udp_put, Ok(Ok(()))) {
+            return Err("Controller selector 补偿写入未在前台总预算内完成".into());
+        }
+        let (master_read, udp_read) = tokio::join!(
+            tokio::time::timeout_at(deadline, controller.is_selected(MASTER_SELECTOR, master),),
+            tokio::time::timeout_at(deadline, controller.is_selected(UDP_SELECTOR, udp),),
+        );
+        if matches!(master_read, Ok(Ok(true))) && matches!(udp_read, Ok(Ok(true))) {
+            Ok(())
+        } else {
+            Err("Controller selector 补偿无法在前台总预算内权威回读".into())
         }
     }
 
@@ -2201,11 +2253,28 @@ impl AppState {
             .is_ok_and(|hook| hook.as_ref().is_some_and(|hook| hook(point)))
     }
 
+    #[cfg(test)]
     async fn compensate_failed_live_settings(
         &self,
         pending: &DeferredSettingsApply,
         selectors: &ControllerSelectorSnapshot,
         failure: &str,
+    ) -> String {
+        self.compensate_failed_live_settings_before(
+            pending,
+            selectors,
+            failure,
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        )
+        .await
+    }
+
+    pub(crate) async fn compensate_failed_live_settings_before(
+        &self,
+        pending: &DeferredSettingsApply,
+        selectors: &ControllerSelectorSnapshot,
+        failure: &str,
+        deadline: tokio::time::Instant,
     ) -> String {
         if let Err(error) = self.persist_settings_terminal_state(SettingsTerminalState::Pending) {
             return format!(
@@ -2227,10 +2296,11 @@ impl AppState {
         if rollback.is_ok()
             && let Ok(Some(controller)) = self.controller_client()
         {
-            let restored = Self::select_and_confirm_controller_targets(
+            let restored = Self::select_and_confirm_controller_targets_before(
                 &controller,
                 &selectors.master,
                 &selectors.udp,
+                deadline,
             )
             .await
             .is_ok();
@@ -2260,7 +2330,19 @@ impl AppState {
             }
         }
 
-        if self.force_controller_fail_closed().await.is_ok() {
+        let fail_closed = if let Ok(Some(controller)) = self.controller_client() {
+            Self::select_and_confirm_controller_targets_before(
+                &controller,
+                FAIL_CLOSED_PROXY,
+                FAIL_CLOSED_PROXY,
+                deadline,
+            )
+            .await
+            .and_then(|()| self.clear_current_route_for_terminal_recovery())
+        } else {
+            Err("受鉴权 Controller 不可用".into())
+        };
+        if fail_closed.is_ok() {
             let confirmation =
                 self.persist_settings_terminal_state(SettingsTerminalState::FailClosedConfirmed);
             format!(
@@ -6332,7 +6414,7 @@ mod tests {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("fake Controller");
             listener.set_nonblocking(true).expect("nonblocking");
             let port = listener.local_addr().expect("Controller address").port();
-            let selected = Arc::new(Mutex::new((OLD_MASTER.into(), OLD_UDP.into())));
+            let selected = Arc::new(Mutex::new((OLD_MASTER.to_string(), OLD_UDP.to_string())));
             let server_selected = Arc::clone(&selected);
             let stop = Arc::new(AtomicBool::new(false));
             let server_stop = Arc::clone(&stop);
@@ -6372,6 +6454,19 @@ mod tests {
                                     (FAIL_CLOSED_PROXY): {"type": "Reject", "alive": true}
                                 }
                             }),
+                        );
+                        continue;
+                    }
+                    if request.starts_with(&format!("GET /proxies/{UDP_SELECTOR} ")) {
+                        let udp = server_selected.lock().expect("selected").1.clone();
+                        write_fake_controller_json(&mut stream, &serde_json::json!({ "now": udp }));
+                        continue;
+                    }
+                    if request.starts_with(&format!("GET /proxies/{MASTER_SELECTOR} ")) {
+                        let master = server_selected.lock().expect("selected").0.clone();
+                        write_fake_controller_json(
+                            &mut stream,
+                            &serde_json::json!({ "now": master }),
                         );
                         continue;
                     }

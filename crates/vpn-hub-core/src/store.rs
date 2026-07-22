@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{BufWriter, Write},
     path::Path,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -38,6 +39,8 @@ pub enum StoreError {
     InvalidUdpGeneration,
     #[error("database version {0} is newer than this application supports")]
     UnsupportedDatabaseVersion(i64),
+    #[error("Guardian durable batch exceeded its cycle deadline")]
+    Deadline,
 }
 
 pub struct GuardianStore {
@@ -364,8 +367,27 @@ impl GuardianStore {
         failure_threshold: u32,
         recovery_threshold: u32,
     ) -> Result<Option<StateEvent>, StoreError> {
-        let observed_at = canonical_timestamp(&result.observed_at)?;
         let transaction = self.connection.transaction()?;
+        let event = Self::record_probe_in_transaction(
+            &transaction,
+            outlet,
+            result,
+            failure_threshold,
+            recovery_threshold,
+        )?;
+        transaction.commit()?;
+        Ok(event)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn record_probe_in_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        outlet: &ProbeOutletConfig,
+        result: &ProbeResult,
+        failure_threshold: u32,
+        recovery_threshold: u32,
+    ) -> Result<Option<StateEvent>, StoreError> {
+        let observed_at = canonical_timestamp(&result.observed_at)?;
         transaction.execute(
             r"INSERT INTO outlets(id, label, updated_at, enabled, deleted_at) VALUES (?1, ?2, ?3, 1, NULL)
                ON CONFLICT(id) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at,
@@ -469,7 +491,6 @@ impl GuardianStore {
                 ],
             )?;
         }
-        transaction.commit()?;
         Ok(event)
     }
 
@@ -530,6 +551,157 @@ impl GuardianStore {
             );
         }
         Ok(health)
+    }
+
+    /// Commits every durable projection of one Guardian generation in a
+    /// single `SQLite` transaction. The connection busy timeout and explicit
+    /// pre-commit checks share the caller's absolute cycle deadline; dropping
+    /// the transaction on any error leaves no partial probes, UDP projection,
+    /// state events, or route switch.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Deadline` when the batch cannot atomically commit before the
+    /// supplied deadline, or the corresponding SQLite/validation error.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn commit_guardian_cycle_batch(
+        &mut self,
+        initial_udp: &[(String, String, UdpCapabilityEvidence)],
+        observed: &[(ProbeOutletConfig, ProbeResult)],
+        failure_threshold: u32,
+        recovery_threshold: u32,
+        route_event: Option<&RouteSwitchEvent>,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(StoreError::Deadline)?;
+        self.connection.busy_timeout(remaining)?;
+        let result = (|| {
+            let transaction = self.connection.transaction()?;
+            let constrain_to_deadline = |transaction: &rusqlite::Transaction<'_>| {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .ok_or(StoreError::Deadline)?;
+                transaction
+                    .busy_timeout(remaining)
+                    .map_err(StoreError::from)
+            };
+            for (outlet_id, label, evidence) in initial_udp {
+                constrain_to_deadline(&transaction)?;
+                let exists = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM udp_capability_current WHERE outlet_id=?1)",
+                    [outlet_id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if !exists {
+                    let observed_at = canonical_timestamp(&evidence.observed_at)?;
+                    let generation = i64::try_from(evidence.configuration_generation)
+                        .ok()
+                        .filter(|generation| *generation != i64::MAX)
+                        .ok_or(StoreError::InvalidUdpGeneration)?;
+                    transaction.execute(
+                        r"INSERT INTO outlets(id, label, updated_at) VALUES (?1, ?2, ?3)
+                           ON CONFLICT(id) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at",
+                        params![outlet_id, crate::history::sanitized_label(label), observed_at],
+                    )?;
+                    transaction.execute(
+                        "INSERT INTO udp_capability_history(outlet_id, status, observed_at, evidence_version, probe_version, model_version, configuration_fingerprint, configuration_generation, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        params![
+                            outlet_id,
+                            evidence.status.as_str(),
+                            observed_at,
+                            evidence.evidence_version,
+                            evidence.probe_version,
+                            evidence.model_version,
+                            evidence.configuration_fingerprint,
+                            generation,
+                            evidence.reason_code,
+                        ],
+                    )?;
+                    let history_id = transaction.last_insert_rowid();
+                    transaction.execute(
+                        "INSERT INTO udp_capability_current(outlet_id, history_id) VALUES (?1, ?2)",
+                        params![outlet_id, history_id],
+                    )?;
+                }
+            }
+            for (outlet, probe) in observed {
+                constrain_to_deadline(&transaction)?;
+                Self::record_probe_in_transaction(
+                    &transaction,
+                    outlet,
+                    probe,
+                    failure_threshold,
+                    recovery_threshold,
+                )?;
+            }
+            if let Some(event) = route_event {
+                constrain_to_deadline(&transaction)?;
+                let occurred_at = canonical_timestamp(&event.occurred_at)?;
+                for outlet_id in event
+                    .from_outlet
+                    .iter()
+                    .chain(std::iter::once(&event.to_outlet))
+                {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO outlets(id, label, updated_at, kind, enabled) VALUES (?1, '已脱敏出口', ?2, 'unknown', 0)",
+                        params![outlet_id, occurred_at],
+                    )?;
+                }
+                let snapshot =
+                    |outlet_id: &str| -> Result<Option<(String, HistoryOutletKind)>, StoreError> {
+                        transaction
+                            .query_row(
+                                "SELECT label, kind FROM outlets WHERE id=?1",
+                                [outlet_id],
+                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                            )
+                            .optional()?
+                            .map(|(label, kind)| {
+                                Ok((
+                                    crate::history::sanitized_label(&label),
+                                    HistoryOutletKind::try_from(kind.as_str())
+                                        .map_err(StoreError::InvalidOutletKind)?,
+                                ))
+                            })
+                            .transpose()
+                    };
+                let from_snapshot = event
+                    .from_outlet
+                    .as_deref()
+                    .map(snapshot)
+                    .transpose()?
+                    .flatten();
+                let to_snapshot = snapshot(&event.to_outlet)?
+                    .unwrap_or_else(|| (event.to_outlet.clone(), HistoryOutletKind::Unknown));
+                transaction.execute(
+                    "INSERT INTO route_switches(occurred_at, from_outlet, to_outlet, mode, reason, duration_ms, from_label, from_kind, to_label, to_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        occurred_at,
+                        event.from_outlet,
+                        event.to_outlet,
+                        crate::history::sanitized_code(&event.mode),
+                        crate::history::sanitized_code(&event.reason),
+                        i64::try_from(event.duration_ms).unwrap_or(i64::MAX),
+                        from_snapshot.as_ref().map(|value| value.0.as_str()),
+                        from_snapshot.as_ref().map(|value| value.1.as_str()),
+                        to_snapshot.0,
+                        to_snapshot.1.as_str(),
+                    ],
+                )?;
+            }
+            constrain_to_deadline(&transaction)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        let reset = self.connection.busy_timeout(Duration::from_secs(5));
+        match (result, reset) {
+            (Err(_), _) if Instant::now() >= deadline => Err(StoreError::Deadline),
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(StoreError::Database(error)),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     /// Returns aggregate availability and latency summaries for all outlets.
@@ -1880,6 +2052,42 @@ mod tests {
             successful_targets: u32::from(status != HealthStatus::Down),
             total_targets: 1,
         }
+    }
+
+    #[test]
+    fn locked_sqlite_batch_obeys_deadline_and_rolls_back_every_projection() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("guardian.db");
+        let mut store = GuardianStore::open(&path).expect("store");
+        let locker = Connection::open(&path).expect("locker");
+        locker
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold writer lock");
+        let observed = vec![(
+            outlet(),
+            result(HealthStatus::Healthy, "2026-01-01T00:00:00Z"),
+        )];
+        let started = Instant::now();
+
+        let error = store
+            .commit_guardian_cycle_batch(
+                &[],
+                &observed,
+                2,
+                2,
+                None,
+                Instant::now() + Duration::from_millis(120),
+            )
+            .expect_err("locked durable batch must time out");
+        let elapsed = started.elapsed();
+        locker.execute_batch("ROLLBACK").expect("unlock");
+
+        assert!(matches!(error, StoreError::Deadline), "error={error:?}");
+        assert!(elapsed < Duration::from_millis(300), "elapsed={elapsed:?}");
+        assert!(store.recent_samples(10).expect("samples").is_empty());
+        assert!(store.recent_events(10).expect("events").is_empty());
+        assert!(store.recent_route_switches(10).expect("routes").is_empty());
+        assert!(store.udp_capabilities().expect("udp").is_empty());
     }
 
     #[test]
