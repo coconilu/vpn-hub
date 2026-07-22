@@ -2130,6 +2130,74 @@ pub async fn stop_development_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    async fn read_live_policy_fixture_request(
+        reader: &mut (impl AsyncRead + Unpin),
+    ) -> Result<String, String> {
+        const MAX_REQUEST_BYTES: usize = 16 * 1024;
+        const READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+        let mut request = Vec::with_capacity(1_024);
+        loop {
+            if let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|offset| offset + 4)
+            {
+                let headers = std::str::from_utf8(&request[..header_end])
+                    .map_err(|_| "fixture request headers are not UTF-8".to_string())?;
+                let content_length = headers
+                    .lines()
+                    .skip(1)
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then_some(value.trim())
+                    })
+                    .map_or(Ok(0_usize), |value| {
+                        value
+                            .parse::<usize>()
+                            .map_err(|_| "fixture Content-Length is invalid".to_string())
+                    })?;
+                let complete_length = header_end
+                    .checked_add(content_length)
+                    .filter(|length| *length <= MAX_REQUEST_BYTES)
+                    .ok_or_else(|| "fixture request is too large".to_string())?;
+                if request.len() >= complete_length {
+                    return String::from_utf8(request[..complete_length].to_vec())
+                        .map_err(|_| "fixture request body is not UTF-8".to_string());
+                }
+            }
+            if request.len() >= MAX_REQUEST_BYTES {
+                return Err("fixture request is too large".into());
+            }
+            let mut chunk = [0_u8; 1_024];
+            let read = tokio::time::timeout(READ_TIMEOUT, reader.read(&mut chunk))
+                .await
+                .map_err(|_| "fixture request read timed out".to_string())?
+                .map_err(|error| format!("fixture request read failed: {error}"))?;
+            if read == 0 {
+                return Err("fixture request ended before Content-Length bytes arrived".into());
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    async fn stop_live_policy_fixture_server(
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        mut server: tokio::task::JoinHandle<()>,
+    ) {
+        let _ = shutdown.send(());
+        if let Ok(result) = tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+            result.expect("live-policy fixture server task must finish cleanly");
+        } else {
+            server.abort();
+            let _ = server.await;
+            panic!("live-policy fixture server did not stop within two seconds");
+        }
+    }
 
     #[tokio::test]
     async fn foreground_fallback_steps_share_one_total_deadline() {
@@ -2151,6 +2219,45 @@ mod tests {
         .expect_err("second step must consume only the remaining time");
         assert!(error.contains("总预算 10 秒"));
         assert!(started.elapsed() < Duration::from_millis(180));
+    }
+
+    #[tokio::test]
+    async fn live_policy_fixture_reads_fragmented_content_length_body() {
+        let body = br#"{"name":"vpn-hub-outlet-local-b"}"#;
+        let headers = format!(
+            "PUT /proxies/vpn-hub-master HTTP/1.1\r\ncontent-type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut writer, mut reader) = tokio::io::duplex(1_024);
+        let fixture_read =
+            tokio::spawn(async move { read_live_policy_fixture_request(&mut reader).await });
+
+        writer
+            .write_all(&headers.as_bytes()[..headers.len() / 2])
+            .await
+            .expect("first header fragment");
+        tokio::task::yield_now().await;
+        writer
+            .write_all(&headers.as_bytes()[headers.len() / 2..])
+            .await
+            .expect("second header fragment");
+        writer
+            .write_all(&body[..8])
+            .await
+            .expect("first body fragment");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        writer
+            .write_all(&body[8..])
+            .await
+            .expect("second body fragment");
+        drop(writer);
+
+        let request = tokio::time::timeout(Duration::from_secs(1), fixture_read)
+            .await
+            .expect("fragmented fixture read must stay bounded")
+            .expect("fixture reader task")
+            .expect("complete fixture request");
+        assert!(request.ends_with(std::str::from_utf8(body).expect("body UTF-8")));
     }
 
     #[tokio::test]
@@ -2270,10 +2377,7 @@ mod tests {
     {
         use std::sync::Mutex;
 
-        use tokio::{
-            io::{AsyncReadExt, AsyncWriteExt},
-            net::TcpListener,
-        };
+        use tokio::net::TcpListener;
         use vpn_hub_core::{ControllerClient, PrivateRoutingConfig, outlet_proxy_name};
 
         let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
@@ -2323,84 +2427,109 @@ mod tests {
         let server_candidate_finished = Arc::clone(&candidate_response_finished);
         let server_candidate = candidate_master.clone();
         let server_old_master = old_master.clone();
+        let fixture_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_fixture_errors = Arc::clone(&fixture_errors);
+        let (shutdown_server, mut server_shutdown) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let selected = Arc::clone(&server_selected);
-                let candidate_seen = Arc::clone(&server_candidate_seen);
-                let candidate_finished = Arc::clone(&server_candidate_finished);
-                let candidate = server_candidate.clone();
-                let old_master = server_old_master.clone();
-                tokio::spawn(async move {
-                    let mut bytes = vec![0_u8; 8_192];
-                    let Ok(read) = stream.read(&mut bytes).await else {
-                        return;
-                    };
-                    let request = String::from_utf8_lossy(&bytes[..read]).into_owned();
-                    let path = request
-                        .lines()
-                        .next()
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or_default();
-                    let body_text = request.split("\r\n\r\n").nth(1).unwrap_or_default();
-                    let target = body_text
-                        .split("\"name\":\"")
-                        .nth(1)
-                        .and_then(|tail| tail.split('"').next());
-                    let mut slow = false;
-                    if request.starts_with("PUT ")
-                        && let Some(target) = target
-                    {
-                        let mut current = selected.lock().expect("selected");
-                        if request.contains(vpn_hub_core::UDP_SELECTOR) {
-                            current.1 = target.into();
-                        } else if request.contains(vpn_hub_core::MASTER_SELECTOR) {
-                            current.0 = target.into();
-                            if target == candidate {
-                                candidate_seen.store(true, Ordering::Release);
-                                slow = true;
-                            }
+                tokio::select! {
+                    biased;
+                    _ = &mut server_shutdown => break,
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(error)) = joined {
+                            server_fixture_errors
+                                .lock()
+                                .expect("fixture errors")
+                                .push(format!("fixture connection task failed: {error}"));
                         }
                     }
-                    if slow {
-                        tokio::time::sleep(Duration::from_millis(600)).await;
-                        candidate_finished.store(true, Ordering::Release);
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else {
+                            break;
+                        };
+                        let selected = Arc::clone(&server_selected);
+                        let candidate_seen = Arc::clone(&server_candidate_seen);
+                        let candidate_finished = Arc::clone(&server_candidate_finished);
+                        let candidate = server_candidate.clone();
+                        let old_master = server_old_master.clone();
+                        let fixture_errors = Arc::clone(&server_fixture_errors);
+                        connections.spawn(async move {
+                            let request = match read_live_policy_fixture_request(&mut stream).await {
+                                Ok(request) => request,
+                                Err(error) => {
+                                    fixture_errors.lock().expect("fixture errors").push(error);
+                                    return;
+                                }
+                            };
+                            let path = request
+                                .lines()
+                                .next()
+                                .and_then(|line| line.split_whitespace().nth(1))
+                                .unwrap_or_default();
+                            let body_text = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                            let target = body_text
+                                .split("\"name\":\"")
+                                .nth(1)
+                                .and_then(|tail| tail.split('"').next());
+                            let mut slow = false;
+                            if request.starts_with("PUT ")
+                                && let Some(target) = target
+                            {
+                                let mut current = selected.lock().expect("selected");
+                                if request.contains(vpn_hub_core::UDP_SELECTOR) {
+                                    current.1 = target.into();
+                                } else if request.contains(vpn_hub_core::MASTER_SELECTOR) {
+                                    current.0 = target.into();
+                                    if target == candidate {
+                                        candidate_seen.store(true, Ordering::Release);
+                                        slow = true;
+                                    }
+                                }
+                            }
+                            if slow {
+                                tokio::time::sleep(Duration::from_millis(600)).await;
+                                candidate_finished.store(true, Ordering::Release);
+                            }
+                            let (status, body) = if request.starts_with("GET ") && path == "/proxies" {
+                                let current = selected.lock().expect("selected").clone();
+                                (
+                                    "200 OK",
+                                    format!(
+                                        r#"{{"proxies":{{"{}":{{"type":"Selector","now":"{}","all":["{}","{}"]}},"{}":{{"type":"Selector","now":"{}","all":["REJECT"]}}}}}}"#,
+                                        vpn_hub_core::MASTER_SELECTOR,
+                                        current.0,
+                                        old_master,
+                                        candidate,
+                                        vpn_hub_core::UDP_SELECTOR,
+                                        current.1,
+                                    ),
+                                )
+                            } else if request.starts_with("GET ")
+                                && request.contains(vpn_hub_core::UDP_SELECTOR)
+                            {
+                                let current = selected.lock().expect("selected").1.clone();
+                                ("200 OK", format!(r#"{{"now":"{current}"}}"#))
+                            } else if request.starts_with("GET ")
+                                && request.contains(vpn_hub_core::MASTER_SELECTOR)
+                            {
+                                let current = selected.lock().expect("selected").0.clone();
+                                ("200 OK", format!(r#"{{"now":"{current}"}}"#))
+                            } else {
+                                ("204 No Content", String::new())
+                            };
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        });
                     }
-                    let (status, body) = if request.starts_with("GET ") && path == "/proxies" {
-                        let current = selected.lock().expect("selected").clone();
-                        (
-                            "200 OK",
-                            format!(
-                                r#"{{"proxies":{{"{}":{{"type":"Selector","now":"{}","all":["{}","{}"]}},"{}":{{"type":"Selector","now":"{}","all":["REJECT"]}}}}}}"#,
-                                vpn_hub_core::MASTER_SELECTOR,
-                                current.0,
-                                old_master,
-                                candidate,
-                                vpn_hub_core::UDP_SELECTOR,
-                                current.1,
-                            ),
-                        )
-                    } else if request.starts_with("GET ")
-                        && request.contains(vpn_hub_core::UDP_SELECTOR)
-                    {
-                        let current = selected.lock().expect("selected").1.clone();
-                        ("200 OK", format!(r#"{{"now":"{current}"}}"#))
-                    } else if request.starts_with("GET ")
-                        && request.contains(vpn_hub_core::MASTER_SELECTOR)
-                    {
-                        let current = selected.lock().expect("selected").0.clone();
-                        ("200 OK", format!(r#"{{"now":"{current}"}}"#))
-                    } else {
-                        ("204 No Content", String::new())
-                    };
-                    let response = format!(
-                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                });
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {
+                // Drain every cancelled connection before the server task exits.
             }
         });
         let controller =
@@ -2440,16 +2569,35 @@ mod tests {
             started + Duration::from_secs(4),
         );
         let cancel = async {
-            while !candidate_seen.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            (
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while !candidate_seen.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .map_err(|_| "candidate PUT was not observed within three seconds".to_string())?;
+            Ok::<_, String>((
                 state.cancel_foreground_operation("slow-live-policy"),
                 !candidate_response_finished.load(Ordering::Acquire),
-            )
+            ))
         };
-        let (result, (cancelled, cancelled_while_request_in_flight)) = tokio::join!(apply, cancel);
-        server.abort();
+        let joined = tokio::time::timeout(Duration::from_secs(8), async {
+            tokio::join!(apply, cancel)
+        })
+        .await;
+        stop_live_policy_fixture_server(shutdown_server, server).await;
+        let (result, cancellation) = joined.unwrap_or_else(|_| {
+            panic!(
+                "live-policy fixture exceeded eight seconds: {:?}",
+                fixture_errors.lock().expect("fixture errors")
+            )
+        });
+        let (cancelled, cancelled_while_request_in_flight) = cancellation.unwrap_or_else(|error| {
+            panic!(
+                "{error}: {:?}",
+                fixture_errors.lock().expect("fixture errors")
+            )
+        });
 
         assert!(cancelled);
         assert!(cancelled_while_request_in_flight);
