@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { mockSnapshot } from "../data/mock";
 import { consumeSettingsPreviewTicket, settingsRequestFingerprint } from "./settingsModel";
+import { isSupportedLoopbackHost } from "./entrySwitchModel";
 import type {
   CoreStatus,
   DashboardSnapshot,
@@ -73,6 +74,7 @@ let browserSettings: SafeSettingsView = {
 let browserSettingsTerminalStatus: SettingsTerminalStatus = { active: false, state: null };
 let browserSettingsPreviewTicket: string | null = null;
 let browserEntrySwitchAuthorization: string | null = null;
+let browserEntrySwitchAuthorizationExpiresAt = 0;
 
 function browserSettingsDiff(
   draft: SettingsDraft,
@@ -272,13 +274,9 @@ export async function previewEntrySwitch(
 ): Promise<EntrySwitchPreview> {
   if (!isTauriRuntime()) {
     const current = structuredClone(browserSettings.draft.entry);
-    const host = target.host.toLowerCase() === "localhost" ? "127.0.0.1" : target.host;
-    const parts = host.split(".").map(Number);
-    const loopback = host === "::1" || host === "[::1]"
-      || (/^127(?:\.\d{1,3}){3}$/.test(host)
-        && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255));
     const issues: ValidationIssue[] = [];
-    if (!loopback || !Number.isInteger(target.port) || target.port < 1 || target.port > 65535) {
+    if (!isSupportedLoopbackHost(target.host)
+      || !Number.isInteger(target.port) || target.port < 1 || target.port > 65535) {
       issues.push({ field: "entry", code: "invalid_entry_target", message: "入口只能使用合法的显式 loopback 地址与端口。" });
     }
     if (current.host === target.host && current.port === target.port) {
@@ -293,6 +291,9 @@ export async function previewEntrySwitch(
     browserEntrySwitchAuthorization = issues.length === 0
       ? `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`
       : null;
+    browserEntrySwitchAuthorizationExpiresAt = browserEntrySwitchAuthorization
+      ? Date.now() + 120_000
+      : 0;
     return {
       current,
       target: structuredClone(target),
@@ -300,7 +301,6 @@ export async function previewEntrySwitch(
       can_execute: issues.length === 0,
       issues,
       authorization: browserEntrySwitchAuthorization,
-      expires_at_unix_ms: browserEntrySwitchAuthorization ? Date.now() + 120_000 : null,
     };
   }
   return invoke<EntrySwitchPreview>("preview_entry_switch", {
@@ -315,10 +315,14 @@ export async function applyEntrySwitch(
 ): Promise<EntrySwitchApplyResult> {
   if (!isTauriRuntime()) {
     if (!browserEntrySwitchAuthorization
+      || Date.now() >= browserEntrySwitchAuthorizationExpiresAt
       || request.authorization !== browserEntrySwitchAuthorization) {
+      browserEntrySwitchAuthorization = null;
+      browserEntrySwitchAuthorizationExpiresAt = 0;
       throw new Error("入口切换授权不存在、已过期或已被使用，请重新预览。");
     }
     browserEntrySwitchAuthorization = null;
+    browserEntrySwitchAuthorizationExpiresAt = 0;
     const previous = structuredClone(browserSettings.draft.entry);
     browserSettings.draft.entry = structuredClone(request.target);
     browserSnapshot.entry = {

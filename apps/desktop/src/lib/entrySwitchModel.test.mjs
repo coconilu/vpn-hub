@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildEntrySwitchFoundationPreview } from "./entrySwitchModel.js";
+import { buildEntrySwitchFoundationPreview, isSupportedLoopbackHost } from "./entrySwitchModel.js";
 
 test("valid confirmed preview becomes executable and exposes the fail-closed order", () => {
   const preview = buildEntrySwitchFoundationPreview(
@@ -27,4 +27,12 @@ test("non-loopback and missing confirmation are explicit accessible issues", () 
     ["loopback_required", "invalid_port", "confirmation_required"],
   );
   assert.equal(preview.steps.at(-1), "不调用任何系统代理 backend");
+});
+
+test("browser loopback validation matches Rust parsing for leading-zero IPv4", () => {
+  assert.equal(isSupportedLoopbackHost("127.0.0.1"), true);
+  assert.equal(isSupportedLoopbackHost("localhost"), true);
+  assert.equal(isSupportedLoopbackHost("[::1]"), true);
+  assert.equal(isSupportedLoopbackHost("127.0.0.01"), false);
+  assert.equal(isSupportedLoopbackHost("127.0.0.256"), false);
 });

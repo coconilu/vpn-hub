@@ -360,7 +360,6 @@ export interface EntrySwitchPreview {
   can_execute: boolean;
   issues: ValidationIssue[];
   authorization: string | null;
-  expires_at_unix_ms: number | null;
 }
 
 export interface EntrySwitchApplyRequest {

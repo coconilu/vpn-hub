@@ -212,6 +212,19 @@ pub async fn get_settings(
     state.settings_view()
 }
 
+fn ensure_entry_switch_preview_supported(
+    settings_terminal_active: bool,
+    windows_supported: bool,
+) -> Result<(), String> {
+    if settings_terminal_active {
+        return Err("terminal_recovery_active：设置安全门未解除，拒绝签发入口切换授权".into());
+    }
+    if !windows_supported {
+        return Err("安全入口切换只支持 Windows 当前用户 default-LAN 系统代理".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub async fn preview_entry_switch(
@@ -222,6 +235,7 @@ pub async fn preview_entry_switch(
 ) -> Result<EntrySwitchPreview, String> {
     let _settings_apply = state.lock_settings_apply().await;
     let _transaction = state.lock_routing_transaction().await;
+    ensure_entry_switch_preview_supported(state.settings_terminal_active(), cfg!(windows))?;
     let status = state.core_status_authoritative().await?;
     let managed_core_ready = status.managed
         && status.pid.is_some()
@@ -247,6 +261,37 @@ pub async fn preview_entry_switch(
 }
 
 #[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyRollbackAction {
+    RestoreOriginal,
+    AlreadyOriginal,
+    PreserveThirdParty,
+}
+
+#[cfg(target_os = "windows")]
+fn classify_proxy_rollback(
+    observed: &ProtectedProxySnapshotWire,
+    original: &ProtectedProxySnapshotWire,
+    desired: &ProtectedProxySnapshotWire,
+) -> ProxyRollbackAction {
+    if observed == desired {
+        ProxyRollbackAction::RestoreOriginal
+    } else if observed == original {
+        ProxyRollbackAction::AlreadyOriginal
+    } else {
+        ProxyRollbackAction::PreserveThirdParty
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn owned_core_stop_confirmed(
+    stop_result: lifecycle::StopRequestResult,
+    authoritative_pid: Option<u32>,
+) -> bool {
+    stop_result == lifecycle::StopRequestResult::Stopped && authoritative_pid.is_none()
+}
+
+#[cfg(target_os = "windows")]
 async fn compensate_failed_entry_switch(
     app: &AppHandle,
     state: &AppState,
@@ -259,22 +304,39 @@ async fn compensate_failed_entry_switch(
             "entry_switch_recovery_pending：{failure}；入口提交决定已持久化，系统代理与配置只允许幂等前滚"
         );
     }
-    let _ = lifecycle::dispatch_stop_and_wait(app).await;
+    let stop_result = lifecycle::dispatch_stop_and_wait(app).await;
+    let authoritative_pid = match state.owned_core_pid_authoritative().await {
+        Ok(pid) => pid,
+        Err(error) => {
+            return format!(
+                "entry_switch_recovery_pending：{failure}；无法确认目标入口核心是否已停止，保留恢复日志：{error}"
+            );
+        }
+    };
+    if !owned_core_stop_confirmed(stop_result, authoritative_pid) {
+        return format!(
+            "entry_switch_recovery_pending：{failure}；目标入口核心停止仍在进行或 PID 仍存在，未回滚配置或系统代理并保留恢复日志"
+        );
+    }
     let mut notes = Vec::new();
     if let (Some(original), Some(desired)) = (&journal.original_proxy, &journal.desired_proxy) {
         match snapshot_current_user_proxy() {
-            Ok(observed) if observed == *desired => {
-                match compare_then_apply_proxy(desired, original) {
-                    Ok(true) => notes.push("Windows 系统代理已恢复"),
-                    Ok(false) | Err(_) => {
-                        return format!(
-                            "entry_switch_recovery_pending：{failure}；系统代理属于本事务但恢复回读失败"
-                        );
+            Ok(observed) => match classify_proxy_rollback(&observed, original, desired) {
+                ProxyRollbackAction::RestoreOriginal => {
+                    match compare_then_apply_proxy(desired, original) {
+                        Ok(true) => notes.push("Windows 系统代理已恢复"),
+                        Ok(false) | Err(_) => {
+                            return format!(
+                                "entry_switch_recovery_pending：{failure}；系统代理属于本事务但恢复回读失败"
+                            );
+                        }
                     }
                 }
-            }
-            Ok(observed) if observed == *original => {}
-            Ok(_) => notes.push("检测到并发系统代理变更，未覆盖第三方新值"),
+                ProxyRollbackAction::AlreadyOriginal => {}
+                ProxyRollbackAction::PreserveThirdParty => {
+                    notes.push("检测到并发系统代理变更，未覆盖第三方新值");
+                }
+            },
             Err(_) => {
                 return format!(
                     "entry_switch_recovery_pending：{failure}；无法确认系统代理恢复边界"
@@ -465,11 +527,13 @@ async fn run_entry_switch_transaction(
         previous_entry,
         mut journal,
     } = prepared;
-    if lifecycle::dispatch_stop_and_wait(app).await != lifecycle::StopRequestResult::Stopped
-        || state.owned_core_pid_authoritative().await?.is_some()
-    {
-        let _ = state.clear_entry_switch_runtime_journal();
-        return Err("未能确认精确 owned core 已停止；入口与系统代理保持不变".into());
+    let stop_result = lifecycle::dispatch_stop_and_wait(app).await;
+    let authoritative_pid = state.owned_core_pid_authoritative().await?;
+    if !owned_core_stop_confirmed(stop_result, authoritative_pid) {
+        return Err(
+            "entry_switch_recovery_pending：已请求停止当前核心，但尚未确认精确 owned core 消失；入口与系统代理尚未提交并保留恢复日志"
+                .into(),
+        );
     }
     if AppState::port_snapshot(&request.target.host, request.target.port).reachable {
         let error = "停止旧核心后目标端口被并发占用；拒绝接管";
@@ -1425,6 +1489,69 @@ pub async fn stop_development_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entry_switch_preview_rejects_terminal_and_unsupported_platform() {
+        assert!(ensure_entry_switch_preview_supported(false, true).is_ok());
+        assert!(
+            ensure_entry_switch_preview_supported(true, true)
+                .expect_err("terminal")
+                .contains("terminal_recovery_active")
+        );
+        assert!(
+            ensure_entry_switch_preview_supported(false, false)
+                .expect_err("platform")
+                .contains("只支持 Windows")
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn proxy_snapshot(port: u16) -> ProtectedProxySnapshotWire {
+        vpn_hub_windows_security::WinInetLanProxySnapshot {
+            flags: 2,
+            proxy_server: Some(format!("http=127.0.0.1:{port}")),
+            proxy_bypass: Some("<local>".into()),
+            auto_config_url: None,
+        }
+        .into()
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn compensation_requires_stopped_result_and_absent_owned_pid() {
+        assert!(owned_core_stop_confirmed(
+            lifecycle::StopRequestResult::Stopped,
+            None
+        ));
+        assert!(!owned_core_stop_confirmed(
+            lifecycle::StopRequestResult::Pending,
+            None
+        ));
+        assert!(!owned_core_stop_confirmed(
+            lifecycle::StopRequestResult::Stopped,
+            Some(42)
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn compensation_proxy_classification_never_overwrites_third_party_value() {
+        let original = proxy_snapshot(31_001);
+        let desired = proxy_snapshot(31_002);
+        let third_party = proxy_snapshot(31_003);
+        assert_eq!(
+            classify_proxy_rollback(&desired, &original, &desired),
+            ProxyRollbackAction::RestoreOriginal
+        );
+        assert_eq!(
+            classify_proxy_rollback(&original, &original, &desired),
+            ProxyRollbackAction::AlreadyOriginal
+        );
+        assert_eq!(
+            classify_proxy_rollback(&third_party, &original, &desired),
+            ProxyRollbackAction::PreserveThirdParty
+        );
+    }
 
     #[test]
     fn helper_owned_runtime_changes_are_rejected_even_while_stopped() {

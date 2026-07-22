@@ -278,7 +278,6 @@ pub struct EntrySwitchPreview {
     pub can_execute: bool,
     pub issues: Vec<ValidationIssue>,
     pub authorization: Option<String>,
-    pub expires_at_unix_ms: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -304,6 +303,19 @@ struct EntrySwitchTicket {
     apply_system_proxy: bool,
     settings_fingerprint: String,
     expires_at_unix_ms: i64,
+}
+
+fn authorization_matches(expected: &str, observed: &str) -> bool {
+    if expected.len() != observed.len() {
+        return false;
+    }
+    expected
+        .bytes()
+        .zip(observed.bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 #[derive(Clone, Copy)]
@@ -1594,7 +1606,7 @@ impl AppState {
                 .changes
                 .iter()
                 .all(|change| change.code == "entry_changed");
-        let (authorization, expires_at_unix_ms) = if can_execute {
+        let authorization = if can_execute {
             let authorization = generate_controller_secret();
             let expires_at = chrono::Utc::now()
                 .timestamp_millis()
@@ -1615,12 +1627,12 @@ impl AppState {
                 settings_fingerprint: fingerprint,
                 expires_at_unix_ms: expires_at,
             });
-            (Some(authorization), Some(expires_at))
+            Some(authorization)
         } else {
             if let Ok(mut ticket) = self.entry_switch_ticket.lock() {
                 *ticket = None;
             }
-            (None, None)
+            None
         };
         Ok(EntrySwitchPreview {
             current,
@@ -1629,7 +1641,6 @@ impl AppState {
             can_execute,
             issues,
             authorization,
-            expires_at_unix_ms,
         })
     }
 
@@ -1644,8 +1655,8 @@ impl AppState {
             .take()
             .ok_or_else(|| "入口切换授权不存在或已被使用，请重新预览".to_string())?;
         let current = self.private_config()?.entry;
-        if chrono::Utc::now().timestamp_millis() > ticket.expires_at_unix_ms
-            || ticket.authorization != request.authorization
+        if chrono::Utc::now().timestamp_millis() >= ticket.expires_at_unix_ms
+            || !authorization_matches(&ticket.authorization, &request.authorization)
             || ticket.current != current
             || ticket.target != request.target
             || ticket.apply_system_proxy != request.apply_system_proxy
@@ -3715,7 +3726,9 @@ impl AppState {
         let mut child = PendingChild::new(child);
 
         let pid = child.id();
-        for _ in 0..50 {
+        // A freshly downloaded/signed Mihomo can spend several seconds in
+        // Windows Defender inspection before its listeners become visible.
+        for _ in 0..100 {
             ensure_core_start_not_cancelled(cancel)?;
             if owns_loopback_listeners(pid, &[startup_entry_address, controller_address]) {
                 break;
@@ -4571,6 +4584,25 @@ fn recover_entry_switch_runtime_journal(
     runtime_directory: &Path,
     private_config_path: &Path,
 ) -> Result<(), String> {
+    recover_entry_switch_runtime_journal_with(
+        runtime_directory,
+        private_config_path,
+        crate::entry_switch_windows::snapshot_current_user_proxy,
+        crate::entry_switch_windows::compare_then_apply_proxy,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn recover_entry_switch_runtime_journal_with<S, A>(
+    runtime_directory: &Path,
+    private_config_path: &Path,
+    mut snapshot_proxy: S,
+    mut compare_then_apply_proxy: A,
+) -> Result<(), String>
+where
+    S: FnMut() -> Result<ProtectedProxySnapshotWire, String>,
+    A: FnMut(&ProtectedProxySnapshotWire, &ProtectedProxySnapshotWire) -> Result<bool, String>,
+{
     let Some(journal) = read_entry_switch_runtime_journal(runtime_directory)? else {
         return Ok(());
     };
@@ -4579,10 +4611,8 @@ fn recover_entry_switch_runtime_journal(
         .entry;
     if current_entry == journal.original_entry {
         if let (Some(original), Some(desired)) = (&journal.original_proxy, &journal.desired_proxy) {
-            let observed = crate::entry_switch_windows::snapshot_current_user_proxy()?;
-            if observed == *desired
-                && !crate::entry_switch_windows::compare_then_apply_proxy(desired, original)?
-            {
+            let observed = snapshot_proxy()?;
+            if observed == *desired && !compare_then_apply_proxy(desired, original)? {
                 return Err("系统代理仍属于未完成入口事务，但恢复回读失败".into());
             }
             // A third value belongs to a concurrent user/application change.
@@ -4592,7 +4622,7 @@ fn recover_entry_switch_runtime_journal(
     }
     if current_entry == journal.target_entry {
         if let Some(desired) = &journal.desired_proxy {
-            let observed = crate::entry_switch_windows::snapshot_current_user_proxy()?;
+            let observed = snapshot_proxy()?;
             if observed != *desired {
                 return Err(
                     "入口已提交，但 Windows 系统代理不是本事务的目标值；拒绝覆盖并保留恢复日志"
@@ -8938,5 +8968,232 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             .expect("rollback recovery");
         assert!(!entry_switch_runtime_journal_path(&state.runtime_directory).exists());
         assert!(!entry_switch_runtime_journal_backup_path(&state.runtime_directory).exists());
+    }
+
+    fn recovery_proxy(port: u16) -> ProtectedProxySnapshotWire {
+        vpn_hub_windows_security::WinInetLanProxySnapshot {
+            flags: 2,
+            proxy_server: Some(format!("http=127.0.0.1:{port}")),
+            proxy_bypass: Some("<local>".into()),
+            auto_config_url: None,
+        }
+        .into()
+    }
+
+    fn entry_switch_recovery_fixture() -> (
+        tempfile::TempDir,
+        AppState,
+        EntryConfig,
+        EntryConfig,
+        ProtectedProxySnapshotWire,
+        ProtectedProxySnapshotWire,
+    ) {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let original = state.private_config().expect("private config").entry;
+        let target = EntryConfig {
+            host: "127.0.0.1".into(),
+            port: original.port.saturating_add(201),
+        };
+        let original_proxy = recovery_proxy(32_001);
+        let desired_proxy = recovery_proxy(32_002);
+        (
+            directory,
+            state,
+            original,
+            target,
+            original_proxy,
+            desired_proxy,
+        )
+    }
+
+    fn commit_recovery_target(state: &AppState, target: &EntryConfig) {
+        let mut config = state.private_config().expect("private config");
+        config.entry = target.clone();
+        config
+            .save(state.private_config_path_for_test())
+            .expect("commit target entry");
+    }
+
+    #[test]
+    fn entry_switch_journal_rollback_restores_only_transaction_owned_proxy() {
+        let (_directory, state, original, target, original_proxy, desired_proxy) =
+            entry_switch_recovery_fixture();
+        state
+            .prepare_entry_switch_runtime_journal(
+                original,
+                target,
+                Some(original_proxy.clone()),
+                Some(desired_proxy.clone()),
+            )
+            .expect("journal");
+        let apply_count = AtomicUsize::new(0);
+        recover_entry_switch_runtime_journal_with(
+            &state.runtime_directory,
+            &state.private_config_path,
+            || Ok(desired_proxy.clone()),
+            |expected, replacement| {
+                assert!(expected == &desired_proxy);
+                assert!(replacement == &original_proxy);
+                apply_count.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+        )
+        .expect("owned proxy rollback");
+        assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+        assert!(!entry_switch_runtime_journal_path(&state.runtime_directory).exists());
+    }
+
+    #[test]
+    fn entry_switch_journal_rollback_preserves_third_party_proxy() {
+        let (_directory, state, original, target, original_proxy, desired_proxy) =
+            entry_switch_recovery_fixture();
+        state
+            .prepare_entry_switch_runtime_journal(
+                original,
+                target,
+                Some(original_proxy),
+                Some(desired_proxy),
+            )
+            .expect("journal");
+        let apply_count = AtomicUsize::new(0);
+        recover_entry_switch_runtime_journal_with(
+            &state.runtime_directory,
+            &state.private_config_path,
+            || Ok(recovery_proxy(32_003)),
+            |_, _| {
+                apply_count.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            },
+        )
+        .expect("preserve concurrent proxy");
+        assert_eq!(apply_count.load(Ordering::SeqCst), 0);
+        assert!(!entry_switch_runtime_journal_path(&state.runtime_directory).exists());
+    }
+
+    #[test]
+    fn entry_switch_journal_accepts_only_committed_proxy_phase_and_value() {
+        let (_directory, state, original, target, original_proxy, desired_proxy) =
+            entry_switch_recovery_fixture();
+        let mut journal = state
+            .prepare_entry_switch_runtime_journal(
+                original,
+                target.clone(),
+                Some(original_proxy),
+                Some(desired_proxy.clone()),
+            )
+            .expect("journal");
+        state
+            .set_entry_switch_runtime_phase(&mut journal, EntrySwitchRuntimePhase::ProxyApplied)
+            .expect("phase");
+        commit_recovery_target(&state, &target);
+        recover_entry_switch_runtime_journal_with(
+            &state.runtime_directory,
+            &state.private_config_path,
+            || Ok(desired_proxy.clone()),
+            |_, _| panic!("committed target must not rewrite proxy"),
+        )
+        .expect("committed recovery");
+        assert!(!entry_switch_runtime_journal_path(&state.runtime_directory).exists());
+    }
+
+    #[test]
+    fn entry_switch_journal_retains_phase_or_proxy_conflicts() {
+        for conflict in ["phase", "proxy"] {
+            let (_directory, state, original, target, original_proxy, desired_proxy) =
+                entry_switch_recovery_fixture();
+            let mut journal = state
+                .prepare_entry_switch_runtime_journal(
+                    original,
+                    target.clone(),
+                    Some(original_proxy.clone()),
+                    Some(desired_proxy.clone()),
+                )
+                .expect("journal");
+            let phase = if conflict == "phase" {
+                EntrySwitchRuntimePhase::SettingsPending
+            } else {
+                EntrySwitchRuntimePhase::ProxyApplied
+            };
+            state
+                .set_entry_switch_runtime_phase(&mut journal, phase)
+                .expect("phase");
+            commit_recovery_target(&state, &target);
+            let observed = if conflict == "phase" {
+                desired_proxy.clone()
+            } else {
+                recovery_proxy(32_003)
+            };
+            let error = recover_entry_switch_runtime_journal_with(
+                &state.runtime_directory,
+                &state.private_config_path,
+                || Ok(observed.clone()),
+                |_, _| panic!("conflict must not rewrite proxy"),
+            )
+            .expect_err("conflict must remain recoverable");
+            assert!(error.contains("不一致") || error.contains("不是本事务"));
+            assert!(entry_switch_runtime_journal_path(&state.runtime_directory).exists());
+        }
+    }
+
+    #[test]
+    fn entry_switch_journal_retains_third_entry_and_corrupt_copies() {
+        let (_directory, state, original, target, original_proxy, desired_proxy) =
+            entry_switch_recovery_fixture();
+        state
+            .prepare_entry_switch_runtime_journal(
+                original,
+                target.clone(),
+                Some(original_proxy),
+                Some(desired_proxy),
+            )
+            .expect("journal");
+        commit_recovery_target(
+            &state,
+            &EntryConfig {
+                host: "127.0.0.1".into(),
+                port: target.port.saturating_add(1),
+            },
+        );
+        assert!(
+            recover_entry_switch_runtime_journal_with(
+                &state.runtime_directory,
+                &state.private_config_path,
+                || panic!("third entry must fail before proxy query"),
+                |_, _| panic!("third entry must not rewrite proxy"),
+            )
+            .is_err()
+        );
+        assert!(entry_switch_runtime_journal_path(&state.runtime_directory).exists());
+
+        fs::write(
+            entry_switch_runtime_journal_path(&state.runtime_directory),
+            b"corrupt-primary",
+        )
+        .expect("corrupt primary");
+        fs::write(
+            entry_switch_runtime_journal_backup_path(&state.runtime_directory),
+            b"corrupt-backup",
+        )
+        .expect("corrupt backup");
+        assert!(
+            recover_entry_switch_runtime_journal_with(
+                &state.runtime_directory,
+                &state.private_config_path,
+                || panic!("corrupt journal must fail before proxy query"),
+                |_, _| panic!("corrupt journal must not rewrite proxy"),
+            )
+            .is_err()
+        );
+        assert!(entry_switch_runtime_journal_path(&state.runtime_directory).exists());
+        assert!(entry_switch_runtime_journal_backup_path(&state.runtime_directory).exists());
+    }
+
+    #[test]
+    fn entry_switch_authorization_comparison_is_length_bound_and_exact() {
+        assert!(authorization_matches("abcd", "abcd"));
+        assert!(!authorization_matches("abcd", "abce"));
+        assert!(!authorization_matches("abcd", "abc"));
     }
 }

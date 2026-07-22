@@ -20,9 +20,10 @@ use vpn_hub_core::{
 use vpn_hub_helper::{AuthorityFileGuard, InstallationReference, SupervisorAuthority};
 use vpn_hub_windows_security::{
     ProtectedPathPolicy, WinInetLanProxySnapshot, current_interactive_session_scope,
-    open_current_user_mutable_directory, open_current_user_mutable_file, protect_current_user_data,
-    query_current_user_default_lan_proxy, set_current_user_default_lan_proxy,
-    unprotect_current_user_data, validate_protected_installation,
+    current_process_user_sid, open_current_user_mutable_directory, open_current_user_mutable_file,
+    protect_current_user_data, query_current_user_default_lan_proxy,
+    set_current_user_default_lan_proxy, unprotect_current_user_data,
+    validate_protected_installation,
 };
 
 const PROXY_TYPE_DIRECT: u32 = 1;
@@ -108,9 +109,8 @@ impl From<WinInetLanProxySnapshot> for ProtectedProxySnapshotWire {
 pub(crate) fn current_interactive_user_scope() -> Result<InteractiveUserLanScopeEvidence, String> {
     let scope = current_interactive_session_scope()
         .map_err(|_| "无法确认当前 Windows 交互会话或 RAS/VPN 范围".to_string())?;
-    let username = std::env::var("USERNAME").map_err(|_| "无法确定当前交互用户".to_string())?;
-    let sid = vpn_hub_windows_security::lookup_local_account_sid(&username)
-        .map_err(|_| "无法确认当前交互用户 SID".to_string())?
+    let sid = current_process_user_sid()
+        .map_err(|_| "无法从当前进程 token 确认交互用户 SID".to_string())?
         .to_ascii_lowercase();
     Ok(InteractiveUserLanScopeEvidence {
         interactive_user_scope_id: sid,
@@ -138,6 +138,9 @@ pub(crate) fn compare_then_apply_proxy(
 ) -> Result<bool, String> {
     expected.validate()?;
     replacement.validate()?;
+    let evidence = current_interactive_user_scope()?;
+    let _scope = WinInetUserProxyAdapter::from_scope(evidence)
+        .map_err(|_| "写入前 Windows 会话或 RAS/VPN 范围已变化，拒绝应用系统代理".to_string())?;
     let observed = query_current_user_default_lan_proxy()
         .map(ProtectedProxySnapshotWire::from)
         .map_err(|_| "无法重新读取当前用户的 Windows 系统代理".to_string())?;
