@@ -2,7 +2,7 @@
 
 状态：Accepted
 
-日期：2026-07-18
+日期：2026-07-18（最近更新：2026-07-22）
 
 以下决策已经 Review，除非后续兼容性验证给出相反证据，否则实现按此执行。
 
@@ -19,7 +19,8 @@
 | D-009 | 历史数据只记录出口质量和状态 | 不采集域名、URL、目标 IP 或用户流量内容 |
 | D-010 | 先通过 Phase 0 再进入正式开发 | 端口可修改和并行运行是方案成立的硬门槛 |
 | D-011 | 运行中设置重载只允许停止可同时证明 PID、Supervisor authority 与 Controller ownership 的自管核心；配置在首次 Guardian 权威回读前保持可回滚 | 防止误停第三方进程，并确保提交后启动失败不会把无效配置提升为最后有效配置 |
-| D-012 | 配置生效只等待本地 runtime、入口、Controller ownership 与双 `REJECT` 回读；provider 和 Guardian 健康确认在提交后异步进行 | 把安全提交与不可控外部网络延迟解耦，同时在连接未确认时继续 Fail Closed |
+| D-012 | 主界面只暴露当前可完成的核心任务；手动外部 UDP 验证退出总览，不可用 TUN 退出设置页，活动出口安全选择只在删除或停用动作中出现 | 降低普通用户理解成本，同时保留 UDP `unknown/tcp_only → REJECT`、替代出口和 Fail Closed 的底层安全边界 |
+| D-013 | 配置生效只等待本地 runtime、入口、Controller ownership 与双 `REJECT` 回读；provider 和 Guardian 健康确认在提交后异步进行 | 把安全提交与不可控外部网络延迟解耦，同时在连接未确认时继续 Fail Closed |
 
 ## 默认检测参数
 

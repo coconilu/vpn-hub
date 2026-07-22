@@ -8,8 +8,11 @@ import {
   continueAfterPreviewIfCurrent,
   createOutletId,
   dispatchOneShotSettingsApply,
+  enabledReplacementOutlets,
+  FAIL_CLOSED_OUTLET_CHOICE,
   isCurrentPreviewResponse,
   moveItem,
+  requiresActiveOutletDecision,
   settingsPreviewOutcome,
   settingsRequestFingerprint,
   settingsValidationTargetIds,
@@ -67,6 +70,34 @@ test("reordering and renaming do not regenerate stable outlet ids", () => {
 
 test("generated ids stay within the core stable-id alphabet", () => {
   assert.equal(createOutletId("subscription", "A1B2-C3D4_E5F6"), "subscription-a1b2c3d4e5f6");
+});
+
+test("active outlet decisions expose only enabled alternatives and require one safe disposition", () => {
+  const routingDraft = {
+    outlets: [
+      { outlet_id: "current", enabled: true },
+      { outlet_id: "enabled", enabled: true },
+      { outlet_id: "disabled", enabled: false },
+    ],
+  };
+  assert.deepEqual(
+    enabledReplacementOutlets(routingDraft, "current").map((outlet) => outlet.outlet_id),
+    ["enabled"],
+  );
+  assert.equal(requiresActiveOutletDecision(routingDraft, "current", null, false), false);
+
+  const disabledCurrent = {
+    ...routingDraft,
+    outlets: routingDraft.outlets.map((outlet) => outlet.outlet_id === "current"
+      ? { ...outlet, enabled: false }
+      : outlet),
+  };
+  assert.equal(requiresActiveOutletDecision(disabledCurrent, "current", null, false), true);
+  assert.equal(requiresActiveOutletDecision(disabledCurrent, "current", "disabled", false), true);
+  assert.equal(requiresActiveOutletDecision(disabledCurrent, "current", "enabled", false), false);
+  assert.equal(requiresActiveOutletDecision(disabledCurrent, "current", null, true), false);
+  assert.equal(requiresActiveOutletDecision(disabledCurrent, "current", "enabled", true), true);
+  assert.equal(FAIL_CLOSED_OUTLET_CHOICE, "__fail_closed__");
 });
 
 const draft = { entry: { host: "127.0.0.1", port: 3666 }, outlets: [{ outlet_id: "sub-a" }] };
@@ -164,12 +195,31 @@ test("entry switching preserves dirty drafts and resyncs committed recovery-pend
   assert.equal(source.includes("setFailClosed(false)"), true);
 });
 
-test("unsupported TUN stays visibly off and cannot record consent", () => {
+test("low-frequency UDP and unavailable TUN controls leave the primary product surface", () => {
+  const settingsSource = fs.readFileSync(new URL("../SettingsPage.tsx", import.meta.url), "utf8");
+  const dashboardSource = fs.readFileSync(new URL("../Dashboard.tsx", import.meta.url), "utf8");
+  const bridgeSource = fs.readFileSync(new URL("bridge.ts", import.meta.url), "utf8");
+  assert.equal(settingsSource.includes("可选 TUN（当前不可用）"), false);
+  assert.equal(settingsSource.includes("windows_verified_application_identity_exclusion_unavailable"), false);
+  assert.equal(settingsSource.includes("tun_plan"), false);
+  assert.equal(dashboardSource.includes("订阅 UDP 端到端验证"), false);
+  assert.equal(dashboardSource.includes("受控 UDP 目标"), false);
+  assert.equal(bridgeSource.includes("revalidateUdpCapabilities"), false);
+});
+
+test("active outlet removal and disable share one contextual fail-closed decision", () => {
   const source = fs.readFileSync(new URL("../SettingsPage.tsx", import.meta.url), "utf8");
-  assert.equal(source.includes("checked={false} disabled aria-describedby=\"tun-unavailable-reason\" />启用 TUN"), true);
-  assert.equal(source.includes("checked={false} disabled aria-describedby=\"tun-unavailable-reason\" />我已理解"), true);
-  assert.equal(source.includes("windows_verified_application_identity_exclusion_unavailable"), true);
-  assert.equal(source.includes("missing_executable_identity_outlet_ids"), true);
+  assert.equal(source.includes("删除当前出口的安全选择"), false);
+  assert.equal(source.includes('role="presentation"'), true);
+  assert.equal(source.includes('aria-modal="true"'), true);
+  assert.equal(source.includes('aria-labelledby="outlet-decision-title"'), true);
+  assert.equal(source.includes('name="active-outlet-disposition"'), true);
+  assert.equal(source.includes("handleOutletDecisionKeyDown"), true);
+  assert.equal(source.includes('event.key !== "Tab"'), true);
+  assert.equal(source.includes("requestOutletRemoval(index, event.currentTarget)"), true);
+  assert.equal(source.includes("requestOutletEnabledChange(index, event.target.checked, event.currentTarget)"), true);
+  assert.equal(source.includes("应用绝不会自动转为 DIRECT"), true);
+  assert.equal(source.includes("requestAnimationFrame(() => trigger?.focus())"), true);
 });
 
 test("managed-core reload exposes hot reload fallback and slow-operation cancellation", () => {

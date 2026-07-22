@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, Eye, Gauge, KeyRound, ListOrdered, Plus, RadioTower, Route, Save, ShieldAlert, ShieldCheck, Square, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { ArrowDown, ArrowUp, Eye, Gauge, KeyRound, ListOrdered, Plus, Route, Save, ShieldAlert, ShieldCheck, Square, Trash2 } from "lucide-react";
 import { applyEntrySwitch, applySettings, cancelForegroundOperation, getForegroundOperationStatus, getSettings, getSettingsTerminalStatus, previewEntrySwitch, previewSettings, recoverSettingsTerminal } from "./lib/bridge";
 import {
   buildSettingsPreviewRequest,
@@ -7,8 +7,11 @@ import {
   continueAfterPreviewIfCurrent,
   createOutletId,
   dispatchOneShotSettingsApply,
+  enabledReplacementOutlets,
+  FAIL_CLOSED_OUTLET_CHOICE,
   isCurrentPreviewResponse,
   moveItem,
+  requiresActiveOutletDecision,
   settingsPreviewOutcome,
   settingsValidationTargetIds,
 } from "./lib/settingsModel";
@@ -16,8 +19,9 @@ import { buildEntrySwitchFoundationPreview } from "./lib/entrySwitchModel";
 import type { CredentialState, LocalProxyProtocol, SafeSettingsView, SettingsDraft, SettingsOutlet, SettingsPreview, SettingsTerminalStatus } from "./types";
 
 interface Props { currentOutletId: string | null; onApplied: () => Promise<void>; onNotice: (message: string) => void }
-type PageState = "loading" | "clean" | "dirty" | "checking" | "preview" | "applying" | "success" | "error";
+type PageState = "loading" | "clean" | "dirty" | "checking" | "preview" | "confirm_reload" | "applying" | "success" | "error";
 type UiOperation = { id: string; generation: number; cancelled: boolean; backendStarted: boolean };
+type PendingOutletAction = { kind: "remove" | "disable" | "resolve"; outletId: string; label: string };
 const backendStageLabel = {
   validating: "正在校验配置",
   applying: "正在写入候选配置",
@@ -37,6 +41,8 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const [credentialIntentById, setCredentialIntentById] = useState<Record<string, "set" | "delete">>({});
   const [replacement, setReplacement] = useState<string | null>(null);
   const [failClosed, setFailClosed] = useState(false);
+  const [pendingOutletAction, setPendingOutletAction] = useState<PendingOutletAction | null>(null);
+  const [pendingRouteChoice, setPendingRouteChoice] = useState("");
   const [entrySwitchConfirmed, setEntrySwitchConfirmed] = useState(false);
   const [applySystemProxy, setApplySystemProxy] = useState(false);
   const [entrySwitchTarget, setEntrySwitchTarget] = useState<{ host: string; port: number } | null>(null);
@@ -48,6 +54,9 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const [cancelRequested, setCancelRequested] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const errorRef = useRef<HTMLDivElement>(null);
+  const outletDecisionDialogRef = useRef<HTMLDialogElement>(null);
+  const outletDecisionHeadingRef = useRef<HTMLHeadingElement>(null);
+  const outletDecisionTriggerRef = useRef<HTMLElement | null>(null);
   const credentialInputs = useRef(new Map<string, HTMLInputElement>());
   const previewGeneration = useRef(0);
   const operationInFlight = useRef(false);
@@ -94,6 +103,11 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     const timer = window.setInterval(() => void poll(), 200);
     return () => { disposed = true; window.clearInterval(timer); };
   }, [activeOperationId]);
+  useEffect(() => {
+    if (!pendingOutletAction) return undefined;
+    const frame = requestAnimationFrame(() => outletDecisionHeadingRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [pendingOutletAction]);
 
   const beginUiOperation = (): UiOperation => {
     const generation = ++operationGeneration.current;
@@ -133,15 +147,124 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     const count = draft?.outlets.filter((outlet) => outlet.kind === "local_proxy").length ?? 0;
     changeDraft((current) => ({ ...current, outlets: [...current.outlets, { kind: "local_proxy", outlet_id: createOutletId("local"), label: "新本地出口", enabled: true, protocol: "socks5h", host: "127.0.0.1", port: 2666 + count }] }));
   };
-  const removeOutlet = (index: number) => {
-    const id = draft?.outlets[index]?.outlet_id; if (!id) return;
+  const applyOutletRemoval = (id: string, routeChoice?: string) => {
     const input = credentialInputs.current.get(id); if (input) input.value = ""; credentialInputs.current.delete(id);
     setCredentialIntentById((current) => { const next = { ...current }; delete next[id]; return next; });
-    changeDraft((current) => ({ ...current, manual_outlet: current.manual_outlet === id ? null : current.manual_outlet, outlets: current.outlets.filter((_, itemIndex) => itemIndex !== index) }));
+    changeDraft((current) => ({
+      ...current,
+      manual_outlet: current.manual_outlet === id && routeChoice !== FAIL_CLOSED_OUTLET_CHOICE
+        ? routeChoice ?? null
+        : current.manual_outlet === id ? null : current.manual_outlet,
+      outlets: current.outlets.filter((outlet) => outlet.outlet_id !== id),
+    }));
+  };
+  const applyOutletDisable = (id: string, routeChoice?: string) => {
+    changeDraft((current) => ({
+      ...current,
+      manual_outlet: current.manual_outlet === id && routeChoice !== FAIL_CLOSED_OUTLET_CHOICE
+        ? routeChoice ?? null
+        : current.manual_outlet === id ? null : current.manual_outlet,
+      outlets: current.outlets.map((outlet) => outlet.outlet_id === id
+        ? { ...outlet, enabled: false }
+        : outlet),
+    }));
+  };
+  const openOutletDecision = (action: PendingOutletAction, trigger: HTMLElement | null) => {
+    outletDecisionTriggerRef.current = trigger;
+    const replacementStillAvailable = draft && replacement
+      ? enabledReplacementOutlets(draft, currentOutletId)
+        .some((outlet) => outlet.outlet_id === replacement)
+      : false;
+    setPendingRouteChoice(failClosed
+      ? FAIL_CLOSED_OUTLET_CHOICE
+      : replacementStillAvailable ? replacement ?? "" : "");
+    setPendingOutletAction(action);
+  };
+  const cancelOutletDecision = () => {
+    const trigger = outletDecisionTriggerRef.current;
+    setPendingOutletAction(null);
+    setPendingRouteChoice("");
+    outletDecisionTriggerRef.current = null;
+    requestAnimationFrame(() => trigger?.focus());
+  };
+  const handleOutletDecisionKeyDown = (event: KeyboardEvent<HTMLDialogElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelOutletDecision();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const dialog = outletDecisionDialogRef.current;
+    if (!dialog) return;
+    const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+    ));
+    if (focusable.length === 0) {
+      event.preventDefault();
+      return;
+    }
+    const active = document.activeElement;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && (active === first || !focusable.includes(active as HTMLElement))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && active === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+  const confirmOutletDecision = () => {
+    if (!pendingOutletAction || !pendingRouteChoice) return;
+    const routeChoice = pendingRouteChoice;
+    const nextFailClosed = routeChoice === FAIL_CLOSED_OUTLET_CHOICE;
+    setReplacement(nextFailClosed ? null : routeChoice);
+    setFailClosed(nextFailClosed);
+    if (pendingOutletAction.kind === "remove") {
+      applyOutletRemoval(pendingOutletAction.outletId, routeChoice);
+    } else if (pendingOutletAction.kind === "disable") {
+      applyOutletDisable(pendingOutletAction.outletId, routeChoice);
+    } else {
+      invalidatePreview();
+    }
+    setPendingOutletAction(null);
+    setPendingRouteChoice("");
+    outletDecisionTriggerRef.current = null;
+    requestAnimationFrame(() => document.getElementById("settings-outlets")?.focus());
+  };
+  const requestOutletRemoval = (index: number, trigger: HTMLElement) => {
+    const outlet = draft?.outlets[index]; if (!outlet) return;
+    if (outlet.outlet_id === currentOutletId) {
+      openOutletDecision({ kind: "remove", outletId: outlet.outlet_id, label: outlet.label }, trigger);
+      return;
+    }
+    applyOutletRemoval(outlet.outlet_id);
+  };
+  const requestOutletEnabledChange = (index: number, enabled: boolean, trigger: HTMLElement) => {
+    const outlet = draft?.outlets[index]; if (!outlet) return;
+    if (!enabled && outlet.outlet_id === currentOutletId) {
+      openOutletDecision({ kind: "disable", outletId: outlet.outlet_id, label: outlet.label }, trigger);
+      return;
+    }
+    if (enabled && outlet.outlet_id === currentOutletId) {
+      setReplacement(null);
+      setFailClosed(false);
+    }
+    updateOutlet(index, (current) => ({ ...current, enabled }));
+  };
+  const ensureActiveOutletDecision = () => {
+    if (!draft || !requiresActiveOutletDecision(draft, currentOutletId, replacement, failClosed)) return true;
+    const original = view?.draft.outlets.find((outlet) => outlet.outlet_id === currentOutletId);
+    openOutletDecision({
+      kind: "resolve",
+      outletId: currentOutletId ?? "",
+      label: original?.label ?? currentOutletId ?? "当前出口",
+    }, document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    return false;
   };
 
   const requestCurrentPreview = async (operation?: UiOperation) => {
-    if (!draft) return null;
+    if (!draft || !ensureActiveOutletDecision()) return null;
     const request = buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById);
     const generation = ++previewGeneration.current;
     setOperationStage("正在校验配置"); setPageState("checking"); setError(null);
@@ -346,6 +469,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   );
   const statusById = new Map(view.credentials.map((status) => [status.subscription_id, status.state]));
   const enabledOutlets = draft.outlets.filter((outlet) => outlet.enabled);
+  const outletDecisionCandidates = enabledReplacementOutlets(draft, currentOutletId);
   const currentRequest = buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById);
   const previewMatches = preview?.request_fingerprint === currentRequest.request_fingerprint;
   const busy = pageState === "checking" || pageState === "applying";
@@ -424,6 +548,63 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
           <p className="settings-action-reason" id="settings-action-reason">{actionReason}</p>
         </div>
       </header>
+
+      {pendingOutletAction && (
+        <div className="outlet-decision-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) cancelOutletDecision(); }}>
+          <dialog
+            ref={outletDecisionDialogRef}
+            className="outlet-decision-dialog"
+            open
+            aria-modal="true"
+            aria-labelledby="outlet-decision-title"
+            aria-describedby="outlet-decision-description"
+            onKeyDown={handleOutletDecisionKeyDown}
+          >
+            <div className="outlet-decision-title">
+              <ShieldAlert aria-hidden="true" />
+              <div>
+                <h2 id="outlet-decision-title" ref={outletDecisionHeadingRef} tabIndex={-1}>
+                  {pendingOutletAction.kind === "remove" ? "删除当前出口" : pendingOutletAction.kind === "disable" ? "停用当前出口" : "确认当前出口的安全去向"}
+                </h2>
+                <p id="outlet-decision-description">
+                  当前流量正在使用“{pendingOutletAction.label}”。请选择接替出口，或明确停止代理连接；应用绝不会自动转为 DIRECT。
+                </p>
+              </div>
+            </div>
+            <fieldset className="outlet-decision-options">
+              <legend>应用变更后的安全去向</legend>
+              {outletDecisionCandidates.map((outlet) => (
+                <label key={outlet.outlet_id}>
+                  <input
+                    type="radio"
+                    name="active-outlet-disposition"
+                    value={outlet.outlet_id}
+                    checked={pendingRouteChoice === outlet.outlet_id}
+                    onChange={(event) => setPendingRouteChoice(event.target.value)}
+                  />
+                  <span><strong>切换到 {outlet.label}</strong><small>继续通过这个已启用出口连接</small></span>
+                </label>
+              ))}
+              <label className="is-fail-closed">
+                <input
+                  type="radio"
+                  name="active-outlet-disposition"
+                  value={FAIL_CLOSED_OUTLET_CHOICE}
+                  checked={pendingRouteChoice === FAIL_CLOSED_OUTLET_CHOICE}
+                  onChange={(event) => setPendingRouteChoice(event.target.value)}
+                />
+                <span><strong>停止代理连接</strong><small>进入 Fail Closed 并拒绝流量，绝不直连</small></span>
+              </label>
+            </fieldset>
+            <div className="outlet-decision-actions">
+              <button className="secondary-button" type="button" onClick={cancelOutletDecision}>取消</button>
+              <button className="primary-button" type="button" disabled={!pendingRouteChoice} onClick={confirmOutletDecision}>
+                {pendingOutletAction.kind === "remove" ? "确认删除" : pendingOutletAction.kind === "disable" ? "确认停用" : "确认安全去向"}
+              </button>
+            </div>
+          </dialog>
+        </div>
+      )}
 
       {terminalStatus.active && (
         <section className="settings-error" role="alert" aria-label="terminal Fail Closed 安全门">
@@ -517,9 +698,9 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
                 <div className="outlet-head">
                   <label className="field outlet-name-field"><span>名称</span><input {...validationAttributes(`outlets.${outlet.outlet_id}.label`)} value={outlet.label} onChange={(event) => updateOutlet(index, (current) => ({ ...current, label: event.target.value }))} /></label>
                   <span className={`kind-badge ${outlet.kind === "subscription" ? "is-subscription" : "is-local"}`}>{outlet.kind === "subscription" ? "订阅" : "本地"}</span>
-                  <label className="check-field"><input type="checkbox" checked={outlet.enabled} onChange={(event) => updateOutlet(index, (current) => ({ ...current, enabled: event.target.checked }))} />启用</label>
+                  <label className="check-field"><input type="checkbox" checked={outlet.enabled} onChange={(event) => requestOutletEnabledChange(index, event.target.checked, event.currentTarget)} />启用</label>
                   <code className="outlet-id" title="稳定出口 ID">{outlet.outlet_id}</code>
-                  <button className="outlet-delete" type="button" aria-label={`删除 ${outlet.label}`} onClick={() => removeOutlet(index)}><Trash2 /></button>
+                  <button className="outlet-delete" type="button" aria-label={`删除 ${outlet.label}`} onClick={(event) => requestOutletRemoval(index, event.currentTarget)}><Trash2 /></button>
                 </div>
                 {outlet.kind === "subscription" ? (
                   <div className="outlet-detail">
@@ -629,51 +810,6 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
         <button className="primary-button" type="button" disabled={entrySwitchUnavailable} aria-disabled={entrySwitchUnavailable} aria-describedby="entry-switch-unavailable" onClick={() => void runEntrySwitch()}>{busy ? "正在安全切换…" : "执行安全切换"}</button>
       </section>
 
-      <section className="settings-card safety-card">
-        <div className="card-head">
-          <div className="card-title">
-            <ShieldAlert aria-hidden="true" />
-            <div>
-              <h2>删除当前出口的安全选择</h2>
-              <p>当前出口：{currentOutletId ?? "无（Fail Closed）"}。删除或停用当前出口时请选择替代项，或明确保持 Fail Closed。</p>
-            </div>
-          </div>
-        </div>
-        <div className="replacement-row">
-          <label className="field replacement-field">
-            <span>替代出口</span>
-            <select value={replacement ?? ""} onChange={(event) => { setReplacement(event.target.value || null); invalidatePreview(); }}>
-              <option value="">未选择</option>
-              {enabledOutlets.map((outlet) => <option key={outlet.outlet_id} value={outlet.outlet_id}>{outlet.label}</option>)}
-            </select>
-          </label>
-          <label className="check-field"><input type="checkbox" checked={failClosed} onChange={(event) => { setFailClosed(event.target.checked); invalidatePreview(); }} />没有替代项时明确进入 Fail Closed（绝不 DIRECT）</label>
-        </div>
-      </section>
-
-      <section className="settings-card tun-card" aria-label="TUN 能力与风险确认">
-        <div className="card-head">
-          <div className="card-title">
-            <RadioTower aria-hidden="true" />
-            <div>
-              <h2>可选 TUN（当前不可用）</h2>
-              <p>默认关闭。当前 Windows 后端尚不能证明按可执行文件身份排除，因此不会启用 TUN、修改路由/DNS/适配器，也不会记录风险确认。</p>
-            </div>
-          </div>
-        </div>
-        <div className="safety-checks">
-          <label className="check-field"><input type="checkbox" checked={false} disabled aria-describedby="tun-unavailable-reason" />启用 TUN</label>
-          <label className="check-field"><input type="checkbox" checked={false} disabled aria-describedby="tun-unavailable-reason" />我已理解断网、DNS 泄漏与递归代理风险</label>
-        </div>
-        <p className="tun-reason" id="tun-unavailable-reason">当前不可用：<code>{preview?.tun_plan.reason_code ?? "windows_verified_application_identity_exclusion_unavailable"}</code></p>
-        {preview && (
-          <div className="tun-plan" role="status" aria-live="polite">
-            <p>计划 generation：<code>{preview.tun_plan.generation}</code>；订阅出口 {preview.tun_plan.subscription_outlet_ids.length} 个，本地客户端出口 {preview.tun_plan.local_outlet_ids.length} 个。</p>
-            {preview.tun_plan.missing_executable_identity_outlet_ids.length > 0 && <p>缺少经校验的本地客户端可执行身份：<code>{preview.tun_plan.missing_executable_identity_outlet_ids.join(", ")}</code>。能力就绪前保持 Fail Closed。</p>}
-            <p>GUI/Helper 仅允许 loopback 控制面且外网拒绝；Core 仅限自有上游；登记的本地客户端仅允许最小基础设施 bypass。IPv4/IPv6 × TCP/UDP/DNS 当前全部拒绝直连。</p>
-          </div>
-        )}
-      </section>
       </fieldset>
     </main>
   );

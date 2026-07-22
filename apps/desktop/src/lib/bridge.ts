@@ -226,14 +226,6 @@ export async function setRouteMode(mode: RouteMode, manualOutlet: string | null)
   return invoke<DashboardSnapshot>("set_route_mode", { mode, manualOutlet });
 }
 
-export async function revalidateUdpCapabilities(authorizedSubscriptionTargets: string[]): Promise<DashboardSnapshot> {
-  if (!isTauriRuntime()) {
-    browserSnapshot = { ...browserSnapshot, updated_at: new Date().toISOString() };
-    return structuredClone(browserSnapshot);
-  }
-  return invoke<DashboardSnapshot>("revalidate_udp_capabilities", { authorizedSubscriptionTargets });
-}
-
 export async function getHistory(filter: HistoryFilter): Promise<HistoryResponse> {
   if (!isTauriRuntime()) {
     return {
@@ -539,27 +531,6 @@ export async function previewSettings(request: SettingsPreviewRequest): Promise<
         && browserSnapshot.mihomo.pid !== null
         && diff.changes.some((change) => change.impact === "managed_core_reload"),
       request_fingerprint: fingerprint,
-      tun_plan: {
-        requested_enabled: false,
-        active: false,
-        supported: false,
-        consent_required: true,
-        reason_code: "windows_verified_application_identity_exclusion_unavailable",
-        generation: fingerprint,
-        subscription_outlet_ids: draft.outlets
-          .filter((outlet) => outlet.enabled && outlet.kind === "subscription")
-          .map((outlet) => outlet.outlet_id),
-        local_outlet_ids: draft.outlets
-          .filter((outlet) => outlet.enabled && outlet.kind === "local_proxy")
-          .map((outlet) => outlet.outlet_id),
-        missing_executable_identity_outlet_ids: draft.outlets
-          .filter((outlet) => outlet.enabled && outlet.kind === "local_proxy")
-          .map((outlet) => outlet.outlet_id),
-        control_plane_policy: "deny_external_egress_loopback_ipc_only",
-        core_policy: "owned_upstream_only",
-        local_outlet_policy: "registered_executable_identity_only",
-        leak_matrix_disposition: "fail_closed_reject",
-      },
     };
     browserSettingsPreviewTicket = result.can_apply ? fingerprint : null;
     return result;
