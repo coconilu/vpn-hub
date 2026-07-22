@@ -11,6 +11,28 @@ export function createOutletId(kind, randomId = crypto.randomUUID()) {
   return `${kind}-${randomId.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 12)}`;
 }
 
+export const FAIL_CLOSED_OUTLET_CHOICE = "__fail_closed__";
+
+export function enabledReplacementOutlets(draft, currentOutletId) {
+  return draft.outlets.filter((outlet) => outlet.enabled
+    && outlet.outlet_id !== currentOutletId);
+}
+
+export function requiresActiveOutletDecision(
+  draft,
+  currentOutletId,
+  activeOutletReplacement,
+  failClosedOnRemovedActive,
+) {
+  if (!currentOutletId) return false;
+  const current = draft.outlets.find((outlet) => outlet.outlet_id === currentOutletId);
+  if (current?.enabled) return false;
+  const replacementValid = activeOutletReplacement !== null
+    && enabledReplacementOutlets(draft, currentOutletId)
+      .some((outlet) => outlet.outlet_id === activeOutletReplacement);
+  return replacementValid === failClosedOnRemovedActive;
+}
+
 export function credentialIntents(intentById) {
   return Object.entries(intentById)
     .filter(([, action]) => action === "set" || action === "delete")

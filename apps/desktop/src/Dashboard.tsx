@@ -1,5 +1,4 @@
-import { useState } from "react";
-import { LoaderCircle, Play, Radio, RefreshCw, Square, Waypoints } from "lucide-react";
+import { LoaderCircle, Play, RefreshCw, Square, Waypoints } from "lucide-react";
 import { EventTimeline } from "./components/EventTimeline";
 import { LatencyChart } from "./components/LatencyChart";
 import { OutletTable } from "./components/OutletTable";
@@ -13,7 +12,6 @@ interface DashboardProps {
   notice: string | null;
   onModeChange: (mode: RouteMode, manualOutlet: string | null) => void;
   onRefresh: () => void;
-  onUdpRevalidate: (authorizedSubscriptionTargets: string[]) => void;
   onCoreToggle: () => void;
 }
 
@@ -24,19 +22,11 @@ const formatUpdatedAt = (value: string) => new Intl.DateTimeFormat("zh-CN", {
   hour12: false,
 }).format(new Date(value));
 
-export function Dashboard({ snapshot, busy, notice, onModeChange, onRefresh, onUdpRevalidate, onCoreToggle }: DashboardProps) {
-  const [udpTargetsText, setUdpTargetsText] = useState("");
-  const [udpTargetsAuthorized, setUdpTargetsAuthorized] = useState(false);
+export function Dashboard({ snapshot, busy, notice, onModeChange, onRefresh, onCoreToggle }: DashboardProps) {
   const coreRunning = snapshot.mihomo.state === "running";
   const mode = snapshot.routing.mode;
   const selectableOutlets = snapshot.routing.outlets.filter((outlet) => outlet.enabled && outlet.configured);
   const manualOutlet = snapshot.routing.manual_outlet ?? selectableOutlets[0]?.outlet_id ?? "";
-  const udpTargets = udpTargetsText
-    .split(/[,，\n]/)
-    .map((target) => target.trim())
-    .filter(Boolean);
-  const requiresAuthorization = udpTargets.length > 0;
-
   return (
     <main className={`main-content ${busy ? "is-busy" : ""}`}>
       <header className="topbar">
@@ -53,52 +43,6 @@ export function Dashboard({ snapshot, busy, notice, onModeChange, onRefresh, onU
       </header>
       {notice && <div className="notice" role="status">{notice}</div>}
       <ProtectedBanner entry={snapshot.entry} />
-      <section className="panel-card udp-card" aria-label="UDP 能力验证">
-        <div className="panel-head">
-          <div className="panel-title">
-            <Radio aria-hidden="true" />
-            <div>
-              <h2>订阅 UDP 端到端验证</h2>
-              <p>可留空；订阅出口会保持未知。本地客户端仍使用应用自持回环目标验证。</p>
-            </div>
-          </div>
-        </div>
-        <div className="udp-form">
-          <label className="udp-target-field">
-            <span>受控 UDP 目标</span>
-            <input
-              aria-label="受控 UDP 目标"
-              value={udpTargetsText}
-              onChange={(event) => {
-                setUdpTargetsText(event.target.value);
-                setUdpTargetsAuthorized(false);
-              }}
-              placeholder="两个或更多 IP:端口，以逗号分隔"
-              autoComplete="off"
-              spellCheck={false}
-            />
-          </label>
-          <label className="udp-auth">
-            <input
-              type="checkbox"
-              checked={udpTargetsAuthorized}
-              disabled={!requiresAuthorization}
-              onChange={(event) => setUdpTargetsAuthorized(event.target.checked)}
-            />
-            <span>我确认有权测试这些目标</span>
-          </label>
-          <button
-            className="secondary-button"
-            onClick={() => onUdpRevalidate(udpTargetsAuthorized ? udpTargets : [])}
-            disabled={busy || coreRunning || (requiresAuthorization && !udpTargetsAuthorized)}
-            type="button"
-            title="目标只发送给后端执行本次探测，不保存探测目标或结果包"
-          >
-            验证 UDP
-          </button>
-        </div>
-      </section>
-
       <section className="panel-card mode-card" aria-labelledby="mode-title">
         <div className="panel-head">
           <div className="panel-title">

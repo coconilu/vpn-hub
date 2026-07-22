@@ -2,6 +2,9 @@ import type { CredentialMutation, CredentialMutationIntent, SettingsApplyRequest
 
 export function moveItem(items: SettingsOutlet[], index: number, direction: -1 | 1): SettingsOutlet[];
 export function createOutletId(kind: "subscription" | "local", randomId?: string): string;
+export const FAIL_CLOSED_OUTLET_CHOICE: "__fail_closed__";
+export function enabledReplacementOutlets(draft: SettingsDraft, currentOutletId: string | null): SettingsOutlet[];
+export function requiresActiveOutletDecision(draft: SettingsDraft, currentOutletId: string | null, activeOutletReplacement: string | null, failClosedOnRemovedActive: boolean): boolean;
 export type CredentialIntentAction = "set" | "delete";
 export function credentialIntents(intentById: Record<string, CredentialIntentAction>): CredentialMutationIntent[];
 export function settingsRequestFingerprint(draft: SettingsDraft, activeOutletReplacement: string | null, failClosedOnRemovedActive: boolean, intents: CredentialMutationIntent[]): string;

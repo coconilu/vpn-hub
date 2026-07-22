@@ -2,7 +2,7 @@
 
 ## 当前结论
 
-截至 2026-07-20，TUN 的计划、状态机、事务 journal、fake Windows backend 与桌面安全预览已经实现；生产 Windows adapter 只校验 typed plan，并明确返回 `windows_verified_application_identity_exclusion_unavailable`。当前开发机未创建 TUN、未修改路由/DNS/适配器/防火墙/WFP/注册表/系统代理，也未运行 Mihomo 或 Windows Service。
+截至 2026-07-22，TUN 的计划、状态机、事务 journal 与 fake Windows backend 已经实现；生产 Windows adapter 只校验 typed plan，仍明确拒绝执行。Issue #43 已从桌面设置页移除不可完成的 TUN 预览入口，但不删除这些 plan-only 基础。当前开发机未创建 TUN、未修改路由/DNS/适配器/防火墙/WFP/注册表/系统代理，也未运行 Mihomo 或 Windows Service。
 
 这不是“功能已真实接管系统”。它是一道刻意的安全门：只有独立隔离环境中的 Windows backend 能证明按应用身份排除、全协议防泄漏和可靠恢复后，才能把 `supported` 改为 true。
 
@@ -21,11 +21,11 @@
 | 条件 | 行为 |
 |---|---|
 | 默认安装/升级 | TUN 关闭；不弹 UAC、不改系统网络 |
-| 首次请求启用 | 必须确认当前版本风险；能力 unsupported 时确认控件禁用，且不会记录为已启用或已同意 |
+| 首次请求启用 | 当前桌面端不提供入口；未来重新引入前必须确认当前版本风险，能力 unsupported 时不得记录为已启用或已同意 |
 | 普通统一入口模式 | 与 TUN 计划相互独立；TUN 失败会恢复切换前 snapshot，不影响普通模式配置 |
 | 多个订阅出口 | 每个保留稳定 outlet ID；TUN plan 只保存脱敏后的 outlet ID 与 transport，凭据、订阅 URL、节点和 Controller secret 不进入 plan/journal/status |
 | 多个本地出口 | 每个必须有稳定 outlet ID、明确 loopback endpoint、用户登记的本地绝对 executable path 和 SHA-256 |
-| 动态增删 outlet | settings preview generation 随草稿指纹变化；计划只包含当前启用且登记的 outlet，不残留已删除身份 |
+| 动态增删 outlet | plan builder 只接受当前启用且登记的 outlet，不残留已删除身份；当前普通 settings preview 不再携带 TUN plan |
 | all-down | IPv4/IPv6 × TCP/UDP/DNS 全部 `Rejected`，不生成或回退 `DIRECT` |
 
 交易层只接受 `TunPlanBuilder` 产生的 opaque validated plan：原始策略字段私有，类型不实现 `Deserialize`，因此 IPC、journal 或其他不可信字节不能直接构造交易输入。Builder 同时保留不参与序列化的 canonical outlet provenance；每次进入 transaction/backend 前都会从 registry、local endpoint 与 exact executable rule 重建并比对。即使攻击者把 subscription 的 registry/eligible 或 local 的 declaration/endpoint/process/eligible 一起改到内部自洽，也会因不匹配 Builder provenance 被拒绝；该 provenance 是完整结构，不是可随字段一起替换的 hash。
@@ -80,7 +80,7 @@ journal 只允许长度受限的 opaque route/DNS/adapter/TUN record；单条、
 
 ## 已自动化验证
 
-- 默认关闭、当前版本风险确认、生产 unsupported Fail Closed。
+- 默认关闭、生产 unsupported Fail Closed；当前桌面端不暴露启用或风险确认控件。
 - 多 subscription / 多 local_proxy、动态删除/新增、stable ID 和 exact identity。
 - GUI/Helper deny、Core 最小上游、local client 精确基础设施 bypass、unknown process no-touch。
 - canonical outlet registry 与 TCP/UDP eligible subset 防篡改；本地 endpoint 和 executable identity 一一对应；plan 不含订阅 secret。
