@@ -24,9 +24,10 @@ use vpn_hub_core::{
 use crate::{
     lifecycle::{self, LifecycleEvent},
     runtime::{
-        AppState, CoreStatus, PortSnapshot, RoutingStatus, SettingsApplyRequest,
-        SettingsApplyResult, SettingsPreview, SettingsPreviewRequest, SettingsTerminalStatus,
-        SubscriptionNodeCatalog, SubscriptionNodeGroup,
+        AppState, CoreStatus, NodeLatencyBatchResult, NodeLatencyResult, PortSnapshot,
+        RoutingStatus, SettingsApplyRequest, SettingsApplyResult, SettingsPreview,
+        SettingsPreviewRequest, SettingsTerminalStatus, SubscriptionNodeCatalog,
+        SubscriptionNodeGroup,
     },
 };
 
@@ -223,6 +224,41 @@ pub async fn select_subscription_node(
     state
         .select_subscription_node(&subscription_id, &node_name)
         .await
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn test_subscription_node_latency(
+    state: State<'_, AppState>,
+    subscription_id: String,
+    node_name: String,
+) -> Result<NodeLatencyResult, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    state
+        .test_subscription_node_latency(&subscription_id, &node_name)
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn test_subscription_node_latencies(
+    state: State<'_, AppState>,
+    subscription_id: String,
+    operation_id: String,
+) -> Result<NodeLatencyBatchResult, String> {
+    let _transaction = state.lock_routing_transaction().await;
+    state
+        .test_subscription_node_latencies(&subscription_id, &operation_id)
+        .await
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cancel_subscription_node_latency_batch(
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Result<bool, String> {
+    state.cancel_subscription_node_latency_batch(&operation_id)
 }
 
 #[tauri::command]

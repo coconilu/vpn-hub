@@ -30,7 +30,7 @@ use vpn_hub_core::{
     durable_replace, durable_write_new, generate_controller_secret, generate_mihomo_config,
     generate_mihomo_config_with_udp_capabilities, generate_mihomo_startup_config,
     migrate_legacy_subscription, normalize_loopback_host, outlet_proxy_name,
-    probe_authorized_socks5_udp, unknown_udp_evidence, validate_subscription_url,
+    probe_authorized_socks5_udp, provider_name, unknown_udp_evidence, validate_subscription_url,
 };
 
 const DEFAULT_GUARDIAN_CONFIG: &str = r#"database_path = "guardian-desktop.db"
@@ -92,6 +92,54 @@ pub struct SubscriptionNodeCatalog {
     pub controller_ready: bool,
     pub subscriptions: Vec<SubscriptionNodeGroup>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeLatencyStatus {
+    Success,
+    Failure,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeLatencyErrorCode {
+    CoreUnavailable,
+    ProviderUnavailable,
+    NodeDisappeared,
+    Timeout,
+    ControllerError,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NodeLatencyResult {
+    pub node_name: String,
+    pub status: NodeLatencyStatus,
+    pub latency_ms: Option<u64>,
+    pub tested_at: String,
+    pub error_code: Option<NodeLatencyErrorCode>,
+    pub message: String,
+    pub selection_unchanged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NodeLatencyBatchResult {
+    pub subscription_id: String,
+    pub results: Vec<NodeLatencyResult>,
+    pub cancelled: bool,
+    pub selection_unchanged: bool,
+    pub error_code: Option<NodeLatencyErrorCode>,
+    pub message: String,
+}
+
+#[derive(Clone)]
+struct AuthorizedNodeLatencyContext {
+    selector: String,
+    provider: String,
+    target: String,
+    timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,6 +624,7 @@ pub struct AppState {
     settings_terminal: Mutex<Option<SettingsTerminalState>>,
     initialization_error: Option<String>,
     settings_recovery_error: Mutex<Option<String>>,
+    node_latency_batches: Mutex<HashMap<String, Arc<AtomicBool>>>,
     supervisor_route: SupervisorRoute,
     #[cfg(test)]
     entry_switch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -589,6 +638,8 @@ pub struct AppState {
     settings_compensation_hook: Mutex<Option<SettingsCompensationHook>>,
     #[cfg(test)]
     controller_client_override: Mutex<Option<ControllerClient>>,
+    #[cfg(test)]
+    node_latency_authorized_subscriptions: Mutex<HashSet<String>>,
 }
 
 enum SupervisorRoute {
@@ -1022,6 +1073,7 @@ impl AppState {
             settings_terminal: Mutex::new(settings_terminal),
             initialization_error,
             settings_recovery_error: Mutex::new(settings_recovery_error),
+            node_latency_batches: Mutex::new(HashMap::new()),
             supervisor_route,
             #[cfg(test)]
             entry_switch_hook: Mutex::new(None),
@@ -1035,6 +1087,8 @@ impl AppState {
             settings_compensation_hook: Mutex::new(None),
             #[cfg(test)]
             controller_client_override: Mutex::new(None),
+            #[cfg(test)]
+            node_latency_authorized_subscriptions: Mutex::new(HashSet::new()),
         }
     }
 
@@ -2568,6 +2622,218 @@ impl AppState {
         ))
     }
 
+    #[cfg(test)]
+    fn authorize_node_latency_subscription_for_test(&self, subscription_id: &str) {
+        self.node_latency_authorized_subscriptions
+            .lock()
+            .expect("node latency authorization")
+            .insert(subscription_id.into());
+    }
+
+    pub async fn test_subscription_node_latency(
+        &self,
+        subscription_id: &str,
+        node_name: &str,
+    ) -> Result<NodeLatencyResult, String> {
+        let tested_at = chrono::Utc::now().to_rfc3339();
+        let Some(controller) = self.controller_client()? else {
+            return Ok(node_latency_failure(
+                node_name,
+                tested_at,
+                NodeLatencyErrorCode::CoreUnavailable,
+                true,
+            ));
+        };
+        let context = match self.authorized_node_latency_context(subscription_id) {
+            Ok(context) => context,
+            Err(code) => {
+                return Ok(node_latency_failure(node_name, tested_at, code, true));
+            }
+        };
+
+        Ok(
+            match controller
+                .delay_provider_member_preserving_selection(
+                    &context.selector,
+                    &context.provider,
+                    node_name,
+                    &context.target,
+                    context.timeout_ms,
+                )
+                .await
+            {
+                Ok(latency_ms) => NodeLatencyResult {
+                    node_name: node_name.into(),
+                    status: NodeLatencyStatus::Success,
+                    latency_ms: Some(latency_ms),
+                    tested_at,
+                    error_code: None,
+                    message: "本次延迟测试成功；权威当前节点保持不变".into(),
+                    selection_unchanged: true,
+                },
+                Err(error) => node_latency_controller_failure(node_name, tested_at, &error),
+            },
+        )
+    }
+
+    pub async fn test_subscription_node_latencies(
+        &self,
+        subscription_id: &str,
+        operation_id: &str,
+    ) -> Result<NodeLatencyBatchResult, String> {
+        if !valid_node_latency_operation_id(operation_id) {
+            return Err("测速操作标识无效".into());
+        }
+        let Some(controller) = self.controller_client()? else {
+            return Ok(node_latency_batch_failure(
+                subscription_id,
+                NodeLatencyErrorCode::CoreUnavailable,
+            ));
+        };
+        let context = match self.authorized_node_latency_context(subscription_id) {
+            Ok(context) => context,
+            Err(code) => return Ok(node_latency_batch_failure(subscription_id, code)),
+        };
+        let before = match controller.selector_nodes(&context.selector).await {
+            Ok(snapshot) if !snapshot.nodes.is_empty() && snapshot.current_node.is_some() => {
+                snapshot
+            }
+            Ok(_) => {
+                return Ok(node_latency_batch_failure(
+                    subscription_id,
+                    NodeLatencyErrorCode::ProviderUnavailable,
+                ));
+            }
+            Err(_) => {
+                return Ok(node_latency_batch_failure(
+                    subscription_id,
+                    NodeLatencyErrorCode::ControllerError,
+                ));
+            }
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let mut batches = self
+                .node_latency_batches
+                .lock()
+                .map_err(|_| "测速取消状态锁已损坏".to_string())?;
+            if batches.contains_key(operation_id) {
+                return Err("测速操作标识已在使用".into());
+            }
+            batches.insert(operation_id.into(), Arc::clone(&cancel));
+        }
+
+        let mut results =
+            run_node_latency_tasks(&controller, &context, &before.nodes, Arc::clone(&cancel)).await;
+        self.node_latency_batches
+            .lock()
+            .map_err(|_| "测速取消状态锁已损坏".to_string())?
+            .remove(operation_id);
+        let cancelled = cancel.load(Ordering::Acquire)
+            || results
+                .iter()
+                .any(|result| result.status == NodeLatencyStatus::Cancelled);
+        let selection_unchanged = controller
+            .selector_nodes(&context.selector)
+            .await
+            .is_ok_and(|after| after.current_node == before.current_node);
+        if !selection_unchanged {
+            for result in &mut results {
+                if result.status == NodeLatencyStatus::Success {
+                    result.status = NodeLatencyStatus::Failure;
+                    result.latency_ms = None;
+                    result.error_code = Some(NodeLatencyErrorCode::ControllerError);
+                    result.message = "无法确认测速前后的权威当前节点；结果已拒绝".into();
+                    result.selection_unchanged = false;
+                }
+            }
+        }
+        let partial_failure = results
+            .iter()
+            .any(|result| result.status != NodeLatencyStatus::Success);
+        Ok(NodeLatencyBatchResult {
+            subscription_id: subscription_id.into(),
+            results,
+            cancelled,
+            selection_unchanged,
+            error_code: (!selection_unchanged).then_some(NodeLatencyErrorCode::ControllerError),
+            message: if !selection_unchanged {
+                "无法确认测速前后的权威当前节点；本次成功结果已拒绝".into()
+            } else if cancelled {
+                "批量测速已取消；已完成的结果仍保留在当前界面".into()
+            } else if partial_failure {
+                "批量测速完成；部分节点失败，其他成功结果已保留".into()
+            } else {
+                "批量测速完成；权威当前节点保持不变".into()
+            },
+        })
+    }
+
+    pub fn cancel_subscription_node_latency_batch(
+        &self,
+        operation_id: &str,
+    ) -> Result<bool, String> {
+        if !valid_node_latency_operation_id(operation_id) {
+            return Err("测速操作标识无效".into());
+        }
+        let batches = self
+            .node_latency_batches
+            .lock()
+            .map_err(|_| "测速取消状态锁已损坏".to_string())?;
+        Ok(batches.get(operation_id).is_some_and(|flag| {
+            flag.store(true, Ordering::Release);
+            true
+        }))
+    }
+
+    fn authorized_node_latency_context(
+        &self,
+        subscription_id: &str,
+    ) -> Result<AuthorizedNodeLatencyContext, NodeLatencyErrorCode> {
+        let config = self
+            .private_config()
+            .map_err(|_| NodeLatencyErrorCode::ProviderUnavailable)?;
+        let eligible = config.enabled_outlets().any(|outlet| {
+            outlet.id == subscription_id && matches!(outlet.kind, OutletKind::Subscription { .. })
+        });
+        if !eligible {
+            return Err(NodeLatencyErrorCode::ProviderUnavailable);
+        }
+        #[cfg(test)]
+        let configured_for_test = self
+            .node_latency_authorized_subscriptions
+            .lock()
+            .map_err(|_| NodeLatencyErrorCode::ProviderUnavailable)?
+            .contains(subscription_id);
+        #[cfg(not(test))]
+        let configured_for_test = false;
+        let configured = configured_for_test
+            || self
+                .subscription_credential_statuses()
+                .map_err(|_| NodeLatencyErrorCode::ProviderUnavailable)?
+                .into_iter()
+                .any(|status| {
+                    status.subscription_id == subscription_id
+                        && status.state == CredentialState::Configured
+                });
+        if !configured {
+            return Err(NodeLatencyErrorCode::ProviderUnavailable);
+        }
+        let target = config
+            .probe_targets
+            .first()
+            .cloned()
+            .ok_or(NodeLatencyErrorCode::ProviderUnavailable)?;
+        let guardian = GuardianConfig::load(&self.guardian_config_path)
+            .map_err(|_| NodeLatencyErrorCode::ProviderUnavailable)?;
+        Ok(AuthorizedNodeLatencyContext {
+            selector: outlet_proxy_name(subscription_id),
+            provider: provider_name(subscription_id),
+            target,
+            timeout_ms: guardian.monitor.request_timeout_ms,
+        })
+    }
+
     fn udp_capability_map(
         &self,
         private_config: &PrivateRoutingConfig,
@@ -3523,6 +3789,167 @@ fn subscription_node_selection_error(error: &ControllerError) -> String {
         }
         ControllerError::SelectionUnconfirmed => "切换结果未能确认，请刷新后查看实际状态".into(),
         _ => "无法切换订阅节点；原节点选择保持不变".into(),
+    }
+}
+
+async fn run_node_latency_tasks(
+    controller: &ControllerClient,
+    context: &AuthorizedNodeLatencyContext,
+    nodes: &[SubscriptionNode],
+    cancel: Arc<AtomicBool>,
+) -> Vec<NodeLatencyResult> {
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut next_index = 0;
+    while next_index < nodes.len().min(4) {
+        spawn_node_latency_task(
+            &mut tasks,
+            controller.clone(),
+            context.clone(),
+            next_index,
+            nodes[next_index].name.clone(),
+        );
+        next_index += 1;
+    }
+    let mut indexed_results = Vec::with_capacity(nodes.len());
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(result) = joined {
+            indexed_results.push(result);
+        }
+        if cancel.load(Ordering::Acquire) {
+            while next_index < nodes.len() {
+                indexed_results.push((next_index, node_latency_cancelled(&nodes[next_index].name)));
+                next_index += 1;
+            }
+        } else if next_index < nodes.len() {
+            spawn_node_latency_task(
+                &mut tasks,
+                controller.clone(),
+                context.clone(),
+                next_index,
+                nodes[next_index].name.clone(),
+            );
+            next_index += 1;
+        }
+    }
+    indexed_results.sort_by_key(|(index, _)| *index);
+    indexed_results
+        .into_iter()
+        .map(|(_, result)| result)
+        .collect()
+}
+
+fn spawn_node_latency_task(
+    tasks: &mut tokio::task::JoinSet<(usize, NodeLatencyResult)>,
+    controller: ControllerClient,
+    context: AuthorizedNodeLatencyContext,
+    index: usize,
+    node_name: String,
+) {
+    tasks.spawn(async move {
+        let tested_at = chrono::Utc::now().to_rfc3339();
+        let result = match controller
+            .delay_provider_member_preserving_selection(
+                &context.selector,
+                &context.provider,
+                &node_name,
+                &context.target,
+                context.timeout_ms,
+            )
+            .await
+        {
+            Ok(latency_ms) => NodeLatencyResult {
+                node_name,
+                status: NodeLatencyStatus::Success,
+                latency_ms: Some(latency_ms),
+                tested_at,
+                error_code: None,
+                message: "本次延迟测试成功；权威当前节点保持不变".into(),
+                selection_unchanged: true,
+            },
+            Err(error) => node_latency_controller_failure(&node_name, tested_at, &error),
+        };
+        (index, result)
+    });
+}
+
+fn valid_node_latency_operation_id(operation_id: &str) -> bool {
+    !operation_id.is_empty()
+        && operation_id.len() <= 96
+        && operation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn node_latency_batch_failure(
+    subscription_id: &str,
+    code: NodeLatencyErrorCode,
+) -> NodeLatencyBatchResult {
+    NodeLatencyBatchResult {
+        subscription_id: subscription_id.into(),
+        results: Vec::new(),
+        cancelled: false,
+        selection_unchanged: true,
+        error_code: Some(code),
+        message: node_latency_error_message(code).into(),
+    }
+}
+
+fn node_latency_cancelled(node_name: &str) -> NodeLatencyResult {
+    NodeLatencyResult {
+        node_name: node_name.into(),
+        status: NodeLatencyStatus::Cancelled,
+        latency_ms: None,
+        tested_at: chrono::Utc::now().to_rfc3339(),
+        error_code: Some(NodeLatencyErrorCode::Cancelled),
+        message: node_latency_error_message(NodeLatencyErrorCode::Cancelled).into(),
+        selection_unchanged: true,
+    }
+}
+
+fn node_latency_failure(
+    node_name: &str,
+    tested_at: String,
+    code: NodeLatencyErrorCode,
+    selection_unchanged: bool,
+) -> NodeLatencyResult {
+    NodeLatencyResult {
+        node_name: node_name.into(),
+        status: NodeLatencyStatus::Failure,
+        latency_ms: None,
+        tested_at,
+        error_code: Some(code),
+        message: node_latency_error_message(code).into(),
+        selection_unchanged,
+    }
+}
+
+fn node_latency_controller_failure(
+    node_name: &str,
+    tested_at: String,
+    error: &ControllerError,
+) -> NodeLatencyResult {
+    let code = match error {
+        ControllerError::ProviderUnavailable => NodeLatencyErrorCode::ProviderUnavailable,
+        ControllerError::TargetUnavailable => NodeLatencyErrorCode::NodeDisappeared,
+        ControllerError::Timeout => NodeLatencyErrorCode::Timeout,
+        _ => NodeLatencyErrorCode::ControllerError,
+    };
+    node_latency_failure(
+        node_name,
+        tested_at,
+        code,
+        !matches!(error, ControllerError::SelectionUnconfirmed),
+    )
+}
+
+const fn node_latency_error_message(code: NodeLatencyErrorCode) -> &'static str {
+    match code {
+        NodeLatencyErrorCode::CoreUnavailable => "本应用自管核心未启动",
+        NodeLatencyErrorCode::ProviderUnavailable => "订阅 provider 尚未就绪",
+        NodeLatencyErrorCode::NodeDisappeared => "节点已从 provider 中消失，请刷新状态",
+        NodeLatencyErrorCode::Timeout => "节点测速超时",
+        NodeLatencyErrorCode::ControllerError => "Controller 响应异常，测速结果已拒绝",
+        NodeLatencyErrorCode::Cancelled => "未开始的节点测速已取消",
     }
 }
 
@@ -4524,6 +4951,108 @@ mod tests {
         }
     }
 
+    struct FakeNodeLatencyController {
+        port: u16,
+        stop: Arc<AtomicBool>,
+        max_active: Arc<AtomicUsize>,
+        server: Option<JoinHandle<()>>,
+    }
+
+    impl FakeNodeLatencyController {
+        fn start(nodes: Vec<String>, delay: Duration) -> Self {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("latency Controller");
+            listener.set_nonblocking(true).expect("nonblocking");
+            let port = listener.local_addr().expect("Controller address").port();
+            let stop = Arc::new(AtomicBool::new(false));
+            let server_stop = Arc::clone(&stop);
+            let active = Arc::new(AtomicUsize::new(0));
+            let max_active = Arc::new(AtomicUsize::new(0));
+            let server_active = Arc::clone(&active);
+            let server_max = Arc::clone(&max_active);
+            let server = thread::spawn(move || {
+                while !server_stop.load(Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).expect("blocking stream");
+                    if server_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let handler_nodes = nodes.clone();
+                    let handler_active = Arc::clone(&server_active);
+                    let handler_max = Arc::clone(&server_max);
+                    thread::spawn(move || {
+                        let request = read_fake_controller_request(&mut stream);
+                        assert!(request.contains("authorization: Bearer test-secret"));
+                        if request.starts_with("GET /proxies ") {
+                            let mut proxies = serde_json::Map::new();
+                            proxies.insert(
+                                outlet_proxy_name("sub-a"),
+                                serde_json::json!({
+                                    "type": "URLTest",
+                                    "now": "Synthetic Current",
+                                    "all": handler_nodes.clone(),
+                                }),
+                            );
+                            for node in &handler_nodes {
+                                proxies.insert(
+                                    node.clone(),
+                                    serde_json::json!({"type": "Vless", "alive": true}),
+                                );
+                            }
+                            write_fake_controller_json(
+                                &mut stream,
+                                &serde_json::json!({"proxies": proxies}),
+                            );
+                            return;
+                        }
+                        assert!(request.starts_with(&format!(
+                            "GET /providers/proxies/{}/",
+                            provider_name("sub-a")
+                        )));
+                        assert!(
+                            request.contains("url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204")
+                        );
+                        assert!(request.contains("timeout=8000"));
+                        let current = handler_active.fetch_add(1, Ordering::SeqCst) + 1;
+                        handler_max.fetch_max(current, Ordering::SeqCst);
+                        thread::sleep(delay);
+                        if request.contains("Synthetic%20Failure") {
+                            write_fake_controller_status(&mut stream, "502 Bad Gateway");
+                        } else {
+                            write_fake_controller_json(
+                                &mut stream,
+                                &serde_json::json!({"delay": 64}),
+                            );
+                        }
+                        handler_active.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+            Self {
+                port,
+                stop,
+                max_active,
+                server: Some(server),
+            }
+        }
+
+        fn max_active(&self) -> usize {
+            self.max_active.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for FakeNodeLatencyController {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect((Ipv4Addr::LOCALHOST, self.port));
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
     fn read_fake_controller_request(stream: &mut TcpStream) -> String {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -4583,6 +5112,145 @@ mod tests {
         )
         .expect("fake Controller client");
         state.set_controller_client_for_test(controller);
+    }
+
+    fn configure_node_latency_subscription(state: &AppState) {
+        let mut config = state.private_config().expect("private config");
+        config.outlets = vec![OutletConfig {
+            id: "sub-a".into(),
+            label: "Synthetic Subscription".into(),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: "settings.sub-a".into(),
+                provider_update_seconds: 180,
+            },
+        }];
+        config
+            .save(&state.private_config_path)
+            .expect("save config");
+        state.authorize_node_latency_subscription_for_test("sub-a");
+    }
+
+    #[test]
+    fn node_latency_error_mapping_is_distinct_and_sanitized() {
+        for (error, expected) in [
+            (
+                ControllerError::ProviderUnavailable,
+                NodeLatencyErrorCode::ProviderUnavailable,
+            ),
+            (
+                ControllerError::TargetUnavailable,
+                NodeLatencyErrorCode::NodeDisappeared,
+            ),
+            (ControllerError::Timeout, NodeLatencyErrorCode::Timeout),
+            (
+                ControllerError::Response,
+                NodeLatencyErrorCode::ControllerError,
+            ),
+        ] {
+            let result = node_latency_controller_failure(
+                "Synthetic Node",
+                "2026-07-21T00:00:00Z".into(),
+                &error,
+            );
+            assert_eq!(result.error_code, Some(expected));
+            assert!(!result.message.contains("Synthetic Node"));
+        }
+    }
+
+    #[tokio::test]
+    async fn node_latency_batch_bounds_concurrency_and_keeps_partial_success() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        configure_node_latency_subscription(&state);
+        let nodes = vec![
+            "Synthetic Current".into(),
+            "Synthetic Alpha".into(),
+            "Synthetic Beta".into(),
+            "Synthetic Gamma".into(),
+            "Synthetic Delta".into(),
+            "Synthetic Epsilon".into(),
+            "Synthetic Failure".into(),
+        ];
+        let controller = FakeNodeLatencyController::start(nodes, Duration::from_millis(35));
+        install_fake_controller_client(&state, controller.port);
+
+        let result = state
+            .test_subscription_node_latencies("sub-a", "batch-partial")
+            .await
+            .expect("batch result");
+
+        assert!(result.selection_unchanged);
+        assert!(!result.cancelled);
+        assert_eq!(result.results.len(), 7);
+        assert!(
+            result
+                .results
+                .iter()
+                .any(|item| item.status == NodeLatencyStatus::Success)
+        );
+        assert!(
+            result
+                .results
+                .iter()
+                .any(|item| item.status == NodeLatencyStatus::Failure)
+        );
+        assert!((2..=4).contains(&controller.max_active()));
+        let private_bytes = fs::read(&state.private_config_path).expect("private bytes");
+        assert!(!String::from_utf8_lossy(&private_bytes).contains("Synthetic Current"));
+    }
+
+    #[tokio::test]
+    async fn node_latency_batch_cancel_stops_queued_work_and_preserves_completed_results() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(AppState::new_for_test(workspace_root, directory.path()));
+        configure_node_latency_subscription(&state);
+        let nodes = [
+            "Current", "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta",
+        ]
+        .into_iter()
+        .map(|suffix| format!("Synthetic {suffix}"))
+        .collect();
+        let controller = FakeNodeLatencyController::start(nodes, Duration::from_millis(120));
+        install_fake_controller_client(&state, controller.port);
+        let batch_state = Arc::clone(&state);
+        let batch = tokio::spawn(async move {
+            batch_state
+                .test_subscription_node_latencies("sub-a", "batch-cancel")
+                .await
+                .expect("batch result")
+        });
+        for _ in 0..100 {
+            if controller.max_active() == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(controller.max_active(), 4);
+        assert!(
+            state
+                .cancel_subscription_node_latency_batch("batch-cancel")
+                .expect("cancel accepted")
+        );
+
+        let result = batch.await.expect("batch task");
+        assert!(result.cancelled);
+        assert!(result.selection_unchanged);
+        assert!(
+            result
+                .results
+                .iter()
+                .any(|item| item.status == NodeLatencyStatus::Success)
+        );
+        assert!(
+            result
+                .results
+                .iter()
+                .any(|item| item.status == NodeLatencyStatus::Cancelled)
+        );
+        assert_eq!(controller.max_active(), 4);
     }
 
     fn install_fake_owned_controller(state: &AppState, lifetime_ms: u64) -> u32 {

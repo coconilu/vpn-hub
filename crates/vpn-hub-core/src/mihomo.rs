@@ -831,7 +831,8 @@ pub fn outlet_proxy_name(outlet_id: &str) -> String {
     }
 }
 
-fn provider_name(outlet_id: &str) -> String {
+#[must_use]
+pub fn provider_name(outlet_id: &str) -> String {
     format!("vpn-hub-provider-{outlet_id}")
 }
 

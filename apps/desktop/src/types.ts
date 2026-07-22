@@ -181,6 +181,44 @@ export interface SubscriptionNodeCatalog {
   message: string;
 }
 
+export type NodeLatencyStatus = "success" | "failure" | "cancelled";
+export type NodeLatencyErrorCode =
+  | "core_unavailable"
+  | "provider_unavailable"
+  | "node_disappeared"
+  | "timeout"
+  | "controller_error"
+  | "cancelled";
+
+export interface NodeLatencyResult {
+  node_name: string;
+  status: NodeLatencyStatus;
+  latency_ms: number | null;
+  tested_at: string;
+  error_code: NodeLatencyErrorCode | null;
+  message: string;
+  selection_unchanged: boolean;
+}
+
+export interface NodeLatencyBatchResult {
+  subscription_id: string;
+  results: NodeLatencyResult[];
+  cancelled: boolean;
+  selection_unchanged: boolean;
+  error_code: NodeLatencyErrorCode | null;
+  message: string;
+}
+
+export type NodeLatencyViewStatus = "waiting" | "running" | "success" | "failure" | "stale" | "cancelled";
+
+export interface NodeLatencyViewState {
+  status: NodeLatencyViewStatus;
+  latency_ms: number | null;
+  tested_at: string | null;
+  error_code: NodeLatencyErrorCode | null;
+  message: string;
+}
+
 export interface DashboardSnapshot {
   updated_at: string;
   entry: PortSnapshot;
