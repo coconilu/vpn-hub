@@ -2420,13 +2420,20 @@ mod tests {
             old_master.clone(),
             vpn_hub_core::FAIL_CLOSED_PROXY.to_string(),
         )));
-        let candidate_seen = Arc::new(AtomicBool::new(false));
+        let candidate_observed = Arc::new(tokio::sync::Notify::new());
+        let candidate_response_release = Arc::new(tokio::sync::Notify::new());
         let candidate_response_finished = Arc::new(AtomicBool::new(false));
         let server_selected = Arc::clone(&selected);
-        let server_candidate_seen = Arc::clone(&candidate_seen);
+        let server_candidate_observed = Arc::clone(&candidate_observed);
+        let server_candidate_response_release = Arc::clone(&candidate_response_release);
         let server_candidate_finished = Arc::clone(&candidate_response_finished);
         let server_candidate = candidate_master.clone();
         let server_old_master = old_master.clone();
+        // Model a loaded shared runner where the operation is not scheduled
+        // until after the old three-second synchronization threshold.
+        // Cancellation latency is measured separately after the candidate
+        // milestone is observed.
+        let candidate_observation_delay = Duration::from_millis(3_200);
         let fixture_errors = Arc::new(Mutex::new(Vec::<String>::new()));
         let server_fixture_errors = Arc::clone(&fixture_errors);
         let (shutdown_server, mut server_shutdown) = tokio::sync::oneshot::channel();
@@ -2449,7 +2456,9 @@ mod tests {
                             break;
                         };
                         let selected = Arc::clone(&server_selected);
-                        let candidate_seen = Arc::clone(&server_candidate_seen);
+                        let candidate_observed = Arc::clone(&server_candidate_observed);
+                        let candidate_response_release =
+                            Arc::clone(&server_candidate_response_release);
                         let candidate_finished = Arc::clone(&server_candidate_finished);
                         let candidate = server_candidate.clone();
                         let old_master = server_old_master.clone();
@@ -2476,19 +2485,34 @@ mod tests {
                             if request.starts_with("PUT ")
                                 && let Some(target) = target
                             {
+                                let candidate_master_put = request
+                                    .contains(vpn_hub_core::MASTER_SELECTOR)
+                                    && target == candidate;
                                 let mut current = selected.lock().expect("selected");
                                 if request.contains(vpn_hub_core::UDP_SELECTOR) {
                                     current.1 = target.into();
                                 } else if request.contains(vpn_hub_core::MASTER_SELECTOR) {
                                     current.0 = target.into();
-                                    if target == candidate {
-                                        candidate_seen.store(true, Ordering::Release);
+                                    if candidate_master_put {
+                                        candidate_observed.notify_one();
                                         slow = true;
                                     }
                                 }
                             }
                             if slow {
-                                tokio::time::sleep(Duration::from_millis(600)).await;
+                                if tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    candidate_response_release.notified(),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    fixture_errors
+                                        .lock()
+                                        .expect("fixture errors")
+                                        .push("candidate response release timed out".into());
+                                    return;
+                                }
                                 candidate_finished.store(true, Ordering::Release);
                             }
                             let (status, body) = if request.starts_with("GET ") && path == "/proxies" {
@@ -2562,39 +2586,50 @@ mod tests {
             .begin_foreground_operation("slow-live-policy")
             .expect("operation");
         let started = tokio::time::Instant::now();
-        let apply = apply_live_policy_settings_transaction(
-            &state,
-            request,
-            &operation,
-            started + Duration::from_secs(4),
-        );
-        let cancel = async {
-            tokio::time::timeout(Duration::from_secs(3), async {
-                while !candidate_seen.load(Ordering::Acquire) {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .map_err(|_| "candidate PUT was not observed within three seconds".to_string())?;
-            Ok::<_, String>((
-                state.cancel_foreground_operation("slow-live-policy"),
-                !candidate_response_finished.load(Ordering::Acquire),
-            ))
+        let operation_deadline = started + Duration::from_secs(10);
+        let apply = async {
+            tokio::time::sleep(candidate_observation_delay).await;
+            apply_live_policy_settings_transaction(&state, request, &operation, operation_deadline)
+                .await
         };
-        let joined = tokio::time::timeout(Duration::from_secs(8), async {
-            tokio::join!(apply, cancel)
-        })
-        .await;
+        tokio::pin!(apply);
+        let candidate_milestone = candidate_observed.notified();
+        tokio::pin!(candidate_milestone);
+        let milestone = tokio::select! {
+            biased;
+            result = &mut apply => Ok(Some(result)),
+            () = &mut candidate_milestone => Ok(None),
+            () = tokio::time::sleep_until(operation_deadline) => Err(()),
+        };
+        match milestone {
+            Ok(None) => {}
+            Ok(Some(result)) => {
+                stop_live_policy_fixture_server(shutdown_server, server).await;
+                panic!(
+                    "live-policy apply finished before the candidate milestone: {result:?}; fixture errors: {:?}",
+                    fixture_errors.lock().expect("fixture errors")
+                );
+            }
+            Err(()) => {
+                stop_live_policy_fixture_server(shutdown_server, server).await;
+                panic!(
+                    "candidate PUT was not observed before the ten-second operation deadline: {:?}",
+                    fixture_errors.lock().expect("fixture errors")
+                );
+            }
+        }
+        assert!(started.elapsed() >= candidate_observation_delay);
+
+        let cancellation_started = tokio::time::Instant::now();
+        let cancelled = state.cancel_foreground_operation("slow-live-policy");
+        let cancelled_while_request_in_flight =
+            !candidate_response_finished.load(Ordering::Acquire);
+        candidate_response_release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut apply).await;
         stop_live_policy_fixture_server(shutdown_server, server).await;
-        let (result, cancellation) = joined.unwrap_or_else(|_| {
+        let result = result.unwrap_or_else(|_| {
             panic!(
-                "live-policy fixture exceeded eight seconds: {:?}",
-                fixture_errors.lock().expect("fixture errors")
-            )
-        });
-        let (cancelled, cancelled_while_request_in_flight) = cancellation.unwrap_or_else(|error| {
-            panic!(
-                "{error}: {:?}",
+                "cancelled live-policy apply did not join within five seconds: {:?}",
                 fixture_errors.lock().expect("fixture errors")
             )
         });
@@ -2605,11 +2640,12 @@ mod tests {
         assert!(error.contains("已恢复旧配置、路由状态与 Controller selectors"));
         // Windows durable rollback includes atomic file flushes, so the bound
         // deliberately allows that local cost while proving cancellation does
-        // not wait for the four-second command deadline or leave recovery work
+        // not wait for the ten-second operation deadline or leave recovery work
         // running in the foreground indefinitely.
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "elapsed={:?}, error={error}, selected={:?}",
+            cancellation_started.elapsed() < Duration::from_secs(3),
+            "cancellation elapsed={:?}, total elapsed={:?}, error={error}, selected={:?}",
+            cancellation_started.elapsed(),
             started.elapsed(),
             selected.lock().expect("selected debug")
         );
