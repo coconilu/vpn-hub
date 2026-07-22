@@ -40,14 +40,15 @@ pub use guardian_cycle::{
     GuardianCycleError, GuardianCycleOutcome, RoutingSession, RoutingStateError,
     run_controller_guardian_cycle, run_controller_guardian_cycle_controlled,
     probe_controller_outlets, run_controller_guardian_cycle_selected,
+    run_controller_guardian_cycle_selected_guarded,
 };
 pub use history::{
     HistoryEventType, HistoryExport, HistoryFilter, HistoryMetric, HistoryOutletKind,
     HistoryOutletOption, HistoryOutletSnapshot, HistoryRecord, HistoryResponse, HistoryWindow,
 };
 pub use mihomo::{
-    CURRENT_CONFIG_VERSION, EntryConfig, FAIL_CLOSED_PROXY, MASTER_SELECTOR, OutletConfig,
-    OutletConfigSummary, OutletKind, PrivateConfigError, PrivateConfigSummary,
+    CURRENT_CONFIG_VERSION, EntryConfig, FAIL_CLOSED_PROXY, MASTER_SELECTOR, MAX_PROBE_TARGETS,
+    OutletConfig, OutletConfigSummary, OutletKind, PrivateConfigError, PrivateConfigSummary,
     PrivateRoutingConfig, ResolvedSubscriptionUrls, RuntimeConfigSummary, UDP_SELECTOR,
     UdpCapabilityMap, generate_controller_secret, generate_mihomo_config,
     generate_mihomo_config_with_udp_capabilities, generate_mihomo_startup_config,
@@ -73,7 +74,7 @@ pub use settings::{
     LocalProxyProtocol, SafeSettingsView, SafeSubscriptionStatus, SettingsChange, SettingsDiff,
     SettingsDraft, SettingsImpact, SettingsOutletDraft, ValidationIssue,
 };
-pub use store::{GuardianStore, StoreError};
+pub use store::{GuardianStore, ProbeCommitOutcome, StoreError};
 pub use udp_capability::{
     UDP_EVIDENCE_VERSION, UDP_MODEL_VERSION, UDP_PROBE_VERSION, UdpProbeError, UdpProbeTarget,
     classify_subscription_udp, current_udp_status, is_current_udp_evidence,

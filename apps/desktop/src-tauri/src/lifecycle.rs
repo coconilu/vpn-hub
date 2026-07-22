@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     hash::Hasher,
     sync::{
         Arc, Mutex,
@@ -526,6 +526,7 @@ const SIGNAL_PORT_CONFLICT: u32 = 1 << 8;
 const SIGNAL_MANUAL_START: u32 = 1 << 9;
 const SIGNAL_ROUTE_CHANGED: u32 = 1 << 10;
 const SIGNAL_MANUAL_FAILED: u32 = 1 << 11;
+const SIGNAL_PROBE_RUNTIME_READY: u32 = 1 << 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopRequestResult {
@@ -540,6 +541,7 @@ struct ControlMailbox {
     core_epoch: AtomicU64,
     core_stop_epoch: AtomicU64,
     manual_epoch: AtomicU64,
+    probe_runtime_ready: Mutex<HashMap<String, u64>>,
     notify: Notify,
 }
 
@@ -565,13 +567,32 @@ impl ControlMailbox {
         self.post(SIGNAL_MANUAL_FAILED);
     }
 
-    fn take(&self) -> (u32, u32, u64, u64, u64) {
+    fn post_probe_runtime_ready(&self, outlet_id: String, generation: u64) {
+        if let Ok(mut ready) = self.probe_runtime_ready.lock() {
+            ready.insert(outlet_id, generation);
+        }
+        self.post(SIGNAL_PROBE_RUNTIME_READY);
+    }
+
+    fn take(&self) -> (u32, u32, u64, u64, u64, Vec<(String, u64)>) {
         let signals = self.signals.swap(0, Ordering::AcqRel);
         let pid = self.core_pid.load(Ordering::Acquire);
         let epoch = self.core_epoch.load(Ordering::Acquire);
         let stop_epoch = self.core_stop_epoch.load(Ordering::Acquire);
         let manual_epoch = self.manual_epoch.load(Ordering::Acquire);
-        (signals, pid, epoch, stop_epoch, manual_epoch)
+        let probe_runtime_ready = self
+            .probe_runtime_ready
+            .lock()
+            .map(|mut ready| ready.drain().collect())
+            .unwrap_or_default();
+        (
+            signals,
+            pid,
+            epoch,
+            stop_epoch,
+            manual_epoch,
+            probe_runtime_ready,
+        )
     }
 }
 
@@ -580,6 +601,7 @@ pub struct DesktopCoordinator {
     started: AtomicBool,
     exit_permitted: AtomicBool,
     recovery_epoch: AtomicU64,
+    probe_generation: AtomicU64,
     active_cancel: Mutex<Option<Arc<AtomicBool>>>,
     manual_cancel: Mutex<Option<(u64, Arc<AtomicBool>)>>,
     pending_stop: AtomicBool,
@@ -596,6 +618,7 @@ impl DesktopCoordinator {
             started: AtomicBool::new(false),
             exit_permitted: AtomicBool::new(false),
             recovery_epoch: AtomicU64::new(0),
+            probe_generation: AtomicU64::new(0),
             active_cancel: Mutex::new(None),
             manual_cancel: Mutex::new(None),
             pending_stop: AtomicBool::new(false),
@@ -615,7 +638,10 @@ impl DesktopCoordinator {
             LifecycleEvent::StopCore => {
                 self.begin_stop(None);
             }
-            LifecycleEvent::ConfigReload { .. } => self.mailbox.post(SIGNAL_CONFIG_RELOAD),
+            LifecycleEvent::ConfigReload { .. } => {
+                self.invalidate_probe_generation();
+                self.mailbox.post(SIGNAL_CONFIG_RELOAD);
+            }
             LifecycleEvent::RecoverySignal { .. } => self.mailbox.post(SIGNAL_RECOVERY),
             LifecycleEvent::OpenWindow => self.mailbox.post(SIGNAL_OPEN),
             LifecycleEvent::WindowClose => self.mailbox.post(SIGNAL_HIDE),
@@ -668,6 +694,25 @@ impl DesktopCoordinator {
             && let Some((_, cancel)) = manual.as_ref()
         {
             cancel.store(true, Ordering::Release);
+        }
+    }
+
+    fn publish_probe_generation(&self, generation: u64) {
+        self.probe_generation
+            .fetch_max(generation, Ordering::AcqRel);
+    }
+
+    fn invalidate_probe_generation(&self) {
+        self.probe_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn probe_generation(&self) -> u64 {
+        self.probe_generation.load(Ordering::Acquire)
+    }
+
+    fn post_probe_runtime_ready(&self, generation: u64, outlet_id: String) {
+        if self.probe_generation() == generation {
+            self.mailbox.post_probe_runtime_ready(outlet_id, generation);
         }
     }
 
@@ -1029,6 +1074,32 @@ fn start_probe_work(
     let task_cancel = Arc::clone(&cancel);
     let task_app = app.clone();
     let task_probes = probes.to_owned();
+    let generation = probes
+        .iter()
+        .map(|probe| probe.generation)
+        .max()
+        .unwrap_or(0);
+    app.state::<DesktopCoordinator>()
+        .publish_probe_generation(generation);
+    let guard_app = app.clone();
+    let guard_cancel = Arc::clone(&cancel);
+    let update_app = app.clone();
+    let ready_app = app.clone();
+    let control = commands::ProbeCycleControl::new(
+        generation,
+        move |expected| {
+            !guard_cancel.load(Ordering::Acquire)
+                && guard_app.state::<DesktopCoordinator>().probe_generation() == expected
+        },
+        move |expected, outlet_id| {
+            emit_guardian_outlet_update(&update_app, expected, outlet_id);
+        },
+        move |expected, outlet_id| {
+            ready_app
+                .state::<DesktopCoordinator>()
+                .post_probe_runtime_ready(expected, outlet_id);
+        },
+    );
     let handle = tokio::spawn(async move {
         task_app.state::<AppState>().mark_outlets_probing(
             &task_probes
@@ -1052,7 +1123,8 @@ fn start_probe_work(
             .iter()
             .map(|probe| probe.outlet_id.clone())
             .collect::<std::collections::HashSet<_>>();
-        let result = commands::record_routing_cycle_selected_locked(&state, &selected).await;
+        let result =
+            commands::record_routing_cycle_selected_locked(&state, &selected, &control).await;
         let report = if task_cancel.load(Ordering::Acquire) {
             Err("probe_cancelled".into())
         } else {
@@ -1225,6 +1297,7 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
     let schedule_origin = Instant::now();
     let mut scheduler = ProbeScheduler::new();
     scheduler.reconcile(probe_schedule_inputs(&app), 0);
+    let mut pending_runtime_ready = HashSet::new();
     let mut pending_probe = false;
     let mut next_work_id = 1_u64;
     let mut next_network_sample = Instant::now();
@@ -1285,7 +1358,27 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
         );
         tokio::select! {
             () = mailbox.notify.notified() => {
-                let (signals, core_pid, core_epoch, core_stop_epoch, manual_epoch) = mailbox.take();
+                let (
+                    signals,
+                    core_pid,
+                    core_epoch,
+                    core_stop_epoch,
+                    manual_epoch,
+                    runtime_ready,
+                ) = mailbox.take();
+                if signals & SIGNAL_PROBE_RUNTIME_READY != 0 {
+                    let current_generation = app.state::<DesktopCoordinator>().probe_generation();
+                    for (outlet_id, generation) in runtime_ready {
+                        if generation == current_generation {
+                            pending_runtime_ready.insert((outlet_id.clone(), generation));
+                            scheduler.mark_ready(
+                                &outlet_id,
+                                ImmediateProbeReason::RuntimeReady,
+                                monotonic_ms(schedule_origin),
+                            );
+                        }
+                    }
+                }
                 if signals & SIGNAL_EXIT != 0
                     && let Some(mut handle) = network_handle.take()
                     && tokio::time::timeout(CONTROL_JOIN_TIMEOUT, &mut handle).await.is_err()
@@ -1337,6 +1430,7 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                 if signals & SIGNAL_CONFIG_RELOAD != 0
                     && !app.state::<DesktopCoordinator>().pending_stop()
                 {
+                    pending_runtime_ready.clear();
                     if let Some(work) = active.take() {
                         work.cancel_and_join(&app, true).await;
                     }
@@ -1409,6 +1503,15 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                                 active_outlet.as_deref() == Some(probe.outlet_id.as_str()),
                                 monotonic_ms(schedule_origin),
                             );
+                            if pending_runtime_ready
+                                .remove(&(probe.outlet_id.clone(), probe.generation))
+                            {
+                                scheduler.mark_ready(
+                                    &probe.outlet_id,
+                                    ImmediateProbeReason::RuntimeReady,
+                                    monotonic_ms(schedule_origin),
+                                );
+                            }
                         }
                         if report.is_ok() {
                             publish_transition_notifications(&app, &mut transitions, &mut deduper);
@@ -1577,6 +1680,17 @@ fn emit_guardian_update(app: &AppHandle, probes: &[ScheduledProbe]) {
         GuardianUpdateEvent {
             generation,
             outlet_ids,
+            reason_code: "guardian_state_updated",
+        },
+    );
+}
+
+fn emit_guardian_outlet_update(app: &AppHandle, generation: u64, outlet_id: &str) {
+    let _ = app.emit(
+        "guardian://updated",
+        GuardianUpdateEvent {
+            generation,
+            outlet_ids: vec![safe_id(outlet_id)],
             reason_code: "guardian_state_updated",
         },
     );
@@ -1871,6 +1985,76 @@ mod tests {
     }
 
     #[test]
+    fn config_generation_change_rejects_inflight_probe_commit() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let mut store =
+            GuardianStore::open(directory.path().join("guardian.sqlite3")).expect("Guardian store");
+        let outlet = vpn_hub_core::ProbeOutletConfig {
+            id: "fixture-outlet".into(),
+            label: "Fixture".into(),
+            proxy_url: "http://127.0.0.1:45123".into(),
+            probe_url: "https://fixture.invalid/health".into(),
+            degraded_latency_ms: 2_500,
+            enabled: true,
+        };
+        let healthy = vpn_hub_core::ProbeResult {
+            outlet_id: outlet.id.clone(),
+            label: outlet.label.clone(),
+            observed_at: "2026-07-22T00:00:00.000Z".into(),
+            port_reachable: true,
+            status: HealthStatus::Healthy,
+            http_status: None,
+            latency_ms: Some(42),
+            error_code: None,
+            successful_targets: 3,
+            total_targets: 3,
+        };
+        store
+            .record_probe(&outlet, &healthy, 1, 1)
+            .expect("initial state");
+        let coordinator = DesktopCoordinator::new();
+        coordinator.publish_probe_generation(7);
+        let expected_generation = coordinator.probe_generation();
+
+        coordinator.dispatch(LifecycleEvent::ConfigReload { now_ms: 1 });
+        let mut stale = healthy.clone();
+        stale.observed_at = "2026-07-22T00:00:01.000Z".into();
+        stale.status = HealthStatus::Down;
+        stale.latency_ms = None;
+        stale.error_code = Some("request_timeout".into());
+        let error = store
+            .record_probe_guarded(&outlet, &stale, 1, 1, || {
+                coordinator.probe_generation() == expected_generation
+            })
+            .expect_err("stale generation must not commit");
+        assert!(matches!(
+            error,
+            vpn_hub_core::StoreError::StaleProbeGeneration
+        ));
+        let summary = store.summaries().expect("summary").remove(0);
+        assert_eq!(summary.samples, 1);
+        assert_eq!(summary.last_status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn late_probe_runtime_readiness_wakes_waiting_outlet_immediately() {
+        let coordinator = DesktopCoordinator::new();
+        coordinator.publish_probe_generation(4);
+        coordinator.post_probe_runtime_ready(4, "late-sub".into());
+        let (signals, _, _, _, _, ready) = coordinator.mailbox.take();
+        assert_ne!(signals & SIGNAL_PROBE_RUNTIME_READY, 0);
+        assert_eq!(ready, vec![("late-sub".into(), 4)]);
+
+        let mut scheduler = ProbeScheduler::new();
+        scheduler.reconcile([("late-sub".into(), ProbeReadiness::WaitingForRuntime)], 0);
+        assert_eq!(scheduler.next_due_ms(), Some(60_000));
+        scheduler.mark_ready("late-sub", ImmediateProbeReason::RuntimeReady, 4_000);
+        let due = scheduler.take_due(4_000);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].outlet_id, "late-sub");
+    }
+
+    #[test]
     fn guardian_update_payload_contains_only_stable_ids_and_codes() {
         let payload = GuardianUpdateEvent {
             generation: 7,
@@ -2034,7 +2218,7 @@ mod tests {
         }
         mailbox.post(SIGNAL_STOP);
         mailbox.post(SIGNAL_EXIT);
-        let (signals, _, _, _, _) = mailbox.take();
+        let (signals, _, _, _, _, _) = mailbox.take();
         assert_ne!(signals & SIGNAL_EXIT, 0);
         assert_ne!(signals & SIGNAL_STOP, 0);
         assert_ne!(signals & SIGNAL_CONFIG_RELOAD, 0);
@@ -2051,7 +2235,7 @@ mod tests {
         coordinator.begin_stop(None);
         assert!(!coordinator.complete_manual_start(4_242, stale_epoch));
 
-        let (signals, pid, _, _, _) = coordinator.mailbox.take();
+        let (signals, pid, _, _, _, _) = coordinator.mailbox.take();
         assert_ne!(signals & SIGNAL_MANUAL_START, 0);
         assert_eq!(signals & SIGNAL_CORE_STARTED, 0);
         assert_eq!(pid, 0);
@@ -2064,7 +2248,7 @@ mod tests {
         let start = coordinator.prepare_manual_start(&Arc::new(AtomicBool::new(false)));
 
         assert!(start.is_err());
-        let (signals, pid, _, _, _) = coordinator.mailbox.take();
+        let (signals, pid, _, _, _, _) = coordinator.mailbox.take();
         assert_ne!(signals & SIGNAL_STOP, 0);
         assert_eq!(signals & (SIGNAL_MANUAL_START | SIGNAL_CORE_STARTED), 0);
         assert_eq!(pid, 0);
@@ -2080,7 +2264,7 @@ mod tests {
         coordinator.complete_manual_start_failure(epoch);
 
         assert!(coordinator.stop_available());
-        let (signals, _, _, _, manual_epoch) = coordinator.mailbox.take();
+        let (signals, _, _, _, manual_epoch, _) = coordinator.mailbox.take();
         assert_ne!(signals & SIGNAL_MANUAL_FAILED, 0);
         assert_eq!(manual_epoch, epoch);
     }
@@ -2270,7 +2454,7 @@ mod tests {
         let coordinator = DesktopCoordinator::new();
         coordinator.dispatch(LifecycleEvent::RouteChanged);
         coordinator.dispatch(LifecycleEvent::RouteChanged);
-        let (signals, _, _, _, _) = coordinator.mailbox.take();
+        let (signals, _, _, _, _, _) = coordinator.mailbox.take();
         assert_ne!(signals & SIGNAL_ROUTE_CHANGED, 0);
         assert_eq!(signals & (SIGNAL_CONFIG_RELOAD | SIGNAL_RECOVERY), 0);
     }

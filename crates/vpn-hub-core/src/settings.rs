@@ -482,7 +482,7 @@ impl SettingsDraft {
                 "手动模式必须选择一个已启用出口",
             ));
         }
-        if self.probe_targets.len() < 2
+        if !(2..=crate::MAX_PROBE_TARGETS).contains(&self.probe_targets.len())
             || self.probe_targets.iter().any(|target| {
                 reqwest::Url::parse(target).map_or(true, |url| url.scheme() != "https")
             })
@@ -490,7 +490,7 @@ impl SettingsDraft {
             issues.push(ValidationIssue::new(
                 "probe_targets",
                 "invalid_probe_targets",
-                "探测目标至少需要两个有效 HTTPS URL",
+                "探测目标需要 2 到 8 个有效 HTTPS URL",
             ));
         }
         if !(MIN_REFRESH_SECONDS..=MAX_REFRESH_SECONDS).contains(&self.refresh_interval_seconds) {

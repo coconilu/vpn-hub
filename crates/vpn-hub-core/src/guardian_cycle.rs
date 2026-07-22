@@ -19,6 +19,8 @@ use crate::{
     current_udp_status, outlet_proxy_name, unknown_udp_evidence,
 };
 
+const TARGET_PROBE_CONCURRENCY: usize = 3;
+
 #[derive(Debug, Error)]
 pub enum RoutingStateError {
     #[error("routing state is unavailable")]
@@ -165,6 +167,8 @@ pub enum GuardianCycleError {
         "Guardian could not authoritatively confirm both fail-closed selectors; terminal gate persisted"
     )]
     FailClosedUnconfirmed,
+    #[error("probe generation is no longer current")]
+    StaleProbeGeneration,
 }
 
 pub const DEFAULT_GUARDIAN_CYCLE_BUDGET: Duration = Duration::from_secs(8);
@@ -173,6 +177,7 @@ pub const DEFAULT_GUARDIAN_CONCURRENCY: usize = 4;
 #[derive(Debug, Clone)]
 pub struct GuardianCycleOutcome {
     pub observed: Vec<ProbeResult>,
+    pub stable_statuses: BTreeMap<String, HealthStatus>,
     pub decision: Option<RouteDecision>,
 }
 
@@ -414,6 +419,10 @@ pub async fn run_controller_guardian_cycle_controlled(
 
     Ok(GuardianCycleOutcome {
         observed: observed.into_iter().map(|(_, result)| result).collect(),
+        stable_statuses: health
+            .into_iter()
+            .map(|(outlet_id, outlet_health)| (outlet_id, outlet_health.status))
+            .collect(),
         decision,
     })
 }
@@ -435,11 +444,53 @@ pub async fn run_controller_guardian_cycle_selected<S: BuildHasher>(
     now_ms: u64,
     selected: Option<&HashSet<String, S>>,
 ) -> Result<GuardianCycleOutcome, GuardianCycleError> {
+    run_controller_guardian_cycle_selected_guarded(
+        controller,
+        private,
+        resolved,
+        monitor,
+        store,
+        routing,
+        now_ms,
+        selected,
+        &|| true,
+        &|_, _| {},
+    )
+    .await
+}
+
+/// Executes a selected routing cycle with a cancellation/generation fence and
+/// a callback fired immediately after each authoritative probe commit.
+///
+/// # Errors
+///
+/// Returns [`GuardianCycleError::StaleProbeGeneration`] before any guarded
+/// `SQLite`, selector, or routing mutation when the lease is no longer current.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_controller_guardian_cycle_selected_guarded<S, G, O>(
+    controller: &ControllerClient,
+    private: &PrivateRoutingConfig,
+    resolved: &crate::ResolvedSubscriptionUrls,
+    monitor: &MonitorConfig,
+    store: &mut GuardianStore,
+    routing: &impl RoutingSession,
+    now_ms: u64,
+    selected: Option<&HashSet<String, S>>,
+    is_current: &G,
+    on_probe_committed: &O,
+) -> Result<GuardianCycleOutcome, GuardianCycleError>
+where
+    S: BuildHasher,
+    G: Fn() -> bool,
+    O: Fn(&ProbeResult, HealthStatus),
+{
     for outlet in private.enabled_outlets() {
-        store.ensure_udp_capability(
+        ensure_current(is_current)?;
+        store.ensure_udp_capability_guarded(
             &outlet.id,
             &outlet.label,
             &unknown_udp_evidence(outlet, "not_yet_validated"),
+            is_current,
         )?;
     }
     let observed = probe_controller_outlets(
@@ -451,13 +502,18 @@ pub async fn run_controller_guardian_cycle_selected<S: BuildHasher>(
     )
     .await;
 
+    let mut stable_statuses = BTreeMap::new();
     for (outlet, result) in &observed {
-        store.record_probe(
+        let commit = store.record_probe_guarded(
             outlet,
             result,
             monitor.failure_threshold,
             monitor.recovery_threshold,
+            is_current,
         )?;
+        ensure_current(is_current)?;
+        stable_statuses.insert(result.outlet_id.clone(), commit.status);
+        on_probe_committed(result, commit.status);
     }
 
     let enabled_ids = private
@@ -499,6 +555,7 @@ pub async fn run_controller_guardian_cycle_selected<S: BuildHasher>(
     let decision = routing.evaluate_route(now_ms, &health, &policy)?;
     let started = Instant::now();
     if let Some(decision) = &decision {
+        ensure_current(is_current)?;
         controller
             .select(
                 crate::MASTER_SELECTOR,
@@ -512,7 +569,9 @@ pub async fn run_controller_guardian_cycle_selected<S: BuildHasher>(
         .or(routing.current_outlet()?);
     let udp_capabilities = store.udp_capabilities()?;
     let udp_target = udp_selector_target(private, selected_outlet.as_deref(), &udp_capabilities);
+    ensure_current(is_current)?;
     if let Err(error) = controller.select(UDP_SELECTOR, &udp_target).await {
+        ensure_current(is_current)?;
         let _ = controller
             .select(UDP_SELECTOR, crate::FAIL_CLOSED_PROXY)
             .await;
@@ -520,19 +579,25 @@ pub async fn run_controller_guardian_cycle_selected<S: BuildHasher>(
     }
     if let Some(decision) = &decision {
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        ensure_current(is_current)?;
         routing.apply_route(decision, now_ms)?;
-        store.record_route_switch(&RouteSwitchEvent {
-            occurred_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            from_outlet: decision.from_outlet.clone(),
-            to_outlet: decision.to_outlet.clone(),
-            mode: private.route_mode.as_str().into(),
-            reason: decision.reason.clone(),
-            duration_ms,
-        })?;
+        ensure_current(is_current)?;
+        store.record_route_switch_guarded(
+            &RouteSwitchEvent {
+                occurred_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                from_outlet: decision.from_outlet.clone(),
+                to_outlet: decision.to_outlet.clone(),
+                mode: private.route_mode.as_str().into(),
+                reason: decision.reason.clone(),
+                duration_ms,
+            },
+            is_current,
+        )?;
     }
 
     Ok(GuardianCycleOutcome {
         observed: observed.into_iter().map(|(_, result)| result).collect(),
+        stable_statuses,
         decision,
     })
 }
@@ -611,6 +676,14 @@ async fn force_controller_fail_closed_confirmed(
     matches!(master, Ok(Ok(true))) && matches!(udp, Ok(Ok(true)))
 }
 
+fn ensure_current(is_current: &impl Fn() -> bool) -> Result<(), GuardianCycleError> {
+    if is_current() {
+        Ok(())
+    } else {
+        Err(GuardianCycleError::StaleProbeGeneration)
+    }
+}
+
 pub(crate) fn udp_selector_target(
     private: &PrivateRoutingConfig,
     selected_outlet: Option<&str>,
@@ -684,29 +757,34 @@ async fn probe_controller_outlet_scheduled(
     let proxy_name = outlet_proxy_name(&outlet.id);
     let mut delays = Vec::new();
     let mut tasks = tokio::task::JoinSet::new();
-    for (index, target) in targets.iter().enumerate() {
-        let controller = controller.clone();
-        let proxy_name = proxy_name.clone();
-        let target = target.clone();
-        tasks.spawn(async move {
-            let jitter = probe_jitter_ms(&proxy_name, index);
-            tokio::time::sleep(Duration::from_millis(jitter)).await;
-            match tokio::time::timeout(
-                Duration::from_millis(timeout_ms),
-                controller.delay(&proxy_name, &target, timeout_ms),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(ControllerError::Timeout),
-            }
-        });
+    let mut next_target = 0;
+    while next_target < targets.len() && tasks.len() < TARGET_PROBE_CONCURRENCY {
+        spawn_target_probe(
+            &mut tasks,
+            controller,
+            &proxy_name,
+            targets[next_target].clone(),
+            next_target,
+            timeout_ms,
+        );
+        next_target += 1;
     }
     let deadline = Duration::from_millis(timeout_ms.saturating_add(500));
     let _ = tokio::time::timeout(deadline, async {
         while let Some(outcome) = tasks.join_next().await {
             if let Ok(Ok(delay)) = outcome {
                 delays.push(delay);
+            }
+            if next_target < targets.len() {
+                spawn_target_probe(
+                    &mut tasks,
+                    controller,
+                    &proxy_name,
+                    targets[next_target].clone(),
+                    next_target,
+                    timeout_ms,
+                );
+                next_target += 1;
             }
         }
     })
@@ -858,6 +936,31 @@ async fn wait_for_cancel(cancel: Arc<AtomicBool>) {
     while !cancel.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+fn spawn_target_probe(
+    tasks: &mut tokio::task::JoinSet<Result<u64, ControllerError>>,
+    controller: &ControllerClient,
+    proxy_name: &str,
+    target: String,
+    index: usize,
+    timeout_ms: u64,
+) {
+    let controller = controller.clone();
+    let proxy_name = proxy_name.to_owned();
+    tasks.spawn(async move {
+        let jitter = probe_jitter_ms(&proxy_name, index);
+        tokio::time::sleep(Duration::from_millis(jitter)).await;
+        match tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            controller.delay(&proxy_name, &target, timeout_ms),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ControllerError::Timeout),
+        }
+    });
 }
 
 fn probe_jitter_ms(outlet_id: &str, target_index: usize) -> u64 {
@@ -1538,5 +1641,79 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 3);
         assert!(started.elapsed() < Duration::from_millis(900));
         server.join().expect("Controller server");
+    }
+
+    #[tokio::test]
+    async fn configurable_targets_never_exceed_fixed_concurrency_window() {
+        use std::{
+            io::{Read, Write},
+            net::{Ipv4Addr, TcpListener},
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicUsize, Ordering},
+            },
+            thread,
+        };
+
+        let target_count = 7;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("fake Controller");
+        let address = listener.local_addr().expect("Controller address");
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let handlers = Arc::new(Mutex::new(Vec::new()));
+        let server_active = Arc::clone(&active);
+        let server_maximum = Arc::clone(&maximum);
+        let server_requests = Arc::clone(&requests);
+        let server_handlers = Arc::clone(&handlers);
+        let server = thread::spawn(move || {
+            for stream in listener.incoming().take(target_count) {
+                let Ok(mut stream) = stream else { continue };
+                server_requests.fetch_add(1, Ordering::SeqCst);
+                let active = Arc::clone(&server_active);
+                let maximum = Arc::clone(&server_maximum);
+                let handler = thread::spawn(move || {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    let mut buffer = [0_u8; 2_048];
+                    let _ = stream.read(&mut buffer);
+                    thread::sleep(Duration::from_millis(400));
+                    let body = br#"{"delay":42}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(body);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                });
+                server_handlers.lock().expect("handlers").push(handler);
+            }
+        });
+        let controller =
+            ControllerClient::new(&format!("http://{address}"), "fixture-secret".into(), 3_000)
+                .expect("Controller client");
+        let outlet = OutletConfig {
+            id: "fixture-window".into(),
+            label: "Fixture".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "http://127.0.0.1:45123".into(),
+            },
+        };
+        let targets = (0..target_count)
+            .map(|index| format!("https://fixture-{index}.invalid/health"))
+            .collect::<Vec<_>>();
+        let result = probe_controller_outlet(&controller, &outlet, &targets, 2_000).await;
+
+        server.join().expect("Controller server");
+        for handler in handlers.lock().expect("handlers").drain(..) {
+            handler.join().expect("Controller handler");
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), target_count);
+        assert_eq!(maximum.load(Ordering::SeqCst), TARGET_PROBE_CONCURRENCY);
+        let expected_targets = u32::try_from(target_count).expect("bounded fixture target count");
+        assert_eq!(result.successful_targets, expected_targets);
+        assert_eq!(result.total_targets, expected_targets);
     }
 }

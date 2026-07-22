@@ -1032,7 +1032,9 @@ struct OwnedProbeCore {
 struct OwnedSubscriptionProbeRuntime {
     core: OwnedProbeCore,
     fingerprint: u64,
-    ready_outlets: HashSet<String>,
+    ready_outlets: Arc<Mutex<HashSet<String>>>,
+    readiness_cancel: Arc<AtomicBool>,
+    readiness_watcher: tokio::task::JoinHandle<()>,
 }
 
 pub struct SubscriptionProbeRuntimeHandle {
@@ -1134,7 +1136,7 @@ impl OwnedProbeCore {
         false
     }
 
-    async fn wait_for_provider_catalog(&self, outlets: &[OutletConfig]) -> HashSet<String> {
+    async fn provider_catalog_snapshot(&self, outlets: &[OutletConfig]) -> HashSet<String> {
         for outlet in outlets {
             let _ = self
                 .controller
@@ -1142,32 +1144,69 @@ impl OwnedProbeCore {
                 .await;
         }
         let mut ready = HashSet::new();
-        for _ in 0..40 {
-            for outlet in outlets {
-                if ready.contains(&outlet.id) {
-                    continue;
-                }
-                if self
-                    .controller
-                    .selector_nodes(&outlet_proxy_name(&outlet.id))
-                    .await
-                    .is_ok_and(|snapshot| {
-                        snapshot
-                            .nodes
-                            .iter()
-                            .any(|node| node.name != FAIL_CLOSED_PROXY)
-                    })
-                {
-                    ready.insert(outlet.id.clone());
-                }
+        for outlet in outlets {
+            if provider_outlet_ready(&self.controller, outlet).await {
+                ready.insert(outlet.id.clone());
             }
-            if ready.len() == outlets.len() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
         }
         ready
     }
+}
+
+impl Drop for OwnedSubscriptionProbeRuntime {
+    fn drop(&mut self) {
+        self.readiness_cancel.store(true, Ordering::Release);
+        self.readiness_watcher.abort();
+    }
+}
+
+async fn provider_outlet_ready(controller: &ControllerClient, outlet: &OutletConfig) -> bool {
+    controller
+        .selector_nodes(&outlet_proxy_name(&outlet.id))
+        .await
+        .is_ok_and(|snapshot| {
+            snapshot
+                .nodes
+                .iter()
+                .any(|node| node.name != FAIL_CLOSED_PROXY)
+        })
+}
+
+fn spawn_provider_readiness_watcher(
+    controller: ControllerClient,
+    outlets: Vec<OutletConfig>,
+    ready_outlets: Arc<Mutex<HashSet<String>>>,
+    cancel: Arc<AtomicBool>,
+    notify: Option<Arc<dyn Fn(String) + Send + Sync>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                return;
+            }
+            for outlet in &outlets {
+                let already_ready = ready_outlets
+                    .lock()
+                    .is_ok_and(|ready| ready.contains(&outlet.id));
+                if already_ready || !provider_outlet_ready(&controller, outlet).await {
+                    continue;
+                }
+                let inserted = ready_outlets
+                    .lock()
+                    .is_ok_and(|mut ready| ready.insert(outlet.id.clone()));
+                if inserted && let Some(notify) = &notify {
+                    notify(outlet.id.clone());
+                }
+            }
+            if ready_outlets
+                .lock()
+                .is_ok_and(|ready| ready.len() == outlets.len())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
 }
 
 impl Drop for OwnedProbeCore {
@@ -3996,6 +4035,7 @@ impl AppState {
     pub async fn subscription_probe_runtime(
         &self,
         private: &PrivateRoutingConfig,
+        readiness_notify: Option<Arc<dyn Fn(String) + Send + Sync>>,
     ) -> Result<SubscriptionProbeRuntimeHandle, String> {
         let resolved = self.resolved_subscription_urls(private)?;
         let configured = private
@@ -4082,19 +4122,32 @@ impl AppState {
             )
             .await
             .map_err(|_| "probe_runtime_start_failed".to_string())?;
+            let initial_ready = core.provider_catalog_snapshot(&configured).await;
+            let ready_outlets = Arc::new(Mutex::new(initial_ready));
+            let readiness_cancel = Arc::new(AtomicBool::new(false));
+            let readiness_watcher = spawn_provider_readiness_watcher(
+                core.controller.clone(),
+                configured.clone(),
+                Arc::clone(&ready_outlets),
+                Arc::clone(&readiness_cancel),
+                readiness_notify,
+            );
             *slot = Some(OwnedSubscriptionProbeRuntime {
                 core,
                 fingerprint,
-                ready_outlets: HashSet::new(),
+                ready_outlets,
+                readiness_cancel,
+                readiness_watcher,
             });
         }
         let runtime = slot.as_mut().expect("probe runtime initialized");
-        if runtime.ready_outlets.len() != configured.len() {
-            runtime.ready_outlets = runtime.core.wait_for_provider_catalog(&configured).await;
-        }
         Ok(SubscriptionProbeRuntimeHandle {
             controller: runtime.core.controller.clone(),
-            ready_outlets: runtime.ready_outlets.clone(),
+            ready_outlets: runtime
+                .ready_outlets
+                .lock()
+                .map(|ready| ready.clone())
+                .unwrap_or_default(),
         })
     }
 
@@ -6503,6 +6556,76 @@ mod tests {
         assert!(!yaml.contains("external-controller: 127.0.0.1:45101"));
         assert!(!yaml.contains("tun:"));
         assert!(!yaml.contains("dns:"));
+    }
+
+    #[tokio::test]
+    async fn late_provider_readiness_notifies_without_waiting_for_fallback_timer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("fake Controller");
+        let address = listener.local_addr().expect("Controller address");
+        let server = thread::spawn(move || {
+            for attempt in 0..3 {
+                let (mut stream, _) = listener.accept().expect("Controller request");
+                let mut request = [0_u8; 2_048];
+                let _ = stream.read(&mut request);
+                let ready = attempt == 2;
+                let member = if ready { "Synthetic Ready" } else { "REJECT" };
+                let body = serde_json::json!({
+                    "proxies": {
+                        "VPN-HUB-OUTLET-late-sub": {
+                            "type": "URLTest",
+                            "now": member,
+                            "all": [member]
+                        },
+                        (member): {"type": "Vless", "alive": ready}
+                    }
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("Controller response");
+            }
+        });
+        let controller =
+            ControllerClient::new(&format!("http://{address}"), "fixture-secret".into(), 1_000)
+                .expect("Controller client");
+        let outlet = OutletConfig {
+            id: "late-sub".into(),
+            label: "Late subscription".into(),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: "fixture.secret".into(),
+                provider_update_seconds: 180,
+            },
+        };
+        let ready_outlets = Arc::new(Mutex::new(HashSet::new()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = spawn_provider_readiness_watcher(
+            controller,
+            vec![outlet],
+            Arc::clone(&ready_outlets),
+            Arc::clone(&cancel),
+            Some(Arc::new(move |outlet_id| {
+                let _ = sender.send(outlet_id);
+            })),
+        );
+
+        let notified = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("readiness notification deadline")
+            .expect("readiness notification");
+        assert_eq!(notified, "late-sub");
+        assert!(
+            ready_outlets
+                .lock()
+                .is_ok_and(|ready| ready.contains("late-sub"))
+        );
+        watcher.await.expect("watcher completion");
+        server.join().expect("Controller server");
     }
 
     #[cfg(target_os = "windows")]

@@ -17,7 +17,7 @@ VPN Hub 在桌面协调器启动时立即为所有启用且可验证的出口签
 | 等待探测运行时 | 60 秒低频复核 | runtime、网络、恢复或配置事件立即唤醒 |
 | terminal gate | 无定时器 | 显式恢复事件唤醒 |
 
-每个出口同一时间至多有一个租约。租约携带 generation；取消或旧 generation 的完成消息不能更新当前调度状态。桌面协调器仍只保留一个 Guardian 工作任务，因此不会形成无界任务队列。
+每个出口同一时间至多有一个租约。租约携带 generation；配置重载会立即使旧 generation 失效。SQLite 目录同步、UDP 初始证据、探测样本和路由切换都在事务内再次校验 generation；Controller selector 和内存视图也在每次修改前校验。旧任务因此不能留下部分数据库写入、旧 selector 选择或旧 UI 状态。桌面协调器仍只保留一个 Guardian 工作任务，因此不会形成无界任务队列。
 
 ## 状态与证据边界
 
@@ -47,18 +47,19 @@ flowchart LR
 | Controller | 独立随机 loopback 端口和 32 字节随机 secret |
 | 默认路由 | `MASTER` 首项为 `REJECT`，无 `DIRECT` fallback |
 | 网络副作用 | `allow-lan=false`；不配置 TUN/DNS，不修改 WinINet/WinHTTP、路由、适配器或防火墙 |
-| 进程 | 只保存本次创建的 child；Drop/配置失效/APP 退出仅终止该 PID |
+| provider 就绪 | 首次快照后由独立 watcher 每 250ms 只复核未就绪出口；首次发现成员时主动唤醒对应出口，60 秒仅作丢事件兜底 |
+| 进程 | 只保存本次创建的 child；Drop/配置失效/APP 退出会取消 watcher 并仅终止该 PID |
 | 文件 | 配置位于 ACL 加固的临时目录，运行时销毁；URL 和 secret 不进入 SQLite、UI、事件或日志 |
 
 产品自管核心运行时复用其已验证 Controller，但只探测调度器签发的 outlet 集合；路由决策仍从完整 SQLite 稳定状态计算，保留连续失败 2 次进入 `down`、连续成功 3 次恢复以及 Fail Closed。
 
 ## 并发、期限与请求上界
 
-一个出口的三个目标并发执行，每目标沿用 `request_timeout_ms`，整组使用 `request_timeout_ms + 500ms` 全局 deadline。deadline 到达时取消余下任务并保留已完成结果。每个租约最多发出 `probe_targets.len()` 个请求；per-outlet 调度、失败退避和 jitter 避免全量 3 秒请求风暴。
+配置允许 2～8 个探测目标。一个出口至多同时执行 3 个目标请求，完成一个才补入下一个；每目标沿用 `request_timeout_ms`，整组使用 `request_timeout_ms + 500ms` 全局 deadline。deadline 到达时取消余下任务并保留已完成结果。每个租约最多发出 `probe_targets.len()` 个请求；per-outlet 调度、固定并发窗口、失败退避和 jitter 共同限制失败期请求量。
 
 ## UI 通知
 
-每批状态写入后，Tauri 发出 `guardian://updated`。事件仅包含 generation、稳定 outlet ID 和固定 reason code；React 收到后立即重读权威 dashboard。15 秒轮询保留为窗口重开或通知丢失时的恢复兜底。
+每个出口的权威 SQLite 提交完成后立即发出 `guardian://updated`，不等待同批其他本地或订阅出口结束；测试约束本地出口通知不被一个 2 秒 sibling 阻塞。事件仅包含 generation、稳定 outlet ID 和固定 reason code；React 收到后立即重读权威 dashboard。15 秒轮询保留为窗口重开或通知丢失时的恢复兜底。
 
 ## 回滚
 
