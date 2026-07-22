@@ -16,7 +16,7 @@
 | 私密文件 ACL | 仅当前用户与 `SYSTEM` 拥有 `FullControl` | 已确认 |
 | Provider | provider cache 已生成 | 已确认 |
 | Controller | loopback Controller ready | 已确认 |
-| 主选择组约束 | `VPN-HUB-MASTER` 只允许 `REJECT`、`VPN-HUB-SUBSCRIPTION-A`、`VPN-HUB-LOCAL-CLIENT` 三个固定项 | 已确认 |
+| 主选择组约束 | `VPN-HUB-MASTER` 只允许 `REJECT`、`VPN-HUB-OUTLET-subscription-a`、`VPN-HUB-OUTLET-local-client` 三个固定项 | 已确认 |
 
 ## 优先级模式
 
@@ -41,7 +41,7 @@
 |---|---|
 | UI | 显示 `manual · Local client` |
 | 切换记录 | 存在原因 `manual_selection` 的 `route_switch` 事件 |
-| Controller | `VPN-HUB-MASTER` 确认为 `VPN-HUB-LOCAL-CLIENT` |
+| Controller | `VPN-HUB-MASTER` 确认为 `VPN-HUB-OUTLET-local-client` |
 
 | 目标 | 经 `36666` | 耗时 |
 |---|---:|---:|

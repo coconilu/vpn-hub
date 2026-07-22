@@ -394,8 +394,8 @@ impl PrivateRoutingConfig {
     }
 
     fn from_legacy(legacy: LegacyPrivateRoutingConfig) -> Result<Self, PrivateConfigError> {
-        legacy.validate()?;
-        let legacy_local_id = legacy.local_outlet_id()?.to_owned();
+        let layout = legacy.validated_layout()?;
+        let legacy_local_id = layout.local_outlet_id;
         let map_legacy_id = |id: &str| -> Result<String, PrivateConfigError> {
             if id == LEGACY_SUBSCRIPTION_ID {
                 Ok(LEGACY_SUBSCRIPTION_ID.into())
@@ -430,7 +430,7 @@ impl PrivateRoutingConfig {
                 endpoint: "socks5h://127.0.0.1:16666".into(),
             },
         });
-        let mapped_priority = legacy
+        let mapped_priority = layout
             .priority
             .iter()
             .map(|id| map_legacy_id(id))
@@ -486,7 +486,7 @@ impl PrivateRoutingConfig {
             controller_port: self.controller_port,
             route_mode: self.route_mode,
             manual_outlet: self.manual_outlet.clone(),
-            priority: self.priority(),
+            priority: Some(self.priority()),
             cooldown_seconds: self.cooldown_seconds,
             minimum_improvement_ms: self.minimum_improvement_ms,
             probe_targets: self.probe_targets.clone(),
@@ -575,7 +575,7 @@ struct LegacyPrivateRoutingConfig {
     controller_port: u16,
     route_mode: RouteMode,
     manual_outlet: Option<String>,
-    priority: Vec<String>,
+    priority: Option<Vec<String>>,
     cooldown_seconds: u64,
     minimum_improvement_ms: u64,
     probe_targets: Vec<String>,
@@ -589,7 +589,7 @@ impl Default for LegacyPrivateRoutingConfig {
             controller_port: 39_090,
             route_mode: RouteMode::Priority,
             manual_outlet: None,
-            priority: vec![LEGACY_SUBSCRIPTION_ID.into(), DEFAULT_LOCAL_ID.into()],
+            priority: None,
             cooldown_seconds: 60,
             minimum_improvement_ms: 150,
             probe_targets: PrivateRoutingConfig::default().probe_targets,
@@ -598,7 +598,7 @@ impl Default for LegacyPrivateRoutingConfig {
 }
 
 impl LegacyPrivateRoutingConfig {
-    fn validate(&self) -> Result<(), PrivateConfigError> {
+    fn validated_layout(&self) -> Result<LegacyDualOutletLayout, PrivateConfigError> {
         if !self.subscription_url.is_empty() {
             validate_subscription_url(&self.subscription_url)?;
         }
@@ -607,10 +607,17 @@ impl LegacyPrivateRoutingConfig {
                 "legacy routing thresholds are invalid".into(),
             ));
         }
-        if self.priority.len() != 2
-            || self.priority[0] == self.priority[1]
-            || self
-                .priority
+        let priority = self.priority.clone().unwrap_or_else(|| {
+            let local_id = self
+                .manual_outlet
+                .as_deref()
+                .filter(|id| *id != LEGACY_SUBSCRIPTION_ID)
+                .unwrap_or(DEFAULT_LOCAL_ID);
+            vec![LEGACY_SUBSCRIPTION_ID.into(), local_id.into()]
+        });
+        if priority.len() != 2
+            || priority[0] == priority[1]
+            || priority
                 .iter()
                 .filter(|id| id.as_str() == LEGACY_SUBSCRIPTION_ID)
                 .count()
@@ -620,28 +627,35 @@ impl LegacyPrivateRoutingConfig {
                 "legacy dual-outlet priority is ambiguous".into(),
             ));
         }
-        for id in &self.priority {
+        for id in &priority {
             validate_outlet_id(id)?;
         }
         if self
             .manual_outlet
             .as_deref()
-            .is_some_and(|id| !self.priority.iter().any(|candidate| candidate == id))
+            .is_some_and(|id| !priority.iter().any(|candidate| candidate == id))
         {
             return Err(PrivateConfigError::Invalid(
                 "legacy manual_outlet is ambiguous".into(),
             ));
         }
-        Ok(())
-    }
-
-    fn local_outlet_id(&self) -> Result<&str, PrivateConfigError> {
-        self.priority
+        let local_outlet_id = priority
             .iter()
             .find(|id| id.as_str() != LEGACY_SUBSCRIPTION_ID)
-            .map(String::as_str)
-            .ok_or_else(|| PrivateConfigError::Invalid("legacy local outlet is ambiguous".into()))
+            .cloned()
+            .ok_or_else(|| {
+                PrivateConfigError::Invalid("legacy local outlet is ambiguous".into())
+            })?;
+        Ok(LegacyDualOutletLayout {
+            priority,
+            local_outlet_id,
+        })
     }
+}
+
+struct LegacyDualOutletLayout {
+    priority: Vec<String>,
+    local_outlet_id: String,
 }
 
 #[must_use]
@@ -1284,6 +1298,26 @@ probe_targets = ["https://a.invalid/", "https://b.invalid/"]
     }
 
     #[test]
+    fn migrates_legacy_local_manual_reference_when_priority_is_omitted() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("routing.toml");
+        let legacy = r#"
+subscription_url = ""
+provider_update_seconds = 180
+controller_port = 39090
+route_mode = "manual"
+manual_outlet = "legacy-local-slot"
+cooldown_seconds = 60
+minimum_improvement_ms = 150
+probe_targets = ["https://a.invalid/", "https://b.invalid/"]
+"#;
+        fs::write(&path, legacy).expect("legacy file");
+        let config = PrivateRoutingConfig::load(&path).expect("migrate");
+        assert_eq!(config.priority(), ["subscription-a", "local-client"]);
+        assert_eq!(config.manual_outlet.as_deref(), Some("local-client"));
+    }
+
+    #[test]
     fn rejects_ambiguous_legacy_dual_outlet_structure() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("routing.toml");
@@ -1299,6 +1333,22 @@ minimum_improvement_ms = 150
 probe_targets = ["https://a.invalid/", "https://b.invalid/"]
 "#;
         fs::write(&path, ambiguous).expect("legacy file");
+        assert!(matches!(
+            PrivateRoutingConfig::load(&path),
+            Err(PrivateConfigError::Invalid(message)) if message.contains("ambiguous")
+        ));
+
+        let two_local_slots = r#"
+subscription_url = ""
+provider_update_seconds = 180
+controller_port = 39090
+route_mode = "priority"
+priority = ["legacy-local-a", "legacy-local-b"]
+cooldown_seconds = 60
+minimum_improvement_ms = 150
+probe_targets = ["https://a.invalid/", "https://b.invalid/"]
+"#;
+        fs::write(&path, two_local_slots).expect("legacy file");
         assert!(matches!(
             PrivateRoutingConfig::load(&path),
             Err(PrivateConfigError::Invalid(message)) if message.contains("ambiguous")

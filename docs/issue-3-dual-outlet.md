@@ -4,8 +4,8 @@
 
 ```text
 应用 -> 127.0.0.1:36666 -> VPN-HUB-MASTER
-                              |-- VPN-HUB-SUBSCRIPTION-A -> Mihomo proxy provider
-                              |-- VPN-HUB-LOCAL-CLIENT -> 127.0.0.1:16666
+                              |-- VPN-HUB-OUTLET-subscription-a -> Mihomo proxy provider
+                              |-- VPN-HUB-OUTLET-local-client -> 127.0.0.1:16666
                               `-- REJECT（全部不可用或手动出口异常）
 ```
 
