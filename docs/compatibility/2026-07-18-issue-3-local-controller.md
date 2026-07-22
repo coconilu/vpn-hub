@@ -9,10 +9,10 @@
 ```text
 127.0.0.1:36666 -> Mihomo VPN-HUB-MASTER
                     |-- REJECT（初始状态）
-                    `-- VPN-HUB-CHAOSHIHUI -> 127.0.0.1:16666 -> HTTPS
+                    `-- VPN-HUB-OUTLET-local-client -> 127.0.0.1:16666 -> HTTPS
 ```
 
-未停止或重启 SpeedCat、超实惠；未修改 Windows 系统代理。
+未停止或重启 Local client A/B；未修改 Windows 系统代理。
 
 ## 结果
 
@@ -21,7 +21,7 @@
 | 生成的运行时配置通过 Mihomo 启动 | 通过 |
 | Controller 使用随机 secret 且只监听 loopback | 通过 |
 | 初始选择器为 `REJECT`，HTTPS 请求失败关闭 | 通过 |
-| Controller 将真实选择器切到 `VPN-HUB-CHAOSHIHUI` | 通过 |
+| Controller 将真实选择器切到 `VPN-HUB-OUTLET-local-client` | 通过 |
 | `36666 -> 16666` 完成 Gstatic HTTPS 请求 | 通过 |
 | 测试结束释放 `36666` 和 Controller 端口 | 通过 |
 | 测试前后 `6666` 监听 PID | 均为 `64908` |

@@ -27,23 +27,23 @@
 | 组件 | 地址 | 对用户可见 | 说明 |
 |---|---:|---:|---|
 | 统一客户端 Mihomo Mixed Port | `127.0.0.1:6666` | 是 | 唯一稳定入口，永久保留 |
-| 超实惠内部 Mixed Port | `127.0.0.1:16666` | 否 | 仅由统一客户端访问 |
-| SpeedCat 内部 Mixed Port | `127.0.0.1:26666` | 否 | 仅由统一客户端访问 |
+| Local client A 内部 Mixed Port | `127.0.0.1:16666` | 否 | 仅由统一客户端访问 |
+| Local client B 内部 Mixed Port | `127.0.0.1:26666` | 否 | 仅由统一客户端访问 |
 | 统一客户端控制 API | `127.0.0.1:19090` | 否 | 随机密钥保护，仅本机访问 |
 
 ## 2. 已确认事实、推测和待验证项
 
 | 分类 | 内容 |
 |---|---|
-| 已确认 | 超实惠版本为 2.2.4，核心进程为 `chaoshihuiCore.exe` |
-| 已确认 | SpeedCat Lite 版本为 3.0.3，核心进程为 `SpeedCatCore.exe` |
+| 已确认 | Local client A 的核心进程可独立监听 `127.0.0.1:16666` |
+| 已确认 | Local client B 的核心进程继续监听 `127.0.0.1:6666` |
 | 已确认 | 两者当前都使用 `127.0.0.1:6666` 作为 Mixed Port |
 | 已确认 | 两个核心都包含 Clash.Meta/Mihomo、SOCKS5、Mixed Port 和标准 API 路由代码 |
-| 已确认 | 两个客户端的本地配置对象源自 FlClash 架构或高度相似的衍生架构 |
+| 已确认 | 两个客户端的本地配置对象结构高度相似 |
 | 已确认 | 本地配置模型包含可覆写的 `mixed-port`、`allow-lan`、`tun.enable` 和 `external-controller` 字段 |
 | 已确认 | 当前未发现可直接访问的标准 HTTP 控制 API |
-| 已确认 | SpeedCat 存在 `\\.\pipe\SpeedCat` 命名管道，但普通用户连接被拒绝 |
-| 合理推测 | 两个客户端是基于 FlClash 改造的白标客户端，并使用私有 GUI/Core IPC |
+| 已确认 | Local client B 存在客户端专用命名管道，但普通用户连接被拒绝 |
+| 合理推测 | 两个客户端可能共享相近的白标架构，并使用私有 GUI/Core IPC |
 | 待验证 | 两个客户端的设置页能否直接修改 Mixed Port |
 | 待验证 | 两个客户端同时运行时是否还存在端口、服务、TUN 或账号层冲突 |
 | 待验证 | 两个内部 Mixed Port 的 SOCKS5 UDP 是否可用 |
@@ -89,8 +89,8 @@ flowchart TB
     Master --> Manual["手动模式"]
 
     Priority --> A["出口 A：远程订阅"]
-    Priority --> B["出口 B：超实惠 127.0.0.1:16666"]
-    Priority --> C["出口 C：SpeedCat 127.0.0.1:26666"]
+    Priority --> B["出口 B：Local client A 127.0.0.1:16666"]
+    Priority --> C["出口 C：Local client B 127.0.0.1:26666"]
 
     Guardian["Guardian 守护与监控"] <-->|"REST / WebSocket"| Core
     Guardian --> Process["进程与端口检测"]
@@ -128,11 +128,11 @@ flowchart TB
 
 ## 6. 上游客户端接入方式
 
-### 6.1 超实惠和 SpeedCat
+### 6.1 Local client A 和 Local client B
 
 两者都只作为本地代理出口运行：
 
-| 设置 | 超实惠 | SpeedCat |
+| 设置 | Local client A | Local client B |
 |---|---:|---:|
 | Mixed Port | `16666` | `26666` |
 | 系统代理 | 关闭 | 关闭 |
@@ -146,13 +146,13 @@ flowchart TB
 
 ```yaml
 proxies:
-  - name: OUT-CHAOSHIHUI
+  - name: OUT-LOCAL-A
     type: socks5
     server: 127.0.0.1
     port: 16666
     udp: true
 
-  - name: OUT-SPEEDCAT
+  - name: OUT-LOCAL-B
     type: socks5
     server: 127.0.0.1
     port: 26666
@@ -192,8 +192,8 @@ proxy-providers:
 | Windows 系统代理 | 统一客户端 |
 | Windows TUN/虚拟网卡 | 统一客户端 |
 | DNS 劫持 | 统一 Mihomo |
-| 内部端口 16666 | 超实惠 |
-| 内部端口 26666 | SpeedCat |
+| 内部端口 16666 | Local client A |
+| 内部端口 26666 | Local client B |
 
 ### 7.2 Windows TUN 防递归能力门禁
 
@@ -226,8 +226,8 @@ proxy-groups:
     type: fallback
     proxies:
       - A-AUTO
-      - OUT-CHAOSHIHUI
-      - OUT-SPEEDCAT
+      - OUT-LOCAL-A
+      - OUT-LOCAL-B
     url: https://cp.cloudflare.com
     interval: 30
     lazy: false
@@ -236,8 +236,8 @@ proxy-groups:
     type: url-test
     proxies:
       - A-AUTO
-      - OUT-CHAOSHIHUI
-      - OUT-SPEEDCAT
+      - OUT-LOCAL-A
+      - OUT-LOCAL-B
     url: https://cp.cloudflare.com
     interval: 60
     tolerance: 80
@@ -248,17 +248,17 @@ proxy-groups:
       - PRIORITY
       - FASTEST
       - A-AUTO
-      - OUT-CHAOSHIHUI
-      - OUT-SPEEDCAT
+      - OUT-LOCAL-A
+      - OUT-LOCAL-B
 ```
 
 ### 8.1 用户模式
 
 | 模式 | 行为 | 默认性 |
 |---|---|---:|
-| 优先级 | A 可用用 A；A 失败用超实惠；再失败用 SpeedCat | 默认 |
+| 优先级 | A 可用用 A；A 失败用 Local client A；再失败用 Local client B | 默认 |
 | 最低延迟 | 在三个顶层出口间选择较低延迟出口 | 可选 |
-| 手动锁定 | 固定使用 A、超实惠或 SpeedCat | 可选 |
+| 手动锁定 | 固定使用 A、Local client A 或 Local client B | 可选 |
 | 负载均衡 | 不同新连接分散到不同出口 | 第一版不提供 |
 
 ### 8.2 故障恢复策略
@@ -362,8 +362,8 @@ stateDiagram-v2
 | 出口 | 状态 | 当前延迟 | 24h 在线率 | P50/P95 | 最近断线 | 当前使用 |
 |---|---|---:|---:|---:|---|---:|
 | 订阅 A | 正常 | 82ms | 99.8% | 75/130ms | 14:32，48秒 | 是 |
-| 超实惠 | 备用 | 119ms | 98.7% | 105/260ms | 昨日 22:10 | 否 |
-| SpeedCat | 恢复中 | — | 96.2% | 180/490ms | 10:17 | 否 |
+| Local client A | 备用 | 119ms | 98.7% | 105/260ms | 昨日 22:10 | 否 |
+| Local client B | 恢复中 | — | 96.2% | 180/490ms | 10:17 | 否 |
 
 首页同时显示：
 
@@ -411,8 +411,8 @@ stateDiagram-v2
 sequenceDiagram
     participant U as 用户
     participant App as 统一客户端
-    participant B as 超实惠
-    participant C as SpeedCat
+    participant B as Local client A
+    participant C as Local client B
     participant M as Mihomo
 
     U->>App: 启动
@@ -456,10 +456,10 @@ sequenceDiagram
 ## 14. 许可证和分发
 
 - Mihomo 使用 GPLv3。
-- FlClash 使用 GPLv3，两个白标客户端很可能基于其代码，但其合规情况不属于本项目假设范围。
+- 第三方客户端的源码与许可证合规情况不属于本项目假设范围。
 - 个人本地自用风险较低。
 - 如果统一客户端公开分发或商业化，需在正式发布前完成许可证评审，提供必要的许可证、源码获取方式和修改声明。
-- 第一版应把 Mihomo 作为未修改独立 Sidecar，通过进程/API交互，不直接复制 FlClash UI 代码。
+- 第一版应把 Mihomo 作为未修改独立 Sidecar，通过进程/API 交互，不复制第三方客户端 UI 代码。
 
 ## 15. 实施阶段
 
@@ -469,8 +469,8 @@ sequenceDiagram
 
 验收条件：
 
-- 超实惠成功改为 `16666`。
-- SpeedCat 成功改为 `26666`。
+- Local client A 成功改为 `16666`。
+- Local client B 成功改为 `26666`。
 - 两个客户端系统代理、TUN 和穿透模式均关闭。
 - 两个核心能同时运行至少 2 小时。
 - 分别通过两个端口访问探测网站成功。
@@ -529,10 +529,10 @@ sequenceDiagram
 | 场景 | 预期结果 |
 |---|---|
 | 统一客户端启动 | 6666 成功监听，原有应用无需改配置 |
-| 订阅 A 节点失败 | A 内部换节点；必要时切到超实惠 |
-| 订阅 A 全部失败 | 自动切到超实惠并记录事件 |
-| 超实惠 Core 退出 | 端口检测失败，切到下一出口并创建 incident |
-| SpeedCat 端口存在但无法联网 | 路径检测失败，不能误判为健康 |
+| 订阅 A 节点失败 | A 内部换节点；必要时切到 Local client A |
+| 订阅 A 全部失败 | 自动切到 Local client A 并记录事件 |
+| Local client A Core 退出 | 端口检测失败，切到下一出口并创建 incident |
+| Local client B 端口存在但无法联网 | 路径检测失败，不能误判为健康 |
 | 检测网站之一故障 | 标记 Degraded，不立即切换 |
 | 当前出口恢复 | 连续成功并经过冷却后按策略回切 |
 | 三个出口全部失败 | 6666 保持存在但请求失败，不静默直连 |
@@ -549,7 +549,7 @@ sequenceDiagram
 请重点 Review 以下选择：
 
 1. `6666` 是否确认由统一客户端永久独占。
-2. 默认优先级是否为：订阅 A → 超实惠 → SpeedCat。
+2. 默认优先级是否为：订阅 A → Local client A → Local client B。
 3. 全部出口失败时是否确认默认阻断，不允许自动直连。
 4. 恢复后默认自动切回，还是保持当前可用出口。
 5. 第一版是否只做系统代理，TUN 放到后续阶段。
@@ -565,7 +565,7 @@ sequenceDiagram
 |---|---|
 | 稳定入口 | `127.0.0.1:6666` |
 | 默认策略 | 优先级模式 |
-| 默认优先级 | 订阅 A → 超实惠 → SpeedCat |
+| 默认优先级 | 订阅 A → Local client A → Local client B |
 | 故障策略 | Fail Closed |
 | 恢复策略 | 连续成功 3 次 + 5 分钟后自动回切 |
 | 第一版接管方式 | Windows 系统代理 |
@@ -582,5 +582,4 @@ sequenceDiagram
 - [Mihomo Proxy Providers](https://wiki.metacubex.one/en/config/proxy-providers/)
 - [Mihomo Fallback](https://wiki.metacubex.one/en/config/proxy-groups/fallback/)
 - [Mihomo SOCKS5 出站](https://wiki.metacubex.one/en/config/proxies/socks/)
-- [FlClash 项目](https://github.com/chen08209/FlClash)
 - [Tauri Sidecar](https://v2.tauri.app/develop/sidecar/)

@@ -1900,7 +1900,7 @@ mod tests {
         let event = RouteSwitchEvent {
             occurred_at: "2026-01-01T00:00:00Z".into(),
             from_outlet: Some("subscription-a".into()),
-            to_outlet: "chaoshihui".into(),
+            to_outlet: "local-client".into(),
             mode: "priority".into(),
             reason: "priority_policy".into(),
             duration_ms: 12,
