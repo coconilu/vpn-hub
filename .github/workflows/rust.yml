@@ -12,6 +12,33 @@ env:
   EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
+  repository-hygiene:
+    name: Repository hygiene
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.EXPECTED_SHA }}
+          persist-credentials: false
+
+      - name: Assert exact reviewed source
+        shell: pwsh
+        run: |
+          $actual = git rev-parse HEAD
+          if ($actual -ne $env:EXPECTED_SHA) { throw "review source mismatch: expected $env:EXPECTED_SHA, got $actual" }
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .node-version
+
+      - name: Reject specific local client product names
+        run: npm run check:generic-client-names
+
+      - name: Check Markdown relative links
+        run: npm run check:markdown-links
+
   frontend:
     name: Frontend checks
     runs-on: windows-latest

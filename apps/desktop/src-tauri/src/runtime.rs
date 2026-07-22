@@ -6124,7 +6124,7 @@ mod tests {
 provider_update_seconds = 180
 controller_port = 39090
 route_mode = "priority"
-priority = ["subscription-a", "chaoshihui"]
+priority = ["subscription-a", "legacy-local-slot"]
 cooldown_seconds = 60
 minimum_improvement_ms = 150
 probe_targets = ["https://example.com/a", "https://example.com/b"]

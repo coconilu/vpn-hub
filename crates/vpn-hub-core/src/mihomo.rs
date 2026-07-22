@@ -14,7 +14,7 @@ pub const UDP_SELECTOR: &str = "VPN-HUB-UDP";
 pub const FAIL_CLOSED_PROXY: &str = "REJECT";
 const DEFAULT_ENTRY_PORT: u16 = 3_666;
 const LEGACY_SUBSCRIPTION_ID: &str = "subscription-a";
-const LEGACY_LOCAL_ID: &str = "chaoshihui";
+const DEFAULT_LOCAL_ID: &str = "local-client";
 const LEGACY_SECRET_REF: &str = "legacy.subscription-a";
 const RESERVED_OUTLET_IDS: [&str; 1] = ["fail-closed"];
 
@@ -394,7 +394,19 @@ impl PrivateRoutingConfig {
     }
 
     fn from_legacy(legacy: LegacyPrivateRoutingConfig) -> Result<Self, PrivateConfigError> {
-        legacy.validate()?;
+        let layout = legacy.validated_layout()?;
+        let legacy_local_id = layout.local_outlet_id;
+        let map_legacy_id = |id: &str| -> Result<String, PrivateConfigError> {
+            if id == LEGACY_SUBSCRIPTION_ID {
+                Ok(LEGACY_SUBSCRIPTION_ID.into())
+            } else if id == legacy_local_id {
+                Ok(DEFAULT_LOCAL_ID.into())
+            } else {
+                Err(PrivateConfigError::Invalid(
+                    "legacy outlet reference is ambiguous".into(),
+                ))
+            }
+        };
         let mut outlets = Vec::new();
         let mut legacy_subscription_urls = BTreeMap::new();
         outlets.push(OutletConfig {
@@ -411,24 +423,33 @@ impl PrivateRoutingConfig {
                 .insert(LEGACY_SECRET_REF.into(), legacy.subscription_url.clone());
         }
         outlets.push(OutletConfig {
-            id: LEGACY_LOCAL_ID.into(),
-            label: "Local client A".into(),
+            id: DEFAULT_LOCAL_ID.into(),
+            label: "Local client".into(),
             enabled: true,
             kind: OutletKind::LocalProxy {
                 endpoint: "socks5h://127.0.0.1:16666".into(),
             },
         });
-        let order = legacy
+        let mapped_priority = layout
             .priority
+            .iter()
+            .map(|id| map_legacy_id(id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let order = mapped_priority
             .iter()
             .filter_map(|id| outlets.iter().find(|outlet| outlet.id == *id).cloned())
             .chain(
                 outlets
                     .iter()
-                    .filter(|outlet| !legacy.priority.contains(&outlet.id))
+                    .filter(|outlet| !mapped_priority.contains(&outlet.id))
                     .cloned(),
             )
             .collect();
+        let manual_outlet = legacy
+            .manual_outlet
+            .as_deref()
+            .map(map_legacy_id)
+            .transpose()?;
         Ok(Self {
             version: CURRENT_CONFIG_VERSION,
             entry: EntryConfig {
@@ -437,7 +458,7 @@ impl PrivateRoutingConfig {
             },
             controller_port: legacy.controller_port,
             route_mode: legacy.route_mode,
-            manual_outlet: legacy.manual_outlet,
+            manual_outlet,
             cooldown_seconds: legacy.cooldown_seconds,
             minimum_improvement_ms: legacy.minimum_improvement_ms,
             probe_targets: legacy.probe_targets,
@@ -465,7 +486,7 @@ impl PrivateRoutingConfig {
             controller_port: self.controller_port,
             route_mode: self.route_mode,
             manual_outlet: self.manual_outlet.clone(),
-            priority: self.priority(),
+            priority: Some(self.priority()),
             cooldown_seconds: self.cooldown_seconds,
             minimum_improvement_ms: self.minimum_improvement_ms,
             probe_targets: self.probe_targets.clone(),
@@ -554,7 +575,7 @@ struct LegacyPrivateRoutingConfig {
     controller_port: u16,
     route_mode: RouteMode,
     manual_outlet: Option<String>,
-    priority: Vec<String>,
+    priority: Option<Vec<String>>,
     cooldown_seconds: u64,
     minimum_improvement_ms: u64,
     probe_targets: Vec<String>,
@@ -568,7 +589,7 @@ impl Default for LegacyPrivateRoutingConfig {
             controller_port: 39_090,
             route_mode: RouteMode::Priority,
             manual_outlet: None,
-            priority: vec![LEGACY_SUBSCRIPTION_ID.into(), LEGACY_LOCAL_ID.into()],
+            priority: None,
             cooldown_seconds: 60,
             minimum_improvement_ms: 150,
             probe_targets: PrivateRoutingConfig::default().probe_targets,
@@ -577,7 +598,7 @@ impl Default for LegacyPrivateRoutingConfig {
 }
 
 impl LegacyPrivateRoutingConfig {
-    fn validate(&self) -> Result<(), PrivateConfigError> {
+    fn validated_layout(&self) -> Result<LegacyDualOutletLayout, PrivateConfigError> {
         if !self.subscription_url.is_empty() {
             validate_subscription_url(&self.subscription_url)?;
         }
@@ -586,26 +607,55 @@ impl LegacyPrivateRoutingConfig {
                 "legacy routing thresholds are invalid".into(),
             ));
         }
-        if self
-            .priority
-            .iter()
-            .any(|id| !matches!(id.as_str(), LEGACY_SUBSCRIPTION_ID | LEGACY_LOCAL_ID))
+        let priority = self.priority.clone().unwrap_or_else(|| {
+            let local_id = self
+                .manual_outlet
+                .as_deref()
+                .filter(|id| *id != LEGACY_SUBSCRIPTION_ID)
+                .unwrap_or(DEFAULT_LOCAL_ID);
+            vec![LEGACY_SUBSCRIPTION_ID.into(), local_id.into()]
+        });
+        if priority.len() != 2
+            || priority[0] == priority[1]
+            || priority
+                .iter()
+                .filter(|id| id.as_str() == LEGACY_SUBSCRIPTION_ID)
+                .count()
+                != 1
         {
             return Err(PrivateConfigError::Invalid(
-                "legacy priority contains an unknown outlet".into(),
+                "legacy dual-outlet priority is ambiguous".into(),
             ));
+        }
+        for id in &priority {
+            validate_outlet_id(id)?;
         }
         if self
             .manual_outlet
             .as_deref()
-            .is_some_and(|id| !matches!(id, LEGACY_SUBSCRIPTION_ID | LEGACY_LOCAL_ID))
+            .is_some_and(|id| !priority.iter().any(|candidate| candidate == id))
         {
             return Err(PrivateConfigError::Invalid(
-                "legacy manual_outlet is unknown".into(),
+                "legacy manual_outlet is ambiguous".into(),
             ));
         }
-        Ok(())
+        let local_outlet_id = priority
+            .iter()
+            .find(|id| id.as_str() != LEGACY_SUBSCRIPTION_ID)
+            .cloned()
+            .ok_or_else(|| {
+                PrivateConfigError::Invalid("legacy local outlet is ambiguous".into())
+            })?;
+        Ok(LegacyDualOutletLayout {
+            priority,
+            local_outlet_id,
+        })
     }
+}
+
+struct LegacyDualOutletLayout {
+    priority: Vec<String>,
+    local_outlet_id: String,
 }
 
 #[must_use]
@@ -1203,7 +1253,7 @@ subscription_url = "https://example.invalid/provider/credential-token"
 provider_update_seconds = 180
 controller_port = 39090
 route_mode = "priority"
-priority = ["subscription-a", "chaoshihui"]
+priority = ["subscription-a", "legacy-local-slot"]
 cooldown_seconds = 60
 minimum_improvement_ms = 150
 probe_targets = ["https://a.invalid/", "https://b.invalid/"]
@@ -1212,7 +1262,8 @@ probe_targets = ["https://a.invalid/", "https://b.invalid/"]
         let config = PrivateRoutingConfig::load(&path).expect("migrate");
         assert_eq!(config.entry.port, 36_666);
         assert_eq!(config.outlets.len(), 2);
-        assert_eq!(config.priority(), ["subscription-a", "chaoshihui"]);
+        assert_eq!(config.priority(), ["subscription-a", "local-client"]);
+        assert_eq!(config.outlets[1].label, "Local client");
         let summary = serde_json::to_string(&config.summary(&config.resolved_subscription_urls()))
             .expect("summary");
         assert!(!summary.contains("credential-token"));
@@ -1228,22 +1279,100 @@ subscription_url = ""
 provider_update_seconds = 180
 controller_port = 39090
 route_mode = "manual"
-manual_outlet = "subscription-a"
-priority = ["chaoshihui", "subscription-a"]
+manual_outlet = "legacy-local-slot"
+priority = ["legacy-local-slot", "subscription-a"]
 cooldown_seconds = 60
 minimum_improvement_ms = 150
 probe_targets = ["https://a.invalid/", "https://b.invalid/"]
 "#;
         fs::write(&path, legacy).expect("legacy file");
         let config = PrivateRoutingConfig::load(&path).expect("migrate");
-        assert_eq!(config.manual_outlet.as_deref(), Some("subscription-a"));
-        assert_eq!(config.priority(), ["chaoshihui", "subscription-a"]);
+        assert_eq!(config.manual_outlet.as_deref(), Some("local-client"));
+        assert_eq!(config.priority(), ["local-client", "subscription-a"]);
         assert_eq!(config.outlets.len(), 2);
         assert!(config.resolved_subscription_urls().is_empty());
         assert!(matches!(
             config.outlets[1].kind,
             OutletKind::Subscription { .. }
         ));
+    }
+
+    #[test]
+    fn migrates_legacy_local_manual_reference_when_priority_is_omitted() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("routing.toml");
+        let legacy = r#"
+subscription_url = ""
+provider_update_seconds = 180
+controller_port = 39090
+route_mode = "manual"
+manual_outlet = "legacy-local-slot"
+cooldown_seconds = 60
+minimum_improvement_ms = 150
+probe_targets = ["https://a.invalid/", "https://b.invalid/"]
+"#;
+        fs::write(&path, legacy).expect("legacy file");
+        let config = PrivateRoutingConfig::load(&path).expect("migrate");
+        assert_eq!(config.priority(), ["subscription-a", "local-client"]);
+        assert_eq!(config.manual_outlet.as_deref(), Some("local-client"));
+    }
+
+    #[test]
+    fn rejects_ambiguous_legacy_dual_outlet_structure() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("routing.toml");
+        let ambiguous = r#"
+subscription_url = ""
+provider_update_seconds = 180
+controller_port = 39090
+route_mode = "manual"
+manual_outlet = "legacy-local-b"
+priority = ["subscription-a", "legacy-local-a"]
+cooldown_seconds = 60
+minimum_improvement_ms = 150
+probe_targets = ["https://a.invalid/", "https://b.invalid/"]
+"#;
+        fs::write(&path, ambiguous).expect("legacy file");
+        assert!(matches!(
+            PrivateRoutingConfig::load(&path),
+            Err(PrivateConfigError::Invalid(message)) if message.contains("ambiguous")
+        ));
+
+        let two_local_slots = r#"
+subscription_url = ""
+provider_update_seconds = 180
+controller_port = 39090
+route_mode = "priority"
+priority = ["legacy-local-a", "legacy-local-b"]
+cooldown_seconds = 60
+minimum_improvement_ms = 150
+probe_targets = ["https://a.invalid/", "https://b.invalid/"]
+"#;
+        fs::write(&path, two_local_slots).expect("legacy file");
+        assert!(matches!(
+            PrivateRoutingConfig::load(&path),
+            Err(PrivateConfigError::Invalid(message)) if message.contains("ambiguous")
+        ));
+    }
+
+    #[test]
+    fn keeps_dynamic_local_outlet_ids_distinct() {
+        let config = PrivateRoutingConfig {
+            outlets: vec![
+                local("local-client-a", "socks5h://127.0.0.1:2666", true),
+                local("local-client-b", "socks5h://127.0.0.1:4666", true),
+            ],
+            ..PrivateRoutingConfig::default()
+        };
+        let (yaml, _) =
+            generate_mihomo_config(&config, &BTreeMap::new(), "test-secret").expect("config");
+        assert_ne!(
+            outlet_proxy_name("local-client-a"),
+            outlet_proxy_name("local-client-b")
+        );
+        assert!(yaml.contains(&outlet_proxy_name("local-client-a")));
+        assert!(yaml.contains(&outlet_proxy_name("local-client-b")));
+        assert_eq!(config.priority(), ["local-client-a", "local-client-b"]);
     }
 
     #[test]

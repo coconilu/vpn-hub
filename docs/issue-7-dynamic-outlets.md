@@ -23,8 +23,9 @@ Mihomo 主选择器始终以 `REJECT` 为第一个候选，并且不会生成 `D
 没有 `version` 字段的 v0 双出口配置会在加载时映射为动态出口：
 
 - `subscription-a` 迁移为一个 `subscription`，使用兼容 `secret_ref`；
-- `chaoshihui` 迁移为一个 `local_proxy`；
-- 旧 `priority` 顺序、路由模式、手动选择和探测参数保持不变；
+- v0 结构中的唯一非订阅出口迁移为 `local-client` 类型的 `local_proxy`；
+- 旧 `priority` 顺序和手动选择引用映射到通用 ID；路由模式与探测参数保持不变；
+- priority 缺槽、重复或出现多个本地候选时拒绝迁移，不猜测出口身份；
 - 兼容加载不会把订阅 URL写入摘要、数据库或 UI。
 
 每次保存都先验证完整配置，再通过临时文件替换主文件，并保留一份最后有效备份。主文件损坏或校验失败时会回读该备份；若主文件和备份都无效，应用不会生成或启动 Mihomo，保持 Fail Closed。
