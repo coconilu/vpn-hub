@@ -1,5 +1,6 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
+    hash::BuildHasher,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,7 +14,7 @@ use tokio::{sync::Semaphore, task::JoinSet, time::Instant as TokioInstant};
 
 use crate::{
     ControllerClient, ControllerError, GuardianStore, HealthStatus, MonitorConfig, OutletConfig,
-    OutletHealth, PrivateRoutingConfig, ProbeOutletConfig, ProbeResult, RouteDecision,
+    OutletHealth, OutletKind, PrivateRoutingConfig, ProbeOutletConfig, ProbeResult, RouteDecision,
     RouteSwitchEvent, RoutingEngine, RoutingPolicy, StoreError, UDP_SELECTOR, UdpCapabilityStatus,
     current_udp_status, outlet_proxy_name, unknown_udp_evidence,
 };
@@ -417,6 +418,125 @@ pub async fn run_controller_guardian_cycle_controlled(
     })
 }
 
+/// Executes a routing cycle for only the outlets leased by the per-outlet
+/// scheduler while evaluating the route from the complete persisted state.
+///
+/// # Errors
+///
+/// Returns sanitized Controller, `SQLite`, or routing-state failures.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_controller_guardian_cycle_selected<S: BuildHasher>(
+    controller: &ControllerClient,
+    private: &PrivateRoutingConfig,
+    resolved: &crate::ResolvedSubscriptionUrls,
+    monitor: &MonitorConfig,
+    store: &mut GuardianStore,
+    routing: &impl RoutingSession,
+    now_ms: u64,
+    selected: Option<&HashSet<String, S>>,
+) -> Result<GuardianCycleOutcome, GuardianCycleError> {
+    for outlet in private.enabled_outlets() {
+        store.ensure_udp_capability(
+            &outlet.id,
+            &outlet.label,
+            &unknown_udp_evidence(outlet, "not_yet_validated"),
+        )?;
+    }
+    let observed = probe_controller_outlets(
+        controller,
+        private,
+        resolved,
+        monitor.request_timeout_ms,
+        selected,
+    )
+    .await;
+
+    for (outlet, result) in &observed {
+        store.record_probe(
+            outlet,
+            result,
+            monitor.failure_threshold,
+            monitor.recovery_threshold,
+        )?;
+    }
+
+    let enabled_ids = private
+        .enabled_outlets()
+        .map(|outlet| outlet.id.as_str())
+        .collect::<HashSet<_>>();
+    let latest_latency = observed
+        .iter()
+        .map(|(outlet, result)| (outlet.id.as_str(), result.latency_ms))
+        .collect::<BTreeMap<_, _>>();
+    let health = store
+        .summaries()?
+        .into_iter()
+        .filter(|item| enabled_ids.contains(item.outlet_id.as_str()))
+        .map(|item| {
+            let latency_ms = latest_latency
+                .get(item.outlet_id.as_str())
+                .copied()
+                .flatten()
+                .or_else(|| {
+                    item.average_latency_ms
+                        .filter(|latency| latency.is_finite() && *latency >= 0.0)
+                        .and_then(|latency| latency.round().to_string().parse::<u64>().ok())
+                });
+            (
+                item.outlet_id,
+                OutletHealth {
+                    status: item.last_status,
+                    latency_ms,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let policy = RoutingPolicy {
+        priority: private.priority(),
+        cooldown_ms: private.cooldown_seconds.saturating_mul(1_000),
+        minimum_improvement_ms: private.minimum_improvement_ms,
+    };
+    let decision = routing.evaluate_route(now_ms, &health, &policy)?;
+    let started = Instant::now();
+    if let Some(decision) = &decision {
+        controller
+            .select(
+                crate::MASTER_SELECTOR,
+                &outlet_proxy_name(&decision.to_outlet),
+            )
+            .await?;
+    }
+    let selected_outlet = decision
+        .as_ref()
+        .map(|decision| decision.to_outlet.clone())
+        .or(routing.current_outlet()?);
+    let udp_capabilities = store.udp_capabilities()?;
+    let udp_target = udp_selector_target(private, selected_outlet.as_deref(), &udp_capabilities);
+    if let Err(error) = controller.select(UDP_SELECTOR, &udp_target).await {
+        let _ = controller
+            .select(UDP_SELECTOR, crate::FAIL_CLOSED_PROXY)
+            .await;
+        return Err(error.into());
+    }
+    if let Some(decision) = &decision {
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        routing.apply_route(decision, now_ms)?;
+        store.record_route_switch(&RouteSwitchEvent {
+            occurred_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            from_outlet: decision.from_outlet.clone(),
+            to_outlet: decision.to_outlet.clone(),
+            mode: private.route_mode.as_str().into(),
+            reason: decision.reason.clone(),
+            duration_ms,
+        })?;
+    }
+
+    Ok(GuardianCycleOutcome {
+        observed: observed.into_iter().map(|(_, result)| result).collect(),
+        decision,
+    })
+}
+
 fn cycle_invalid(
     routing: &impl RoutingSession,
     expected_generation: u64,
@@ -515,6 +635,98 @@ pub(crate) fn udp_selector_target(
         outlet_proxy_name(selected_outlet)
     } else {
         crate::FAIL_CLOSED_PROXY.to_string()
+    }
+}
+
+/// Collects sanitized multi-target observations for either all enabled outlets
+/// or an explicit per-outlet scheduler selection.
+pub async fn probe_controller_outlets<S: BuildHasher>(
+    controller: &ControllerClient,
+    private: &PrivateRoutingConfig,
+    resolved: &crate::ResolvedSubscriptionUrls,
+    timeout_ms: u64,
+    selected: Option<&HashSet<String, S>>,
+) -> Vec<(ProbeOutletConfig, ProbeResult)> {
+    let mut observed = Vec::new();
+    for outlet in private
+        .enabled_outlets()
+        .filter(|outlet| selected.is_none_or(|selected| selected.contains(&outlet.id)))
+    {
+        let result = match &outlet.kind {
+            OutletKind::Subscription { secret_ref, .. } if !resolved.contains_key(secret_ref) => {
+                unavailable_result(
+                    outlet,
+                    "subscription_not_configured",
+                    private.probe_targets.len(),
+                )
+            }
+            _ => {
+                probe_controller_outlet_scheduled(
+                    controller,
+                    outlet,
+                    &private.probe_targets,
+                    timeout_ms,
+                )
+                .await
+            }
+        };
+        observed.push((virtual_outlet(outlet, &private.entry), result));
+    }
+    observed
+}
+
+async fn probe_controller_outlet_scheduled(
+    controller: &ControllerClient,
+    outlet: &OutletConfig,
+    targets: &[String],
+    timeout_ms: u64,
+) -> ProbeResult {
+    let proxy_name = outlet_proxy_name(&outlet.id);
+    let mut delays = Vec::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, target) in targets.iter().enumerate() {
+        let controller = controller.clone();
+        let proxy_name = proxy_name.clone();
+        let target = target.clone();
+        tasks.spawn(async move {
+            let jitter = probe_jitter_ms(&proxy_name, index);
+            tokio::time::sleep(Duration::from_millis(jitter)).await;
+            match tokio::time::timeout(
+                Duration::from_millis(timeout_ms),
+                controller.delay(&proxy_name, &target, timeout_ms),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(ControllerError::Timeout),
+            }
+        });
+    }
+    let deadline = Duration::from_millis(timeout_ms.saturating_add(500));
+    let _ = tokio::time::timeout(deadline, async {
+        while let Some(outcome) = tasks.join_next().await {
+            if let Ok(Ok(delay)) = outcome {
+                delays.push(delay);
+            }
+        }
+    })
+    .await;
+    tasks.abort_all();
+    delays.sort_unstable();
+    let successful_targets = u32::try_from(delays.len()).unwrap_or(u32::MAX);
+    let total_targets = u32::try_from(targets.len()).unwrap_or(u32::MAX);
+    let (status, latency_ms) = classify_delays(&delays, targets.len());
+    ProbeResult {
+        outlet_id: outlet.id.clone(),
+        label: outlet.label.clone(),
+        observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        port_reachable: true,
+        status,
+        http_status: None,
+        latency_ms,
+        error_code: (status == HealthStatus::Down).then(|| "multi_target_quorum_failed".into()),
+        successful_targets,
+        total_targets,
     }
 }
 
@@ -646,6 +858,13 @@ async fn wait_for_cancel(cancel: Arc<AtomicBool>) {
     while !cancel.load(Ordering::Acquire) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+fn probe_jitter_ms(outlet_id: &str, target_index: usize) -> u64 {
+    outlet_id.bytes().fold(
+        u64::try_from(target_index).unwrap_or(u64::MAX),
+        |hash, byte| hash.wrapping_mul(131).wrapping_add(u64::from(byte)),
+    ) % 251
 }
 
 fn classify_delays(delays: &[u64], total_targets: usize) -> (HealthStatus, Option<u64>) {
@@ -1238,5 +1457,86 @@ mod tests {
         assert!(store.udp_capabilities().expect("udp").is_empty());
         assert_eq!(routing.current_outlet().expect("route"), None);
         assert!(!routing.terminal_unconfirmed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn target_jitter_is_deterministic_and_bounded() {
+        assert_eq!(
+            probe_jitter_ms("outlet-a", 1),
+            probe_jitter_ms("outlet-a", 1)
+        );
+        assert!(probe_jitter_ms("outlet-a", 2) <= 250);
+    }
+
+    #[tokio::test]
+    async fn multi_target_requests_are_bounded_and_keep_partial_results_at_deadline() {
+        use std::{
+            io::{Read, Write},
+            net::{Ipv4Addr, TcpListener},
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            thread,
+        };
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("fake Controller");
+        let address = listener.local_addr().expect("Controller address");
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = Arc::clone(&requests);
+        let server = thread::spawn(move || {
+            for stream in listener.incoming().take(3) {
+                let Ok(mut stream) = stream else { continue };
+                let index = server_requests.fetch_add(1, Ordering::SeqCst);
+                thread::spawn(move || {
+                    let mut buffer = [0_u8; 2_048];
+                    let _ = stream.read(&mut buffer);
+                    if index == 0 {
+                        let body = br#"{"delay":42}"#;
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(body);
+                    } else if index == 1 {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    } else {
+                        thread::sleep(Duration::from_secs(1));
+                    }
+                });
+            }
+        });
+        let controller =
+            ControllerClient::new(&format!("http://{address}"), "fixture-secret".into(), 2_000)
+                .expect("Controller client");
+        let outlet = OutletConfig {
+            id: "fixture-outlet".into(),
+            label: "Fixture".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "http://127.0.0.1:45123".into(),
+            },
+        };
+        let started = Instant::now();
+        let result = probe_controller_outlet_scheduled(
+            &controller,
+            &outlet,
+            &[
+                "https://fixture.invalid/a".into(),
+                "https://fixture.invalid/b".into(),
+                "https://fixture.invalid/c".into(),
+            ],
+            100,
+        )
+        .await;
+        assert_eq!(result.successful_targets, 1);
+        assert_eq!(result.latency_ms, Some(42));
+        assert_eq!(result.status, HealthStatus::Down);
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() < Duration::from_millis(900));
+        server.join().expect("Controller server");
     }
 }

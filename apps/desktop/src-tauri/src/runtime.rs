@@ -1,6 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     env, fs,
+    hash::{Hash, Hasher},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -115,6 +116,37 @@ pub struct CoreStatus {
     pub pid: Option<u32>,
     pub started_at: Option<String>,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutletProbePhase {
+    NotConfigured,
+    WaitingForProbeRuntime,
+    Probing,
+    Healthy,
+    Degraded,
+    Down,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionSourcePhase {
+    NotApplicable,
+    NotConfigured,
+    Waiting,
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutletProbeView {
+    pub outlet_id: String,
+    pub phase: OutletProbePhase,
+    pub source_phase: SubscriptionSourcePhase,
+    pub latency_ms: Option<u64>,
+    pub observed_at: Option<String>,
+    pub reason_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -773,6 +805,8 @@ pub struct AppState {
     runtime_directory: PathBuf,
     secret_store: Option<SystemSecretStore>,
     managed_core: Mutex<Option<ManagedCore>>,
+    subscription_probe_runtime: tokio::sync::Mutex<Option<OwnedSubscriptionProbeRuntime>>,
+    outlet_probe_views: Mutex<HashMap<String, OutletProbeView>>,
     routing_engine: Mutex<RoutingEngine>,
     settings_preview_ticket: Mutex<Option<String>>,
     validated_candidate_ticket: Mutex<Option<String>>,
@@ -995,6 +1029,17 @@ struct OwnedProbeCore {
     _directory: tempfile::TempDir,
 }
 
+struct OwnedSubscriptionProbeRuntime {
+    core: OwnedProbeCore,
+    fingerprint: u64,
+    ready_outlets: HashSet<String>,
+}
+
+pub struct SubscriptionProbeRuntimeHandle {
+    pub controller: ControllerClient,
+    pub ready_outlets: HashSet<String>,
+}
+
 impl OwnedProbeCore {
     #[allow(clippy::too_many_arguments)]
     async fn start(
@@ -1087,6 +1132,41 @@ impl OwnedProbeCore {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         false
+    }
+
+    async fn wait_for_provider_catalog(&self, outlets: &[OutletConfig]) -> HashSet<String> {
+        for outlet in outlets {
+            let _ = self
+                .controller
+                .update_proxy_provider(&provider_name(&outlet.id))
+                .await;
+        }
+        let mut ready = HashSet::new();
+        for _ in 0..40 {
+            for outlet in outlets {
+                if ready.contains(&outlet.id) {
+                    continue;
+                }
+                if self
+                    .controller
+                    .selector_nodes(&outlet_proxy_name(&outlet.id))
+                    .await
+                    .is_ok_and(|snapshot| {
+                        snapshot
+                            .nodes
+                            .iter()
+                            .any(|node| node.name != FAIL_CLOSED_PROXY)
+                    })
+                {
+                    ready.insert(outlet.id.clone());
+                }
+            }
+            if ready.len() == outlets.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        ready
     }
 }
 
@@ -1379,6 +1459,8 @@ impl AppState {
             runtime_directory,
             secret_store,
             managed_core: Mutex::new(None),
+            subscription_probe_runtime: tokio::sync::Mutex::new(None),
+            outlet_probe_views: Mutex::new(HashMap::new()),
             routing_engine: Mutex::new(routing_engine),
             settings_preview_ticket: Mutex::new(None),
             validated_candidate_ticket: Mutex::new(None),
@@ -3836,6 +3918,186 @@ impl AppState {
         Ok(classify_subscription_udp(outlet, true, &outcomes))
     }
 
+    pub fn outlet_probe_views(&self) -> Vec<OutletProbeView> {
+        self.outlet_probe_views
+            .lock()
+            .map(|views| views.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn set_outlet_probe_view(&self, view: OutletProbeView) {
+        if let Ok(mut views) = self.outlet_probe_views.lock() {
+            views.insert(view.outlet_id.clone(), view);
+        }
+    }
+
+    pub fn mark_outlets_probing(&self, outlet_ids: &[String]) {
+        let Ok(private) = self.private_config() else {
+            return;
+        };
+        let resolved = self
+            .resolved_subscription_urls(&private)
+            .unwrap_or_default();
+        let Ok(mut views) = self.outlet_probe_views.lock() else {
+            return;
+        };
+        for outlet in private
+            .enabled_outlets()
+            .filter(|outlet| outlet_ids.contains(&outlet.id))
+        {
+            let (phase, source_phase, reason_code) = match &outlet.kind {
+                OutletKind::LocalProxy { .. } => (
+                    OutletProbePhase::Probing,
+                    SubscriptionSourcePhase::NotApplicable,
+                    None,
+                ),
+                OutletKind::Subscription { secret_ref, .. }
+                    if !resolved.contains_key(secret_ref) =>
+                {
+                    (
+                        OutletProbePhase::NotConfigured,
+                        SubscriptionSourcePhase::NotConfigured,
+                        Some("subscription_not_configured".into()),
+                    )
+                }
+                OutletKind::Subscription { .. } => (
+                    OutletProbePhase::Probing,
+                    views
+                        .get(&outlet.id)
+                        .map_or(SubscriptionSourcePhase::Waiting, |view| view.source_phase),
+                    None,
+                ),
+            };
+            let observed_at = views
+                .get(&outlet.id)
+                .and_then(|view| view.observed_at.clone());
+            views.insert(
+                outlet.id.clone(),
+                OutletProbeView {
+                    outlet_id: outlet.id.clone(),
+                    phase,
+                    source_phase,
+                    latency_ms: None,
+                    observed_at,
+                    reason_code,
+                },
+            );
+        }
+    }
+
+    pub async fn invalidate_subscription_probe_runtime(&self) {
+        *self.subscription_probe_runtime.lock().await = None;
+    }
+
+    /// Starts or reuses the app-owned, random-port subscription probe runtime.
+    /// It never binds the product entry and its generated selectors default to
+    /// `REJECT`; callers receive only a loopback-authenticated Controller.
+    #[allow(clippy::too_many_lines)]
+    pub async fn subscription_probe_runtime(
+        &self,
+        private: &PrivateRoutingConfig,
+    ) -> Result<SubscriptionProbeRuntimeHandle, String> {
+        let resolved = self.resolved_subscription_urls(private)?;
+        let configured = private
+            .enabled_outlets()
+            .filter(|outlet| {
+                matches!(
+                    &outlet.kind,
+                    OutletKind::Subscription { secret_ref, .. }
+                        if resolved.contains_key(secret_ref)
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if configured.is_empty() {
+            *self.subscription_probe_runtime.lock().await = None;
+            return Err("subscription_not_configured".into());
+        }
+        let fingerprint = subscription_probe_fingerprint(private, &resolved, &configured);
+        let mut slot = self.subscription_probe_runtime.lock().await;
+        if let Some(runtime) = slot.as_mut() {
+            let alive = runtime
+                .core
+                .child
+                .try_wait()
+                .map_err(|_| "probe_runtime_state_unavailable".to_string())?
+                .is_none();
+            if !alive || runtime.fingerprint != fingerprint {
+                *slot = None;
+            }
+        }
+        if slot.is_none() {
+            fs::create_dir_all(&self.runtime_directory)
+                .map_err(|_| "probe_runtime_directory_unavailable".to_string())?;
+            harden_private_path(&self.runtime_directory)?;
+            let directory = tempfile::Builder::new()
+                .prefix("subscription-probe-")
+                .tempdir_in(&self.runtime_directory)
+                .map_err(|_| "probe_runtime_directory_unavailable".to_string())?;
+            harden_private_path(directory.path())?;
+            let entry =
+                ProbePortLease::reserve_excluding(&[private.entry.port, private.controller_port])?;
+            let controller = ProbePortLease::reserve_excluding(&[
+                private.entry.port,
+                private.controller_port,
+                entry.port(),
+            ])?;
+            let secret = generate_controller_secret();
+            let (yaml, summary) = isolated_subscription_probe_config(
+                private,
+                &resolved,
+                &configured,
+                entry.port(),
+                controller.port(),
+                &secret,
+            )?;
+            if [summary.entry.port, summary.controller_port]
+                .iter()
+                .any(|port| [private.entry.port, private.controller_port].contains(port))
+                || !matches!(
+                    summary.entry.host.as_str(),
+                    "127.0.0.1" | "localhost" | "::1"
+                )
+            {
+                return Err("probe_runtime_isolation_rejected".into());
+            }
+            let config_path = directory.path().join("mihomo.yaml");
+            fs::write(&config_path, yaml)
+                .map_err(|_| "probe_runtime_config_unavailable".to_string())?;
+            harden_private_path(&config_path)?;
+            let executable = self
+                .find_mihomo_executable()
+                .map_err(|_| "probe_runtime_binary_unavailable".to_string())?;
+            let entry_port = entry.port();
+            let controller_port = controller.port();
+            drop(entry);
+            drop(controller);
+            let core = OwnedProbeCore::start(
+                &executable,
+                directory,
+                &config_path,
+                entry_port,
+                controller_port,
+                &secret,
+            )
+            .await
+            .map_err(|_| "probe_runtime_start_failed".to_string())?;
+            *slot = Some(OwnedSubscriptionProbeRuntime {
+                core,
+                fingerprint,
+                ready_outlets: HashSet::new(),
+            });
+        }
+        let runtime = slot.as_mut().expect("probe runtime initialized");
+        if runtime.ready_outlets.len() != configured.len() {
+            runtime.ready_outlets = runtime.core.wait_for_provider_catalog(&configured).await;
+        }
+        Ok(SubscriptionProbeRuntimeHandle {
+            controller: runtime.core.controller.clone(),
+            ready_outlets: runtime.ready_outlets.clone(),
+        })
+    }
+
     pub async fn lock_routing_transaction(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.routing_transaction.lock().await
     }
@@ -5138,6 +5400,54 @@ impl Default for AppState {
     }
 }
 
+fn subscription_probe_fingerprint(
+    private: &PrivateRoutingConfig,
+    resolved: &ResolvedSubscriptionUrls,
+    outlets: &[OutletConfig],
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    private.probe_targets.hash(&mut hasher);
+    for outlet in outlets {
+        outlet.id.hash(&mut hasher);
+        if let OutletKind::Subscription {
+            secret_ref,
+            provider_update_seconds,
+        } = &outlet.kind
+        {
+            secret_ref.hash(&mut hasher);
+            provider_update_seconds.hash(&mut hasher);
+            resolved.get(secret_ref).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn isolated_subscription_probe_config(
+    private: &PrivateRoutingConfig,
+    resolved: &ResolvedSubscriptionUrls,
+    outlets: &[OutletConfig],
+    entry_port: u16,
+    controller_port: u16,
+    secret: &str,
+) -> Result<(String, vpn_hub_core::RuntimeConfigSummary), String> {
+    let mut isolated = private.clone();
+    isolated.entry = EntryConfig {
+        host: Ipv4Addr::LOCALHOST.to_string(),
+        port: entry_port,
+    };
+    isolated.controller_port = controller_port;
+    isolated.outlets = outlets.to_vec();
+    isolated.route_mode = RouteMode::Priority;
+    isolated.manual_outlet = None;
+    generate_mihomo_config_with_udp_capabilities(
+        &isolated,
+        resolved,
+        secret,
+        &UdpCapabilityMap::new(),
+    )
+    .map_err(|_| "probe_runtime_config_rejected".to_string())
+}
+
 impl Drop for ManagedCore {
     fn drop(&mut self) {
         terminate_child(&mut self.child);
@@ -6150,6 +6460,102 @@ fn remove_proxy_environment(command: &mut Command) {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_probe_config_is_loopback_random_port_and_fail_closed() {
+        let mut private = PrivateRoutingConfig::default();
+        private.entry = EntryConfig {
+            host: "127.0.0.1".into(),
+            port: 45_100,
+        };
+        private.controller_port = 45_101;
+        let outlet = OutletConfig {
+            id: "fixture-sub".into(),
+            label: "Fixture subscription".into(),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: "fixture.secret".into(),
+                provider_update_seconds: 180,
+            },
+        };
+        private.outlets = vec![outlet.clone()];
+        let resolved = ResolvedSubscriptionUrls::from([(
+            "fixture.secret".into(),
+            "https://fixture.invalid/subscription".into(),
+        )]);
+        let (yaml, summary) = isolated_subscription_probe_config(
+            &private,
+            &resolved,
+            &[outlet],
+            45_102,
+            45_103,
+            "test-only-random-secret",
+        )
+        .expect("isolated config");
+        assert_eq!(summary.entry.port, 45_102);
+        assert_eq!(summary.controller_port, 45_103);
+        assert!(!summary.has_direct_fallback);
+        assert!(yaml.contains("mixed-port: 45102"));
+        assert!(yaml.contains("external-controller: 127.0.0.1:45103"));
+        assert!(yaml.contains("allow-lan: false"));
+        assert!(yaml.contains("- REJECT"));
+        assert!(!yaml.contains("mixed-port: 45100"));
+        assert!(!yaml.contains("external-controller: 127.0.0.1:45101"));
+        assert!(!yaml.contains("tun:"));
+        assert!(!yaml.contains("dns:"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn owned_probe_core_drop_stops_only_its_pid_and_releases_random_ports() {
+        let entry = ProbePortLease::reserve().expect("entry lease");
+        let controller =
+            ProbePortLease::reserve_excluding(&[entry.port()]).expect("controller lease");
+        let entry_port = entry.port();
+        let controller_port = controller.port();
+        drop(entry);
+        drop(controller);
+        let script = format!(
+            "$entry=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,{entry_port}); \
+             $controller=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,{controller_port}); \
+             $entry.Start(); $controller.Start(); Start-Sleep -Seconds 30"
+        );
+        let child = hidden_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .spawn()
+            .expect("owned fixture child");
+        let pid = child.id();
+        let addresses = [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, entry_port)),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, controller_port)),
+        ];
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !owns_loopback_listeners(pid, &addresses) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(owns_loopback_listeners(pid, &addresses));
+        let directory = tempfile::tempdir().expect("owned directory");
+        let controller_client = ControllerClient::new(
+            &format!("http://127.0.0.1:{controller_port}"),
+            "test-only".into(),
+            100,
+        )
+        .expect("controller client");
+        drop(OwnedProbeCore {
+            child,
+            controller: controller_client,
+            entry_port,
+            _directory: directory,
+        });
+        assert!(TcpListener::bind(addresses[0]).is_ok());
+        assert!(TcpListener::bind(addresses[1]).is_ok());
+    }
     use crate::lifecycle::{DesktopCoordinator, LifecycleEvent};
     use std::{
         collections::BTreeMap,

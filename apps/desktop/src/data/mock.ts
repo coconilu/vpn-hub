@@ -76,6 +76,12 @@ export const mockSnapshot: DashboardSnapshot = {
     },
   ],
   route_switches: [],
+  probe_views: [
+    { outlet_id: "sub-a", phase: "waiting_for_probe_runtime", source_phase: "waiting", latency_ms: null, observed_at: null, reason_code: "waiting_for_probe_runtime" },
+    { outlet_id: "sub-b", phase: "probing", source_phase: "available", latency_ms: null, observed_at: null, reason_code: null },
+    { outlet_id: "local-a", phase: "down", source_phase: "not_applicable", latency_ms: null, observed_at: new Date(now - 4 * 60 * 1000).toISOString(), reason_code: "request_timeout" },
+    { outlet_id: "local-b", phase: "probing", source_phase: "not_applicable", latency_ms: null, observed_at: null, reason_code: null },
+  ],
   udp_capabilities: [
     {
       outlet_id: "local-a",

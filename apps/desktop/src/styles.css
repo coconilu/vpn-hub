@@ -144,6 +144,9 @@ tr.selected:hover { background: #e3efff; }
 .status-cell.degraded i { background: var(--warning); }
 .status-cell.down { border-color: #f3c3c5; color: var(--danger); background: #fff7f7; }
 .status-cell.down i { background: var(--danger); }
+.status-cell.probing, .status-cell.waiting_for_probe_runtime { border-color: #bdd4f3; color: #2f5f9b; background: #f4f8fe; }
+.status-cell.probing i, .status-cell.waiting_for_probe_runtime i { background: #4d83c5; }
+.status-cell.not_configured, .status-cell.pending { border-color: var(--border); color: var(--muted); background: #fff; }
 .danger-text { color: var(--danger); font-weight: 600; }
 .mono { font-family: "Cascadia Code", Consolas, monospace; }
 

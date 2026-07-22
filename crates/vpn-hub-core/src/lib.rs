@@ -13,6 +13,7 @@ mod history;
 mod mihomo;
 mod model;
 mod probe;
+mod probe_schedule;
 mod routing;
 mod secret_store;
 mod settings;
@@ -38,6 +39,7 @@ pub use guardian_cycle::{
     DEFAULT_GUARDIAN_CONCURRENCY, DEFAULT_GUARDIAN_CYCLE_BUDGET, GuardianCommitStatus,
     GuardianCycleError, GuardianCycleOutcome, RoutingSession, RoutingStateError,
     run_controller_guardian_cycle, run_controller_guardian_cycle_controlled,
+    probe_controller_outlets, run_controller_guardian_cycle_selected,
 };
 pub use history::{
     HistoryEventType, HistoryExport, HistoryFilter, HistoryMetric, HistoryOutletKind,
@@ -56,6 +58,9 @@ pub use model::{
     UdpCapabilityEvidence, UdpCapabilityStatus,
 };
 pub use probe::probe_outlet;
+pub use probe_schedule::{
+    ImmediateProbeReason, ProbeCompletion, ProbeReadiness, ProbeScheduler, ScheduledProbe,
+};
 pub use routing::{
     FAIL_CLOSED_OUTLET, OutletHealth, RouteDecision, RouteMode, RoutingEngine, RoutingPolicy,
 };

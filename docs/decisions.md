@@ -21,6 +21,7 @@
 | D-011 | 运行中设置重载只允许停止可同时证明 PID、Supervisor authority 与 Controller ownership 的自管核心；配置在首次 Guardian 权威回读前保持可回滚 | 防止误停第三方进程，并确保提交后启动失败不会把无效配置提升为最后有效配置 |
 | D-012 | 主界面只暴露当前可完成的核心任务；手动外部 UDP 验证退出总览，不可用 TUN 退出设置页，活动出口安全选择只在删除或停用动作中出现 | 降低普通用户理解成本，同时保留 UDP `unknown/tcp_only → REJECT`、替代出口和 Fail Closed 的底层安全边界 |
 | D-013 | 配置生效只等待本地 runtime、入口、Controller ownership 与双 `REJECT` 回读；provider 和 Guardian 健康确认在提交后异步进行 | 把安全提交与不可控外部网络延迟解耦，同时在连接未确认时继续 Fail Closed |
+| D-014 | APP 启动立即验证全部可验证出口；健康出口按活动 15 秒/备用 60 秒调度，只有失败出口进入 `3,3,6,12,30,60,180` 秒退避；订阅源状态与出口健康分离 | 避免把等待运行时误报为故障，同时在不制造全量 3 秒请求风暴的前提下及时确认故障与恢复；详见 [Issue #45 ADR](issue-45-adaptive-probes.md) |
 
 ## 默认检测参数
 
