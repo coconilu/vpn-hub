@@ -610,10 +610,33 @@ export async function applySettings(request: SettingsApplyRequest): Promise<Sett
       settings: structuredClone(browserSettings),
       diff,
       removed_history_rows: 0,
-      managed_core_restarted: browserSnapshot.mihomo.managed
-        && browserSnapshot.mihomo.pid !== null
-        && diff.changes.some((change) => change.impact === "managed_core_reload"),
+      managed_core_restarted: false,
     };
   }
   return invoke<SettingsApplyResult>("apply_settings", { request });
+}
+
+export async function retrySubscriptionProvider(
+  subscriptionId: string,
+): Promise<SubscriptionNodeGroup> {
+  if (!isTauriRuntime()) {
+    const group = browserNodeCatalog.subscriptions.find(
+      (item) => item.subscription_id === subscriptionId,
+    );
+    if (!group) throw new Error("订阅出口不存在或未启用");
+    const updated = { ...group, state: "provider_loading" as const, nodes: [], current_node: null };
+    browserNodeCatalog = {
+      ...browserNodeCatalog,
+      subscriptions: browserNodeCatalog.subscriptions.map((item) => (
+        item.subscription_id === subscriptionId ? updated : item
+      )),
+    };
+    return structuredClone(updated);
+  }
+  return invoke<SubscriptionNodeGroup>("retry_subscription_provider", { subscriptionId });
+}
+
+export async function cancelForegroundOperation(): Promise<boolean> {
+  if (!isTauriRuntime()) return true;
+  return invoke<boolean>("cancel_foreground_operation");
 }

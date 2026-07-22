@@ -6,18 +6,19 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use vpn_hub_core::{
-    GuardianConfig, GuardianStore, HealthStatus, HistoryExport, HistoryFilter, HistoryOutletKind,
-    HistoryOutletSnapshot, HistoryResponse, LatencySample, OutletConfig, OutletKind, OutletSummary,
-    ProbeOutletConfig, ProbeResult, RouteMode, RouteSwitchEvent, StateEvent,
-    SubscriptionCredentialStatus, UdpCapabilityEvidence, UdpProbeTarget, ValidationIssue,
-    is_current_udp_evidence, probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle,
+    DEFAULT_GUARDIAN_CONCURRENCY, DEFAULT_GUARDIAN_CYCLE_BUDGET, GuardianConfig, GuardianStore,
+    HealthStatus, HistoryExport, HistoryFilter, HistoryOutletKind, HistoryOutletSnapshot,
+    HistoryResponse, LatencySample, OutletConfig, OutletKind, OutletSummary, ProbeOutletConfig,
+    ProbeResult, RouteMode, RouteSwitchEvent, StateEvent, SubscriptionCredentialStatus,
+    UdpCapabilityEvidence, UdpProbeTarget, ValidationIssue, is_current_udp_evidence,
+    probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle_controlled,
     unknown_udp_evidence,
 };
 
@@ -32,10 +33,10 @@ use crate::{
     lifecycle::{self, LifecycleEvent},
     runtime::{
         AppState, CoreStatus, EntrySwitchApplyRequest, EntrySwitchApplyResult, EntrySwitchPreview,
-        EntrySwitchPreviewChecks, NodeLatencyBatchResult, NodeLatencyResult, PortSnapshot,
-        RoutingStatus, SettingsApplyRequest, SettingsApplyResult, SettingsPreview,
-        SettingsPreviewRequest, SettingsTerminalStatus, SubscriptionNodeCatalog,
-        SubscriptionNodeGroup,
+        EntrySwitchPreviewChecks, FastPathPerformanceReport, FastPathResultCode, FastPathStage,
+        NodeLatencyBatchResult, NodeLatencyResult, PortSnapshot, RoutingStatus,
+        SettingsApplyRequest, SettingsApplyResult, SettingsPreview, SettingsPreviewRequest,
+        SettingsTerminalStatus, SubscriptionNodeCatalog, SubscriptionNodeGroup,
     },
 };
 
@@ -516,35 +517,30 @@ async fn finalize_entry_switch_transaction(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_lines)]
 async fn run_entry_switch_transaction(
     app: &AppHandle,
     state: &AppState,
     request: &EntrySwitchApplyRequest,
     prepared: PreparedEntrySwitch,
+    operation: &crate::runtime::ForegroundOperation<'_>,
 ) -> Result<EntrySwitchApplyResult, String> {
     let PreparedEntrySwitch {
         settings_fingerprint,
         previous_entry,
         mut journal,
     } = prepared;
-    let stop_result = lifecycle::dispatch_stop_and_wait(app).await;
-    let authoritative_pid = state.owned_core_pid_authoritative().await?;
-    if !owned_core_stop_confirmed(stop_result, authoritative_pid) {
-        return Err(
-            "entry_switch_recovery_pending：已请求停止当前核心，但尚未确认精确 owned core 消失；入口与系统代理尚未提交并保留恢复日志"
-                .into(),
-        );
-    }
-    if AppState::port_snapshot(&request.target.host, request.target.port).reachable {
-        let error = "停止旧核心后目标端口被并发占用；拒绝接管";
-        return Err(compensate_failed_entry_switch(app, state, None, &journal, error).await);
-    }
+    let owned_pid = state
+        .owned_core_pid_authoritative()
+        .await?
+        .ok_or_else(|| "入口切换前 exact-owned core 已停止".to_string())?;
     let pending = match state
         .apply_entry_switch_settings_deferred(request.target.clone(), settings_fingerprint)
     {
         Ok(pending) => pending,
         Err(error) => {
-            return Err(compensate_failed_entry_switch(app, state, None, &journal, &error).await);
+            let _ = state.clear_entry_switch_runtime_journal();
+            return Err(format!("入口候选未提交，owned 核心保持原状态：{error}"));
         }
     };
     if let Err(error) =
@@ -554,15 +550,68 @@ async fn run_entry_switch_transaction(
             compensate_failed_entry_switch(app, state, Some(&pending), &journal, &error).await,
         );
     }
-    let runtime_start = {
+    let hot_reload = {
         let _transaction = state.lock_routing_transaction().await;
-        start_owned_core_verified(app, state).await
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            state.reload_owned_core_config_verified(owned_pid, operation.cancel_flag()),
+        )
+        .await
+        .map_err(|_| "入口同 PID 热重载超过 4 秒预算".to_string())
+        .and_then(std::convert::identity)
     };
-    if let Err(error) = runtime_start {
-        return Err(
-            compensate_failed_entry_switch(app, state, Some(&pending), &journal, &error).await,
-        );
-    }
+    let managed_core_restarted = if hot_reload.is_ok() {
+        false
+    } else {
+        if let Err(error) = operation.ensure_active() {
+            return Err(compensate_failed_entry_switch(
+                app,
+                state,
+                Some(&pending),
+                &journal,
+                &error,
+            )
+            .await);
+        }
+        let stop_result = lifecycle::dispatch_stop_and_wait(app).await;
+        let authoritative_pid = state.owned_core_pid_authoritative().await?;
+        if !owned_core_stop_confirmed(stop_result, authoritative_pid) {
+            return Err(compensate_failed_entry_switch(
+                app,
+                state,
+                Some(&pending),
+                &journal,
+                "入口热重载失败，且未能确认 exact-owned core 已停止",
+            )
+            .await);
+        }
+        if AppState::port_snapshot(&request.target.host, request.target.port).reachable {
+            let error = "停止旧核心后目标端口被并发占用；拒绝接管";
+            return Err(compensate_failed_entry_switch(
+                app,
+                state,
+                Some(&pending),
+                &journal,
+                error,
+            )
+            .await);
+        }
+        let runtime_start = {
+            let _transaction = state.lock_routing_transaction().await;
+            start_owned_core_verified(app, state).await
+        };
+        if let Err(error) = runtime_start {
+            return Err(compensate_failed_entry_switch(
+                app,
+                state,
+                Some(&pending),
+                &journal,
+                &error,
+            )
+            .await);
+        }
+        true
+    };
     if let Err(error) =
         state.set_entry_switch_runtime_phase(&mut journal, EntrySwitchRuntimePhase::RuntimeVerified)
     {
@@ -570,7 +619,11 @@ async fn run_entry_switch_transaction(
             compensate_failed_entry_switch(app, state, Some(&pending), &journal, &error).await,
         );
     }
-    finalize_entry_switch_transaction(app, state, request, previous_entry, pending, journal).await
+    let mut result =
+        finalize_entry_switch_transaction(app, state, request, previous_entry, pending, journal)
+            .await?;
+    result.managed_core_restarted = managed_core_restarted;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -588,14 +641,17 @@ pub async fn apply_entry_switch(
     #[cfg(target_os = "windows")]
     {
         let _settings_apply = state.lock_settings_apply().await;
+        let operation = state.begin_foreground_operation()?;
         if state.settings_terminal_active() {
             return Err("terminal_recovery_active：设置安全门未解除，拒绝入口切换".into());
         }
         if state.uses_helper_authority() {
             return Err("当前入口切换仅支持 desktop-owned 核心，不会绕过 Helper authority".into());
         }
+        app.state::<lifecycle::DesktopCoordinator>()
+            .cancel_background_work();
         let prepared = prepare_entry_switch_transaction(&state, &request).await?;
-        run_entry_switch_transaction(&app, &state, &request, prepared).await
+        run_entry_switch_transaction(&app, &state, &request, prepared, &operation).await
     }
 }
 
@@ -606,6 +662,28 @@ pub async fn get_subscription_node_catalog(
 ) -> Result<SubscriptionNodeCatalog, String> {
     let _transaction = state.lock_routing_transaction().await;
     state.subscription_node_catalog().await
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn retry_subscription_provider(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    subscription_id: String,
+) -> Result<SubscriptionNodeGroup, String> {
+    let group = {
+        let _transaction = state.lock_routing_transaction().await;
+        state.retry_subscription_provider(&subscription_id).await?
+    };
+    if group.state == crate::runtime::SubscriptionNodeGroupState::ProviderLoading {
+        lifecycle::dispatch(
+            &app,
+            LifecycleEvent::ConfigReload {
+                now_ms: unix_time_ms(),
+            },
+        );
+    }
+    Ok(group)
 }
 
 #[tauri::command]
@@ -710,12 +788,33 @@ pub async fn apply_settings(
     state: State<'_, AppState>,
     request: SettingsApplyRequest,
 ) -> Result<SettingsApplyResult, String> {
+    let started_at = Instant::now();
+    let result = apply_settings_inner(app, &state, request).await;
+    let result_code = if result.is_ok() {
+        FastPathResultCode::Ok
+    } else {
+        FastPathResultCode::Error
+    };
+    state.record_fast_path(FastPathStage::SettingsApply, started_at, result_code);
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+async fn apply_settings_inner(
+    app: AppHandle,
+    state: &AppState,
+    request: SettingsApplyRequest,
+) -> Result<SettingsApplyResult, String> {
     let _settings_apply = state.lock_settings_apply().await;
+    let operation = state.begin_foreground_operation()?;
     if state.settings_terminal_active() {
         return Err(
             "terminal_recovery_active：设置安全门仍处于 Fail Closed；请先执行显式受鉴权恢复".into(),
         );
     }
+    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    coordinator.cancel_background_work();
+    operation.ensure_active()?;
     let (preflight, managed_core_running) = {
         let _transaction = state.lock_routing_transaction().await;
         let core_status = state.core_status_authoritative().await?;
@@ -751,16 +850,13 @@ pub async fn apply_settings(
             managed_core_running && preflight.diff.requires_authenticated_controller_apply();
         let apply_result = if requires_controller_confirmation {
             state
-                .apply_settings_with_runtime_validation(request, || async {
-                    record_owned_controller_cycle_locked(&state)
-                        .await
-                        .map(|_| ())
+                .apply_settings_with_runtime_validation(request, || {
+                    state.apply_runtime_policy_verified()
                 })
                 .await
         } else {
             state.apply_settings(request)
         };
-        let coordinator = app.state::<lifecycle::DesktopCoordinator>();
         let result = match after_successful_settings_commit(apply_result, || {
             coordinator.prepare_config_reload();
         }) {
@@ -796,12 +892,7 @@ pub async fn apply_settings(
     {
         return Err("无法同时证明 PID 与 Controller ownership；不会停止或改写未知核心".into());
     }
-    if lifecycle::dispatch_stop_and_wait(&app).await != lifecycle::StopRequestResult::Stopped
-        || state.owned_core_pid_authoritative().await?.is_some()
-    {
-        return Err("未能确认精确 owned core 已停止；当前配置保持不变".into());
-    }
-
+    operation.ensure_active()?;
     let pending_result = {
         let _transaction = state.lock_routing_transaction().await;
         state.apply_settings_deferred(request)
@@ -811,36 +902,145 @@ pub async fn apply_settings(
         Err(error) => {
             if state.settings_recovery_pending() {
                 return Err(format!(
-                    "设置提交失败且最后有效配置回滚未完成；核心保持停止并等待下次恢复：{error}"
+                    "设置提交失败且最后有效配置回滚未完成；核心保持原状态并等待下次恢复：{error}"
                 ));
             }
-            let coordinator = app.state::<lifecycle::DesktopCoordinator>();
-            if coordinator.stop_requested() {
-                return Err(format!(
-                    "停止请求优先于设置应用；当前核心保持停止且配置未变更：{error}"
-                ));
-            }
-            let recovery = {
-                let _transaction = state.lock_routing_transaction().await;
-                start_owned_core_verified(&app, &state).await
-            };
-            return match recovery {
-                Ok(_) => Err(format!(
-                    "核心停止后设置预检失效；配置未变更且旧核心已恢复：{error}"
-                )),
-                Err(recovery_error) => Err(format!(
-                    "核心停止后设置预检失效；配置未变更，但旧核心恢复失败并进入 terminal Fail Closed：{error}；{recovery_error}"
-                )),
-            };
+            return Err(format!(
+                "设置候选提交失败；配置与 owned 核心保持原状态：{error}"
+            ));
         }
     };
+
+    let hot_reload = {
+        let _transaction = state.lock_routing_transaction().await;
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            state.reload_owned_core_config_verified(owned_pid, operation.cancel_flag()),
+        )
+        .await
+        .map_err(|_| "同 PID 热重载超过 4 秒预算".to_string())
+        .and_then(std::convert::identity)
+    };
+    if hot_reload.is_ok() {
+        let finalized = {
+            let _transaction = state.lock_routing_transaction().await;
+            state.finalize_deferred_settings(&mut pending, false)
+        };
+        match finalized {
+            Ok(result) => {
+                coordinator.prepare_config_reload();
+                lifecycle::dispatch(
+                    &app,
+                    LifecycleEvent::ConfigReload {
+                        now_ms: unix_time_ms(),
+                    },
+                );
+                return Ok(result);
+            }
+            Err(error) if state.deferred_settings_commit_decided(&pending) => {
+                return Err(format!(
+                    "settings_commit_recovery_pending：热重载已生效且提交决定已持久化，收尾将幂等前滚：{error}"
+                ));
+            }
+            Err(error) => {
+                let _ = lifecycle::dispatch_stop_and_wait(&app).await;
+                let rollback = {
+                    let _transaction = state.lock_routing_transaction().await;
+                    state.rollback_deferred_settings(&pending)
+                };
+                if let Err(rollback_error) = rollback {
+                    return Err(format!(
+                        "热重载已通过但事务收尾和回滚均失败；核心已停止并保持 Fail Closed：{error}；{rollback_error}"
+                    ));
+                }
+                let recovery = {
+                    let _transaction = state.lock_routing_transaction().await;
+                    start_owned_core_verified(&app, state).await
+                };
+                return match recovery {
+                    Ok(_) => Err(format!("热重载事务收尾失败，旧配置与核心已恢复：{error}")),
+                    Err(recovery_error) => Err(format!(
+                        "热重载事务收尾失败，旧配置已恢复但旧核心恢复失败：{error}；{recovery_error}"
+                    )),
+                };
+            }
+        }
+    }
+
+    if let Err(cancelled) = operation.ensure_active() {
+        let stopped = lifecycle::dispatch_stop_and_wait(&app).await;
+        let rollback = {
+            let _transaction = state.lock_routing_transaction().await;
+            state.rollback_deferred_settings(&pending)
+        };
+        if let Err(error) = rollback {
+            return Err(format!(
+                "{cancelled}；已停止热重载核心，但配置回滚未完成：{error}"
+            ));
+        }
+        if stopped != lifecycle::StopRequestResult::Stopped
+            || state.owned_core_pid_authoritative().await?.is_some()
+        {
+            return Err(format!(
+                "{cancelled}；旧配置已恢复，但无法确认 exact-owned core 已停止，保持 Fail Closed"
+            ));
+        }
+        if app
+            .state::<lifecycle::DesktopCoordinator>()
+            .stop_requested()
+        {
+            return Err(format!(
+                "{cancelled}；旧配置已恢复，停止请求优先，核心保持停止"
+            ));
+        }
+        let recovery = {
+            let _transaction = state.lock_routing_transaction().await;
+            start_owned_core_verified(&app, state).await
+        };
+        return match recovery {
+            Ok(_) => Err(format!("{cancelled}；旧配置与旧核心已恢复")),
+            Err(error) => Err(format!(
+                "{cancelled}；旧配置已恢复，但旧核心恢复失败并保持 Fail Closed：{error}"
+            )),
+        };
+    }
+    let fallback_started_at = Instant::now();
+    if lifecycle::dispatch_stop_and_wait(&app).await != lifecycle::StopRequestResult::Stopped
+        || state.owned_core_pid_authoritative().await?.is_some()
+    {
+        state.record_fast_path(
+            FastPathStage::FallbackRestart,
+            fallback_started_at,
+            FastPathResultCode::Error,
+        );
+        let rollback = {
+            let _transaction = state.lock_routing_transaction().await;
+            state.rollback_deferred_settings(&pending)
+        };
+        return Err(match rollback {
+            Ok(()) => "热重载失败且未能确认 exact-owned core 已停止；已恢复最后有效配置".into(),
+            Err(error) => format!(
+                "热重载失败、exact-owned core 未确认停止且配置回滚失败；保持 Fail Closed：{error}"
+            ),
+        });
+    }
+
     let reload_epoch_before_start = app
         .state::<lifecycle::DesktopCoordinator>()
         .recovery_epoch();
     let start_result = {
         let _transaction = state.lock_routing_transaction().await;
-        start_owned_core_verified(&app, &state).await
+        start_owned_core_verified(&app, state).await
     };
+    state.record_fast_path(
+        FastPathStage::FallbackRestart,
+        fallback_started_at,
+        if start_result.is_ok() {
+            FastPathResultCode::Ok
+        } else {
+            FastPathResultCode::Error
+        },
+    );
     if let Err(start_error) = start_result {
         let rollback = {
             let _transaction = state.lock_routing_transaction().await;
@@ -859,7 +1059,7 @@ pub async fn apply_settings(
         }
         let recovery = {
             let _transaction = state.lock_routing_transaction().await;
-            start_owned_core_verified(&app, &state).await
+            start_owned_core_verified(&app, state).await
         };
         return match recovery {
             Ok(_) => Err(format!(
@@ -901,7 +1101,7 @@ pub async fn apply_settings(
             }
             let recovery = {
                 let _transaction = state.lock_routing_transaction().await;
-                start_owned_core_verified(&app, &state).await
+                start_owned_core_verified(&app, state).await
             };
             match recovery {
                 Ok(_) => Err(format!(
@@ -913,6 +1113,23 @@ pub async fn apply_settings(
             }
         }
     }
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cancel_foreground_operation(app: AppHandle, state: State<'_, AppState>) -> bool {
+    let cancelled = state.cancel_foreground_operation();
+    app.state::<lifecycle::DesktopCoordinator>()
+        .cancel_background_work();
+    cancelled
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn get_fast_path_performance(
+    state: State<'_, AppState>,
+) -> Result<FastPathPerformanceReport, String> {
+    state.fast_path_performance_report()
 }
 
 fn helper_settings_deployment_required(
@@ -1002,17 +1219,22 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
 }
 
 pub(crate) async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
-    record_routing_cycle_locked_with_mode(state, true).await
+    record_routing_cycle_controlled(state, true, Arc::new(AtomicBool::new(false))).await
 }
 
+#[cfg(test)]
 async fn record_owned_controller_cycle_locked(state: &AppState) -> Result<u64, String> {
-    record_routing_cycle_locked_with_mode(state, false).await
+    record_routing_cycle_controlled(state, false, Arc::new(AtomicBool::new(false))).await
 }
 
-async fn record_routing_cycle_locked_with_mode(
+pub(crate) async fn record_routing_cycle_controlled(
     state: &AppState,
     allow_direct_fallback: bool,
+    cancel: Arc<AtomicBool>,
 ) -> Result<u64, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Err("Guardian 路由周期已取消".into());
+    }
     if state.settings_terminal_active() {
         state.enforce_settings_terminal_fail_closed().await?;
         return Err(
@@ -1025,6 +1247,9 @@ async fn record_routing_cycle_locked_with_mode(
     let private = state.private_config()?;
     let Some(controller) = state.controller_client()? else {
         return if allow_direct_fallback {
+            if cancel.load(Ordering::Acquire) {
+                return Err("Guardian 路由周期已取消".into());
+            }
             record_direct_guardian_cycle(state).await
         } else {
             Err("应用自管核心未提供可验证 Controller；不会把直连探测降级当作启动成功".into())
@@ -1036,7 +1261,8 @@ async fn record_routing_cycle_locked_with_mode(
         .sync_history_outlets(&history_outlets(&private), &Utc::now().to_rfc3339())
         .map_err(|error| format!("无法同步脱敏历史出口目录：{error}"))?;
 
-    run_controller_guardian_cycle(
+    let guardian_started_at = Instant::now();
+    let guardian_result = run_controller_guardian_cycle_controlled(
         &controller,
         &private,
         &state.resolved_subscription_urls(&private)?,
@@ -1044,9 +1270,24 @@ async fn record_routing_cycle_locked_with_mode(
         &mut store,
         state,
         unix_time_ms(),
+        Arc::clone(&cancel),
+        DEFAULT_GUARDIAN_CYCLE_BUDGET,
+        DEFAULT_GUARDIAN_CONCURRENCY,
     )
     .await
-    .map_err(|error| format!("Guardian 路由周期失败：{error}"))?;
+    .map_err(|error| format!("Guardian 路由周期失败：{error}"));
+    state.record_fast_path(
+        FastPathStage::GuardianCycle,
+        guardian_started_at,
+        if guardian_result.is_ok() {
+            FastPathResultCode::Ok
+        } else if cancel.load(Ordering::Acquire) {
+            FastPathResultCode::Cancelled
+        } else {
+            FastPathResultCode::Error
+        },
+    );
+    guardian_result?;
     Ok(guardian.monitor.interval_seconds)
 }
 
@@ -1343,6 +1584,34 @@ async fn start_owned_core_verified(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<CoreStatus, String> {
+    let started_at = Instant::now();
+    let timed = tokio::time::timeout(
+        Duration::from_secs(5),
+        start_owned_core_verified_inner(app, state),
+    )
+    .await;
+    let (result, result_code) = match timed {
+        Ok(result) => {
+            let code = if result.is_ok() {
+                FastPathResultCode::Ok
+            } else {
+                FastPathResultCode::Error
+            };
+            (result, code)
+        }
+        Err(_) => (
+            Err("核心启动超过 5 秒总预算；未发布迟到进程并保持 Fail Closed".to_string()),
+            FastPathResultCode::Timeout,
+        ),
+    };
+    state.record_fast_path(FastPathStage::CoreStartup, started_at, result_code);
+    result
+}
+
+async fn start_owned_core_verified_inner(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<CoreStatus, String> {
     let coordinator = app.state::<lifecycle::DesktopCoordinator>();
     let cancel = Arc::new(AtomicBool::new(false));
     let start_epoch = coordinator.prepare_manual_start(&cancel)?;
@@ -1377,16 +1646,10 @@ async fn start_owned_core_verified(
     {
         let _ = state.stop_supervised_core_if_pid(pid).await;
         coordinator.complete_manual_start_failure(start_epoch);
-        return Err("应用自管核心在首次 Guardian 前失去 PID 或 Controller ownership；已停止并保持 Fail Closed".into());
-    }
-    let guardian_result = record_owned_controller_cycle_locked(state).await;
-    if guardian_result.is_err()
-        || !coordinator.manual_start_allowed(start_epoch)
-        || !state.owned_core_controller_is_running(pid)
-    {
-        let _ = state.stop_supervised_core_if_pid(pid).await;
-        coordinator.complete_manual_start_failure(start_epoch);
-        return Err("应用自管核心未通过首次 Guardian 的 PID 与 Controller ownership 复核；已停止并保持 Fail Closed".into());
+        return Err(
+            "应用自管核心未通过 PID、入口与 Controller ownership 复核；已停止并保持 Fail Closed"
+                .into(),
+        );
     }
     if !coordinator.complete_manual_start(pid, start_epoch)
         || !state.owned_core_controller_is_running(pid)
@@ -1394,7 +1657,13 @@ async fn start_owned_core_verified(
         let _ = state.stop_supervised_core_if_pid(pid).await;
         return Err("停止请求已优先于迟到的启动结果；应用自管核心已清理".into());
     }
-    status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();
+    lifecycle::dispatch(
+        app,
+        LifecycleEvent::ConfigReload {
+            now_ms: unix_time_ms(),
+        },
+    );
+    status.message = "开发核心已启动并验证双 REJECT；出口健康确认正在后台进行".into();
     Ok(status)
 }
 

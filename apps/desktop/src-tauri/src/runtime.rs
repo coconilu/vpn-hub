@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use vpn_hub_helper::{
     AuthorityFileGuard, Command as HelperCommand, InstallationReference, NamedPipeClient,
@@ -45,6 +45,62 @@ failure_threshold = 2
 recovery_threshold = 3
 "#;
 
+const MIHOMO_VALIDATION_TIMEOUT: Duration = Duration::from_secs(2);
+const MIHOMO_LISTENER_TIMEOUT: Duration = Duration::from_secs(3);
+const CONTROLLER_LOCAL_TIMEOUT_MS: u64 = 1_000;
+const CHILD_TERMINATION_TIMEOUT: Duration = Duration::from_millis(750);
+const MAX_FAST_PATH_SAMPLES: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastPathStage {
+    SettingsApply,
+    WarmReload,
+    CoreStartup,
+    FallbackRestart,
+    GuardianCycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastPathResultCode {
+    Ok,
+    Error,
+    Cancelled,
+    Timeout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FastPathPerformanceSample {
+    pub stage: FastPathStage,
+    pub duration_ms: u64,
+    pub result_code: FastPathResultCode,
+    pub outlet_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FastPathPerformanceSummary {
+    pub stage: FastPathStage,
+    pub sample_count: usize,
+    pub p50_ms: u64,
+    pub p95_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FastPathPerformanceReport {
+    pub samples: Vec<FastPathPerformanceSample>,
+    pub summaries: Vec<FastPathPerformanceSummary>,
+}
+
+fn percentile_ms(values: &mut [u64], percentile: usize) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let rank = (percentile * values.len()).div_ceil(100).saturating_sub(1);
+    values[rank.min(values.len() - 1)]
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PortSnapshot {
     pub host: String,
@@ -78,6 +134,8 @@ pub enum SubscriptionNodeGroupState {
     Available,
     CoreUnavailable,
     ProviderUnavailable,
+    ProviderLoading,
+    ProviderFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -730,6 +788,7 @@ pub struct AppState {
     managed_core: Mutex<Option<ManagedCore>>,
     routing_engine: Mutex<RoutingEngine>,
     settings_preview_ticket: Mutex<Option<String>>,
+    validated_candidate_ticket: Mutex<Option<String>>,
     entry_switch_ticket: Mutex<Option<EntrySwitchTicket>>,
     routing_transaction: RoutingTransaction,
     settings_apply_transaction: RoutingTransaction,
@@ -737,6 +796,8 @@ pub struct AppState {
     initialization_error: Option<String>,
     settings_recovery_error: Mutex<Option<String>>,
     node_latency_batches: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    foreground_operation: Mutex<Option<Arc<AtomicBool>>>,
+    fast_path_samples: Mutex<VecDeque<FastPathPerformanceSample>>,
     supervisor_route: SupervisorRoute,
     #[cfg(test)]
     entry_switch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -832,6 +893,37 @@ impl Drop for PendingChild {
     fn drop(&mut self) {
         if let Some(child) = self.0.as_mut() {
             terminate_child(child);
+        }
+    }
+}
+
+pub struct ForegroundOperation<'a> {
+    state: &'a AppState,
+    cancel: Arc<AtomicBool>,
+}
+
+impl ForegroundOperation<'_> {
+    pub fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
+    }
+
+    pub fn ensure_active(&self) -> Result<(), String> {
+        if self.cancel.load(Ordering::Acquire) {
+            Err("前台设置操作已取消；安全回滚或 owned core 清理可能仍在收尾".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for ForegroundOperation<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut current) = self.state.foreground_operation.lock()
+            && current
+                .as_ref()
+                .is_some_and(|cancel| Arc::ptr_eq(cancel, &self.cancel))
+        {
+            *current = None;
         }
     }
 }
@@ -1132,6 +1224,7 @@ impl AppState {
         Self::new_with_data_directory(workspace_root, &data_directory, guardian_override)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn new_with_data_directory(
         workspace_root: PathBuf,
         data_directory: &Path,
@@ -1214,6 +1307,7 @@ impl AppState {
             managed_core: Mutex::new(None),
             routing_engine: Mutex::new(routing_engine),
             settings_preview_ticket: Mutex::new(None),
+            validated_candidate_ticket: Mutex::new(None),
             entry_switch_ticket: Mutex::new(None),
             routing_transaction: RoutingTransaction::default(),
             settings_apply_transaction: RoutingTransaction::default(),
@@ -1221,6 +1315,8 @@ impl AppState {
             initialization_error,
             settings_recovery_error: Mutex::new(settings_recovery_error),
             node_latency_batches: Mutex::new(HashMap::new()),
+            foreground_operation: Mutex::new(None),
+            fast_path_samples: Mutex::new(VecDeque::with_capacity(MAX_FAST_PATH_SAMPLES)),
             supervisor_route,
             #[cfg(test)]
             entry_switch_hook: Mutex::new(None),
@@ -2195,7 +2291,15 @@ impl AppState {
             .guardian_candidate(&current_guardian)
             .validate()
             .map_err(|error| format!("Guardian 候选校验失败：{error}"))?;
-        self.validate_settings_candidate_before_stop(&candidate)?;
+        if preview.diff.affects_private_routing() || !request.credential_mutations.is_empty() {
+            self.validate_settings_candidate_before_stop(&candidate)?;
+            *self
+                .validated_candidate_ticket
+                .lock()
+                .map_err(|_| "候选校验状态锁已损坏".to_string())? = Some(fingerprint);
+        } else if let Ok(mut ticket) = self.validated_candidate_ticket.lock() {
+            *ticket = None;
+        }
         Ok(preview)
     }
 
@@ -2238,17 +2342,6 @@ impl AppState {
             fail_closed_on_removed_active,
             preview_fingerprint,
         } = request;
-        if !credential_mutations.is_empty()
-            && self
-                .managed_core
-                .lock()
-                .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?
-                .is_some()
-        {
-            return Err(
-                "覆盖或删除凭据前请先停止本应用自管核心；当前核心与最后有效配置保持不变".into(),
-            );
-        }
         let credential_intents = credential_mutations
             .iter()
             .map(|mutation| CredentialMutationIntent {
@@ -2273,6 +2366,13 @@ impl AppState {
         if ticket.as_deref() != Some(fingerprint.as_str()) {
             return Err("设置预览已失效或已被使用，请重新预览".into());
         }
+        let candidate_already_validated = self
+            .validated_candidate_ticket
+            .lock()
+            .map_err(|_| "候选校验状态锁已损坏".to_string())?
+            .take()
+            .as_deref()
+            == Some(fingerprint.as_str());
         let preview = self.evaluate_settings(
             &draft,
             &credential_intents,
@@ -2360,6 +2460,8 @@ impl AppState {
             &candidate,
             &candidate_guardian,
             defer_runtime_validation,
+            (preview.diff.affects_private_routing() || !pending.is_empty())
+                && !candidate_already_validated,
         );
         match transaction_result {
             Ok((removed_history_rows, pending_journal)) => {
@@ -2725,6 +2827,7 @@ impl AppState {
         candidate: &PrivateRoutingConfig,
         candidate_guardian: &GuardianConfig,
         defer_runtime_validation: bool,
+        validate_mihomo_candidate: bool,
     ) -> Result<(u64, Option<SettingsTransactionJournal>), String> {
         self.execute_settings_transaction_with_operations(
             journal,
@@ -2732,10 +2835,12 @@ impl AppState {
             candidate,
             candidate_guardian,
             defer_runtime_validation,
+            validate_mihomo_candidate,
             &SystemDurableFileOps,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_settings_transaction_with_operations<O: DurableFileOps + ?Sized>(
         &self,
         mut journal: SettingsTransactionJournal,
@@ -2743,6 +2848,7 @@ impl AppState {
         candidate: &PrivateRoutingConfig,
         candidate_guardian: &GuardianConfig,
         defer_runtime_validation: bool,
+        validate_mihomo_candidate: bool,
         operations: &O,
     ) -> Result<(u64, Option<SettingsTransactionJournal>), String> {
         let store = self
@@ -2765,25 +2871,27 @@ impl AppState {
         journal.phase = SettingsTransactionPhase::CredentialsStaged;
         write_settings_journal_with_operations(&self.runtime_directory, &journal, operations)?;
 
-        let (yaml, summary) = generate_secret_free_validation_config(candidate)?;
-        if summary.has_direct_fallback || yaml.lines().any(|line| line.trim() == "DIRECT") {
-            return Err("候选 Mihomo 配置违反 Fail Closed 边界".into());
+        if validate_mihomo_candidate {
+            let (yaml, summary) = generate_secret_free_validation_config(candidate)?;
+            if summary.has_direct_fallback || yaml.lines().any(|line| line.trim() == "DIRECT") {
+                return Err("候选 Mihomo 配置违反 Fail Closed 边界".into());
+            }
+            let validation_directory =
+                settings_validation_directory(&self.runtime_directory, &journal.transaction_id);
+            operations
+                .create_dir_all(&validation_directory)
+                .and_then(|()| operations.sync_directory(&self.runtime_directory))
+                .map_err(|_| "无法持久化隔离设置验证目录".to_string())?;
+            harden_private_path(&validation_directory)?;
+            let candidate_path = validation_directory.join("mihomo.yaml");
+            durable_write_new(&candidate_path, yaml.as_bytes(), operations)
+                .map_err(|_| "无法持久化隔离候选配置".to_string())?;
+            harden_private_path(&candidate_path)?;
+            let validation_result =
+                self.run_settings_candidate_validation(&validation_directory, &candidate_path);
+            remove_validation_directory(&validation_directory, operations)?;
+            validation_result?;
         }
-        let validation_directory =
-            settings_validation_directory(&self.runtime_directory, &journal.transaction_id);
-        operations
-            .create_dir_all(&validation_directory)
-            .and_then(|()| operations.sync_directory(&self.runtime_directory))
-            .map_err(|_| "无法持久化隔离设置验证目录".to_string())?;
-        harden_private_path(&validation_directory)?;
-        let candidate_path = validation_directory.join("mihomo.yaml");
-        durable_write_new(&candidate_path, yaml.as_bytes(), operations)
-            .map_err(|_| "无法持久化隔离候选配置".to_string())?;
-        harden_private_path(&candidate_path)?;
-        let validation_result =
-            self.run_settings_candidate_validation(&validation_directory, &candidate_path);
-        remove_validation_directory(&validation_directory, operations)?;
-        validation_result?;
 
         journal.phase = if defer_runtime_validation {
             SettingsTransactionPhase::RuntimeValidationPending
@@ -2837,16 +2945,17 @@ impl AppState {
             return hook(validation_directory, candidate_path);
         }
         let executable = self.find_mihomo_executable()?;
-        let validation = hidden_command(&executable)
+        let mut command = hidden_command(&executable);
+        command
             .arg("-t")
             .arg("-d")
             .arg(validation_directory)
             .arg("-f")
             .arg(candidate_path)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|_| "无法启动固定 Mihomo 候选检查".to_string())?;
+            .stderr(Stdio::null());
+        let validation = run_owned_command_bounded(command, MIHOMO_VALIDATION_TIMEOUT)?;
         validation
             .success()
             .then_some(())
@@ -2996,6 +3105,49 @@ impl AppState {
             outlet,
             SubscriptionNodeGroupState::Available,
             snapshot,
+        ))
+    }
+
+    pub async fn retry_subscription_provider(
+        &self,
+        subscription_id: &str,
+    ) -> Result<SubscriptionNodeGroup, String> {
+        let config = self.private_config()?;
+        let outlet = config
+            .enabled_outlets()
+            .find(|outlet| {
+                outlet.id == subscription_id
+                    && matches!(outlet.kind, OutletKind::Subscription { .. })
+            })
+            .ok_or_else(|| "订阅出口不存在或未启用".to_string())?;
+        let configured = self
+            .subscription_credential_statuses()?
+            .into_iter()
+            .any(|status| {
+                status.subscription_id == subscription_id
+                    && status.state == CredentialState::Configured
+            });
+        if !configured {
+            return Err("订阅凭据未配置，无法重试 provider".into());
+        }
+        let controller = self
+            .controller_client()?
+            .ok_or_else(|| "应用自管核心未启动，无法重试 provider".to_string())?;
+        let state = if tokio::time::timeout(
+            Duration::from_secs(2),
+            controller.update_proxy_provider(&provider_name(subscription_id)),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
+        {
+            SubscriptionNodeGroupState::ProviderLoading
+        } else {
+            SubscriptionNodeGroupState::ProviderFailed
+        };
+        Ok(subscription_node_group(
+            outlet,
+            state,
+            empty_selector_node_snapshot(),
         ))
     }
 
@@ -3469,6 +3621,86 @@ impl AppState {
         self.settings_apply_transaction.lock().await
     }
 
+    pub fn begin_foreground_operation(&self) -> Result<ForegroundOperation<'_>, String> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut current = self
+            .foreground_operation
+            .lock()
+            .map_err(|_| "前台操作取消状态锁已损坏".to_string())?;
+        if current.is_some() {
+            return Err("已有设置操作正在进行，请等待或取消后重试".into());
+        }
+        *current = Some(Arc::clone(&cancel));
+        Ok(ForegroundOperation {
+            state: self,
+            cancel,
+        })
+    }
+
+    pub fn cancel_foreground_operation(&self) -> bool {
+        self.foreground_operation
+            .lock()
+            .ok()
+            .and_then(|current| current.as_ref().cloned())
+            .is_some_and(|cancel| {
+                cancel.store(true, Ordering::Release);
+                true
+            })
+    }
+
+    pub fn record_fast_path(
+        &self,
+        stage: FastPathStage,
+        started_at: Instant,
+        result_code: FastPathResultCode,
+    ) {
+        let outlet_count = self
+            .private_config()
+            .map_or(0, |private| private.outlets.len());
+        let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Ok(mut samples) = self.fast_path_samples.lock() {
+            if samples.len() == MAX_FAST_PATH_SAMPLES {
+                samples.pop_front();
+            }
+            samples.push_back(FastPathPerformanceSample {
+                stage,
+                duration_ms,
+                result_code,
+                outlet_count,
+            });
+        }
+    }
+
+    pub fn fast_path_performance_report(&self) -> Result<FastPathPerformanceReport, String> {
+        let samples = self
+            .fast_path_samples
+            .lock()
+            .map_err(|_| "性能样本锁已损坏".to_string())?
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut grouped = BTreeMap::<FastPathStage, Vec<u64>>::new();
+        for sample in &samples {
+            grouped
+                .entry(sample.stage)
+                .or_default()
+                .push(sample.duration_ms);
+        }
+        let summaries = grouped
+            .into_iter()
+            .map(|(stage, mut durations)| {
+                let mut p95_durations = durations.clone();
+                FastPathPerformanceSummary {
+                    stage,
+                    sample_count: durations.len(),
+                    p50_ms: percentile_ms(&mut durations, 50),
+                    p95_ms: percentile_ms(&mut p95_durations, 95),
+                }
+            })
+            .collect();
+        Ok(FastPathPerformanceReport { samples, summaries })
+    }
+
     pub fn settings_recovery_pending(&self) -> bool {
         settings_transaction_artifacts_exist(&self.runtime_directory)
     }
@@ -3533,6 +3765,224 @@ impl AppState {
         )
         .map(Some)
         .map_err(|error| format!("无法连接本机 Mihomo Controller：{error}"))
+    }
+
+    /// Applies the already-staged private configuration to the exact owned
+    /// Mihomo process. The operation never waits for providers or Guardian:
+    /// success means only that the same PID owns the target loopback listener,
+    /// the authenticated Controller responds, and both selectors read back as
+    /// `REJECT`.
+    pub async fn reload_owned_core_config_verified(
+        &self,
+        expected_pid: u32,
+        cancel: &AtomicBool,
+    ) -> Result<CoreStatus, String> {
+        let started_at = Instant::now();
+        let result = self
+            .reload_owned_core_config_verified_inner(expected_pid, cancel)
+            .await;
+        let result_code = if result.is_ok() {
+            FastPathResultCode::Ok
+        } else if cancel.load(Ordering::Acquire) {
+            FastPathResultCode::Cancelled
+        } else {
+            FastPathResultCode::Error
+        };
+        self.record_fast_path(FastPathStage::WarmReload, started_at, result_code);
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn reload_owned_core_config_verified_inner(
+        &self,
+        expected_pid: u32,
+        cancel: &AtomicBool,
+    ) -> Result<CoreStatus, String> {
+        ensure_core_start_not_cancelled(cancel)?;
+        let (secret, previous_entry, controller_address, started_at) = {
+            let mut guard = self
+                .managed_core
+                .lock()
+                .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?;
+            let core = guard
+                .as_mut()
+                .ok_or_else(|| "没有可热重载的应用自管核心".to_string())?;
+            if core.child.id() != expected_pid
+                || core
+                    .child
+                    .try_wait()
+                    .map_err(|_| "无法读取应用自管核心状态".to_string())?
+                    .is_some()
+            {
+                return Err("热重载只允许操作预检确认的 exact-owned PID".into());
+            }
+            let previous_entry = loopback_socket_address(&core.entry_host, core.entry_port)
+                .ok_or_else(|| "旧入口不再是合法 loopback 地址".to_string())?;
+            (
+                core.controller_secret.clone(),
+                previous_entry,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), core.controller_port),
+                core.started_at.clone(),
+            )
+        };
+        if !owns_loopback_listeners(expected_pid, &[previous_entry, controller_address]) {
+            return Err("热重载前无法证明 exact-owned PID 的入口与 Controller ownership".into());
+        }
+
+        let private = self.private_config()?;
+        let target_entry = loopback_socket_address(&private.entry.host, private.entry.port)
+            .ok_or_else(|| "目标入口必须是明确的 loopback socket 地址".to_string())?;
+        if target_entry != previous_entry
+            && listening_owner_pid(target_entry).is_some_and(|pid| pid != expected_pid)
+        {
+            return Err("目标入口已被未知或第三方进程占用；拒绝接管".into());
+        }
+        let yaml = self.generate_runtime_config(&private, &secret)?;
+        let config_path = self.runtime_directory.join("mihomo.yaml");
+        let previous_yaml =
+            fs::read(&config_path).map_err(|_| "无法建立热重载运行配置回滚点".to_string())?;
+        let controller = ControllerClient::new(
+            &format!("http://127.0.0.1:{}", private.controller_port),
+            secret,
+            CONTROLLER_LOCAL_TIMEOUT_MS,
+        )
+        .map_err(|_| "无法创建受鉴权 loopback Controller 客户端".to_string())?;
+
+        let apply = async {
+            for selector in [MASTER_SELECTOR, UDP_SELECTOR] {
+                ensure_core_start_not_cancelled(cancel)?;
+                controller
+                    .select(selector, FAIL_CLOSED_PROXY)
+                    .await
+                    .map_err(|_| format!("无法在热重载前锁定 {selector} 为 REJECT"))?;
+                if !controller
+                    .is_selected(selector, FAIL_CLOSED_PROXY)
+                    .await
+                    .map_err(|_| format!("无法回读热重载前 {selector} 状态"))?
+                {
+                    return Err(format!("热重载前 {selector} 未保持 REJECT"));
+                }
+            }
+            ensure_core_start_not_cancelled(cancel)?;
+            fs::write(&config_path, yaml.as_bytes())
+                .map_err(|_| "无法写入热重载运行配置".to_string())?;
+            harden_private_path(&config_path)?;
+            controller
+                .reload_config(&config_path)
+                .await
+                .map_err(|_| "Controller 热重载未在总时限内确认".to_string())?;
+
+            let deadline = Instant::now() + Duration::from_millis(1_500);
+            while Instant::now() < deadline {
+                ensure_core_start_not_cancelled(cancel)?;
+                if owns_loopback_listeners(expected_pid, &[target_entry, controller_address])
+                    && (target_entry == previous_entry
+                        || listening_owner_pid(previous_entry).is_none())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            if !owns_loopback_listeners(expected_pid, &[target_entry, controller_address])
+                || (target_entry != previous_entry && listening_owner_pid(previous_entry).is_some())
+            {
+                return Err("热重载后的入口或 Controller ownership 回读不一致".into());
+            }
+            for selector in [MASTER_SELECTOR, UDP_SELECTOR] {
+                ensure_core_start_not_cancelled(cancel)?;
+                if !controller
+                    .is_selected(selector, FAIL_CLOSED_PROXY)
+                    .await
+                    .map_err(|_| format!("无法回读热重载后的 {selector}"))?
+                {
+                    return Err(format!("热重载后的 {selector} 未保持 REJECT"));
+                }
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+
+        if let Err(error) = apply {
+            let restored = fs::write(&config_path, &previous_yaml).is_ok()
+                && harden_private_path(&config_path).is_ok()
+                && controller.reload_config(&config_path).await.is_ok();
+            return Err(if restored {
+                format!("{error}；旧运行配置已恢复，将进入有界重启 fallback")
+            } else {
+                format!("{error}；旧运行配置无法在线恢复，必须精确停止 owned PID 后 fallback")
+            });
+        }
+
+        let mut guard = self
+            .managed_core
+            .lock()
+            .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?;
+        let core = guard
+            .as_mut()
+            .filter(|core| core.child.id() == expected_pid)
+            .ok_or_else(|| "热重载完成后 exact-owned PID 已变化".to_string())?;
+        core.entry_host.clone_from(&private.entry.host);
+        core.entry_port = private.entry.port;
+        Ok(CoreStatus {
+            state: "running".into(),
+            managed: true,
+            pid: Some(expected_pid),
+            started_at: Some(started_at),
+            message: "配置已由同一 owned Mihomo PID 热重载；双 REJECT 已验证，后台正在连接".into(),
+        })
+    }
+
+    /// Applies route-policy-only changes without running a Guardian cycle.
+    /// Existing healthy selection is preserved when still valid; manual mode
+    /// selects its configured outlet, otherwise the selectors remain REJECT
+    /// until the next background cycle has fresh evidence.
+    pub async fn apply_runtime_policy_verified(&self) -> Result<(), String> {
+        let private = self.private_config()?;
+        let controller = self
+            .controller_client()?
+            .ok_or_else(|| "受鉴权 Controller 不可用，无法在线应用路由策略".to_string())?;
+        let current = self
+            .routing_engine
+            .lock()
+            .map_err(|_| "路由策略状态锁已损坏".to_string())?
+            .current_outlet()
+            .map(str::to_owned);
+        let selected = if private.route_mode == RouteMode::Manual {
+            private.manual_outlet.clone()
+        } else {
+            current.filter(|outlet_id| {
+                private
+                    .enabled_outlets()
+                    .any(|outlet| outlet.id == *outlet_id)
+            })
+        };
+        let master = selected
+            .as_deref()
+            .map_or_else(|| FAIL_CLOSED_PROXY.to_owned(), outlet_proxy_name);
+        controller
+            .select(MASTER_SELECTOR, &master)
+            .await
+            .map_err(|_| "无法在线应用 MASTER 路由策略".to_string())?;
+        controller
+            .select(UDP_SELECTOR, FAIL_CLOSED_PROXY)
+            .await
+            .map_err(|_| "无法在策略更新期间保持 UDP REJECT".to_string())?;
+        if !controller
+            .is_selected(MASTER_SELECTOR, &master)
+            .await
+            .map_err(|_| "无法回读 MASTER 路由策略".to_string())?
+            || !controller
+                .is_selected(UDP_SELECTOR, FAIL_CLOSED_PROXY)
+                .await
+                .map_err(|_| "无法回读 UDP REJECT".to_string())?
+        {
+            return Err("Controller 路由策略回读不一致".into());
+        }
+        self.routing_engine
+            .lock()
+            .map_err(|_| "路由策略状态锁已损坏".to_string())?
+            .restore_current(selected, None);
+        Ok(())
     }
 
     pub fn core_status(&self) -> Result<CoreStatus, String> {
@@ -3708,9 +4158,10 @@ impl AppState {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let validation = run_owned_command_cancellable(validation_command, cancel)
-            .await
-            .map_err(|error| format!("无法验证 Mihomo 配置：{error}"))?;
+        let validation =
+            run_owned_command_cancellable(validation_command, cancel, MIHOMO_VALIDATION_TIMEOUT)
+                .await
+                .map_err(|error| format!("无法验证 Mihomo 配置：{error}"))?;
         if !validation.success() {
             return Err(core_diagnostic(CoreDiagnostic::ValidationFailed).into());
         }
@@ -3730,9 +4181,8 @@ impl AppState {
         let mut child = PendingChild::new(child);
 
         let pid = child.id();
-        // A freshly downloaded/signed Mihomo can spend several seconds in
-        // Windows Defender inspection before its listeners become visible.
-        for _ in 0..100 {
+        let listener_deadline = Instant::now() + MIHOMO_LISTENER_TIMEOUT;
+        while Instant::now() < listener_deadline {
             ensure_core_start_not_cancelled(cancel)?;
             if owns_loopback_listeners(pid, &[startup_entry_address, controller_address]) {
                 break;
@@ -3757,7 +4207,7 @@ impl AppState {
         let controller = match ControllerClient::new(
             &format!("http://127.0.0.1:{}", private_config.controller_port),
             controller_secret.clone(),
-            10_000,
+            CONTROLLER_LOCAL_TIMEOUT_MS,
         ) {
             Ok(controller) => controller,
             Err(error) => {
@@ -3770,22 +4220,6 @@ impl AppState {
             if let Err(error) = controller.select(selector, FAIL_CLOSED_PROXY).await {
                 terminate_child(&mut child);
                 return Err(format!("无法锁定 {selector} Fail Closed 选择器：{error}"));
-            }
-        }
-        if let Some(target) = private_config.probe_targets.first() {
-            for outlet in private_config
-                .enabled_outlets()
-                .filter(|outlet| matches!(outlet.kind, OutletKind::Subscription { .. }))
-            {
-                ensure_core_start_not_cancelled(cancel)?;
-                let group = outlet_proxy_name(&outlet.id);
-                if controller.select(MASTER_SELECTOR, &group).await.is_ok() {
-                    let _ = probe_https_through_entry(startup_entry_port, target, 1_500).await;
-                }
-            }
-            if let Err(error) = controller.select(MASTER_SELECTOR, FAIL_CLOSED_PROXY).await {
-                terminate_child(&mut child);
-                return Err(format!("无法恢复主 Fail Closed 选择器：{error}"));
             }
         }
         ensure_core_start_not_cancelled(cancel)?;
@@ -5115,18 +5549,50 @@ fn terminate_child(child: &mut Child) {
     if child.try_wait().ok().flatten().is_none() {
         let _ = child.kill();
     }
-    let _ = child.wait();
+    let deadline = Instant::now() + CHILD_TERMINATION_TIMEOUT;
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn run_owned_command_bounded(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    let child = command
+        .spawn()
+        .map_err(|_| "无法启动固定 Mihomo 候选检查".to_string())?;
+    let mut child = PendingChild::new(child);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|_| "无法读取固定 Mihomo 候选检查状态".to_string())?
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            terminate_child(&mut child);
+            return Err("固定 Mihomo 候选检查超过总时限，已终止".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 async fn run_owned_command_cancellable(
     mut command: Command,
     cancel: &AtomicBool,
+    timeout: Duration,
 ) -> Result<ExitStatus, String> {
     ensure_core_start_not_cancelled(cancel)?;
     let child = command
         .spawn()
         .map_err(|error| format!("无法启动应用自管校验进程：{error}"))?;
     let mut child = PendingChild::new(child);
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         ensure_core_start_not_cancelled(cancel)?;
         if let Some(status) = child
@@ -5134,6 +5600,10 @@ async fn run_owned_command_cancellable(
             .map_err(|error| format!("无法读取应用自管校验进程状态：{error}"))?
         {
             return Ok(status);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            terminate_child(&mut child);
+            return Err("应用自管核心校验进程超过总时限，已终止".into());
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -5294,6 +5764,116 @@ mod tests {
     #[derive(Default)]
     struct TestSecretStore {
         values: Mutex<BTreeMap<String, String>>,
+    }
+
+    #[test]
+    fn fast_path_metrics_are_bounded_percentile_ready_and_secret_free() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        for duration_ms in [10, 20, 30, 40, 100] {
+            state.record_fast_path(
+                FastPathStage::WarmReload,
+                Instant::now()
+                    .checked_sub(Duration::from_millis(duration_ms))
+                    .expect("representable synthetic start"),
+                FastPathResultCode::Ok,
+            );
+        }
+        let report = state.fast_path_performance_report().expect("report");
+        let summary = report.summaries.first().expect("summary");
+        assert_eq!(summary.stage, FastPathStage::WarmReload);
+        assert_eq!(summary.sample_count, 5);
+        assert!((30..=35).contains(&summary.p50_ms));
+        assert!((100..=105).contains(&summary.p95_ms));
+        let serialized = serde_json::to_value(&report).expect("serialize report");
+        let first = serialized["samples"][0].as_object().expect("sample object");
+        assert_eq!(
+            first.keys().cloned().collect::<HashSet<_>>(),
+            HashSet::from([
+                "stage".to_string(),
+                "duration_ms".to_string(),
+                "result_code".to_string(),
+                "outlet_count".to_string(),
+            ])
+        );
+        let text = serialized.to_string();
+        assert!(!text.contains("https://"));
+        assert!(!text.contains("token"));
+        assert!(!text.contains("secret"));
+        for _ in 0..=MAX_FAST_PATH_SAMPLES {
+            state.record_fast_path(
+                FastPathStage::GuardianCycle,
+                Instant::now(),
+                FastPathResultCode::Error,
+            );
+        }
+        assert_eq!(
+            state
+                .fast_path_performance_report()
+                .expect("bounded report")
+                .samples
+                .len(),
+            MAX_FAST_PATH_SAMPLES
+        );
+    }
+
+    #[test]
+    fn foreground_operation_cancel_is_observed_and_slot_is_reusable() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let operation = state.begin_foreground_operation().expect("operation");
+        assert!(state.cancel_foreground_operation());
+        assert!(operation.ensure_active().is_err());
+        drop(operation);
+        assert!(state.begin_foreground_operation().is_ok());
+    }
+
+    #[test]
+    #[ignore = "wall-clock acceptance benchmark; run isolated to avoid parallel filesystem contention"]
+    fn ordinary_settings_apply_p95_stays_below_one_second_without_a_core() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let mut private = state.private_config().expect("private");
+        private.outlets = vec![OutletConfig {
+            id: "ordinary-local".into(),
+            label: "Ordinary local".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "socks5h://127.0.0.1:45173".into(),
+            },
+        }];
+        private
+            .save(state.private_config_path_for_test())
+            .expect("seed private config");
+        let mut durations = Vec::new();
+        for retention_days in 31..51 {
+            let mut draft = state.settings_view().expect("settings").draft;
+            draft.retention_days = retention_days;
+            let preview = state
+                .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+                .expect("preview");
+            assert!(preview.can_apply, "preview issues: {:?}", preview.issues);
+            let started_at = Instant::now();
+            state
+                .apply_settings(SettingsApplyRequest {
+                    draft,
+                    credential_mutations: Vec::new(),
+                    active_outlet_replacement: None,
+                    fail_closed_on_removed_active: false,
+                    preview_fingerprint: preview.request_fingerprint,
+                })
+                .expect("ordinary settings apply");
+            durations.push(u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX));
+            assert!(state.managed_core.lock().expect("core state").is_none());
+        }
+        let mut p50_durations = durations.clone();
+        let p50_ms = percentile_ms(&mut p50_durations, 50);
+        let p95_ms = percentile_ms(&mut durations, 95);
+        eprintln!("ordinary settings ms: p50={p50_ms} p95={p95_ms}");
+        assert!(p95_ms < 1_000);
     }
 
     #[test]
@@ -8599,6 +9179,135 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
     }
 
     #[tokio::test]
+    #[ignore = "requires repository-pinned Mihomo binary; uses random loopback ports and no external traffic"]
+    #[allow(clippy::too_many_lines)]
+    async fn owned_core_hot_reloads_entry_and_outlets_without_changing_pid() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let entry = ProbePortLease::reserve().expect("entry");
+        let controller = ProbePortLease::reserve_excluding(&[entry.port()]).expect("controller");
+        let target =
+            ProbePortLease::reserve_excluding(&[entry.port(), controller.port()]).expect("target");
+        let local =
+            ProbePortLease::reserve_excluding(&[entry.port(), controller.port(), target.port()])
+                .expect("local outlet");
+        let mut config = PrivateRoutingConfig::default();
+        config.entry = EntryConfig {
+            host: "127.0.0.1".into(),
+            port: entry.port(),
+        };
+        config.controller_port = controller.port();
+        config.outlets = vec![OutletConfig {
+            id: "local-fast-path".into(),
+            label: "Local fast path".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: format!("socks5://127.0.0.1:{}", local.port()),
+            },
+        }];
+        drop(entry);
+        drop(controller);
+        drop(local);
+        config
+            .save(state.private_config_path_for_test())
+            .expect("save initial config");
+
+        let started = Instant::now();
+        let running = state
+            .start_development_core()
+            .await
+            .expect("start isolated core");
+        let mut startup_ms = vec![u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)];
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = running.pid.expect("owned pid");
+
+        config.entry.port = target.port();
+        drop(target);
+        config.outlets.push(OutletConfig {
+            id: "local-fast-path-2".into(),
+            label: "Local fast path 2".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "http://127.0.0.1:45999".into(),
+            },
+        });
+        let mut warm_reload_ms = Vec::new();
+        for iteration in 0..5 {
+            config.outlets[0].label = format!("Local fast path {iteration}");
+            config
+                .save(state.private_config_path_for_test())
+                .expect("save reload config");
+            let reloaded_at = Instant::now();
+            let reloaded = state
+                .reload_owned_core_config_verified(pid, &AtomicBool::new(false))
+                .await
+                .expect("same-pid hot reload");
+            warm_reload_ms
+                .push(u64::try_from(reloaded_at.elapsed().as_millis()).unwrap_or(u64::MAX));
+            assert!(reloaded_at.elapsed() < Duration::from_secs(5));
+            assert_eq!(reloaded.pid, Some(pid));
+        }
+        assert_eq!(
+            listening_owner_pid(SocketAddr::from((Ipv4Addr::LOCALHOST, config.entry.port))),
+            Some(pid)
+        );
+        let controller = state
+            .controller_client()
+            .expect("controller state")
+            .expect("controller");
+        assert!(
+            controller
+                .is_selected(MASTER_SELECTOR, FAIL_CLOSED_PROXY)
+                .await
+                .expect("master readback")
+        );
+        assert!(
+            controller
+                .is_selected(UDP_SELECTOR, FAIL_CLOSED_PROXY)
+                .await
+                .expect("udp readback")
+        );
+        let mut fallback_restart_ms = Vec::new();
+        for _ in 0..5 {
+            let fallback_started = Instant::now();
+            state
+                .stop_development_core()
+                .expect("stop exact-owned core");
+            let startup_started = Instant::now();
+            state
+                .start_development_core()
+                .await
+                .expect("restart exact-owned core");
+            startup_ms
+                .push(u64::try_from(startup_started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            fallback_restart_ms
+                .push(u64::try_from(fallback_started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        }
+        let mut warm_p50 = warm_reload_ms.clone();
+        let mut warm_p95 = warm_reload_ms.clone();
+        let mut startup_p50 = startup_ms.clone();
+        let mut startup_p95 = startup_ms.clone();
+        let mut fallback_p50 = fallback_restart_ms.clone();
+        let mut fallback_p95 = fallback_restart_ms.clone();
+        let warm_p50 = percentile_ms(&mut warm_p50, 50);
+        let warm_p95 = percentile_ms(&mut warm_p95, 95);
+        let startup_p50 = percentile_ms(&mut startup_p50, 50);
+        let startup_p95 = percentile_ms(&mut startup_p95, 95);
+        let fallback_p50 = percentile_ms(&mut fallback_p50, 50);
+        let fallback_p95 = percentile_ms(&mut fallback_p95, 95);
+        eprintln!(
+            "isolated fast path ms: warm_reload p50={warm_p50} p95={warm_p95}; core_startup p50={startup_p50} p95={startup_p95}; fallback_restart p50={fallback_p50} p95={fallback_p95}"
+        );
+        assert!(warm_p95 < 5_000);
+        assert!(startup_p95 < 5_000);
+        assert!(fallback_p95 < 10_000);
+        state
+            .stop_development_core()
+            .expect("final exact-owned stop");
+    }
+
+    #[tokio::test]
     #[ignore = "requires the pinned Mihomo binary and a configured live local outlet"]
     async fn starts_and_stops_only_the_isolated_development_core() {
         let state = AppState::new();
@@ -8851,8 +9560,9 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         ]);
         let cancel = Arc::new(AtomicBool::new(false));
         let task_cancel = Arc::clone(&cancel);
-        let task =
-            tokio::spawn(async move { run_owned_command_cancellable(command, &task_cancel).await });
+        let task = tokio::spawn(async move {
+            run_owned_command_cancellable(command, &task_cancel, Duration::from_secs(10)).await
+        });
         let deadline = Instant::now() + Duration::from_secs(2);
         let pid = loop {
             if let Ok(content) = fs::read_to_string(&pid_path)
@@ -8890,6 +9600,27 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             !still_running,
             "cancelled validation child must not survive"
         );
+    }
+
+    #[tokio::test]
+    async fn owned_command_total_timeout_kills_child_without_cancellation() {
+        let mut command = hidden_command("powershell.exe");
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ]);
+        let started = Instant::now();
+        let result = run_owned_command_cancellable(
+            command,
+            &AtomicBool::new(false),
+            Duration::from_millis(120),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

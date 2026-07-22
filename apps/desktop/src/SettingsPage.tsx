@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowDown, ArrowUp, Eye, Gauge, KeyRound, ListOrdered, Plus, RadioTower, Route, Save, ShieldAlert, ShieldCheck, Trash2 } from "lucide-react";
-import { applyEntrySwitch, applySettings, getSettings, getSettingsTerminalStatus, previewEntrySwitch, previewSettings, recoverSettingsTerminal } from "./lib/bridge";
+import { ArrowDown, ArrowUp, Eye, Gauge, KeyRound, ListOrdered, Plus, RadioTower, Route, Save, ShieldAlert, ShieldCheck, Square, Trash2 } from "lucide-react";
+import { applyEntrySwitch, applySettings, cancelForegroundOperation, getSettings, getSettingsTerminalStatus, previewEntrySwitch, previewSettings, recoverSettingsTerminal } from "./lib/bridge";
 import {
   buildSettingsPreviewRequest,
   createOutletId,
@@ -14,7 +14,7 @@ import { buildEntrySwitchFoundationPreview } from "./lib/entrySwitchModel";
 import type { CredentialState, LocalProxyProtocol, SafeSettingsView, SettingsDraft, SettingsOutlet, SettingsPreview, SettingsTerminalStatus } from "./types";
 
 interface Props { currentOutletId: string | null; onApplied: () => Promise<void>; onNotice: (message: string) => void }
-type PageState = "loading" | "clean" | "dirty" | "checking" | "preview" | "confirm_reload" | "applying" | "success" | "error";
+type PageState = "loading" | "clean" | "dirty" | "checking" | "preview" | "applying" | "success" | "error";
 const credentialLabel: Record<CredentialState, string> = { configured: "已配置", missing: "未配置", unavailable: "存储不可用", corrupted: "凭据损坏" };
 
 export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
@@ -31,6 +31,9 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const [entrySwitchCompleted, setEntrySwitchCompleted] = useState(false);
   const [preview, setPreview] = useState<SettingsPreview | null>(null);
   const [pageState, setPageState] = useState<PageState>("loading");
+  const [operationStage, setOperationStage] = useState("已同步");
+  const [slowOperation, setSlowOperation] = useState(false);
+  const [cancelRequested, setCancelRequested] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const errorRef = useRef<HTMLDivElement>(null);
   const credentialInputs = useRef(new Map<string, HTMLInputElement>());
@@ -42,6 +45,15 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
 
   useEffect(() => { void Promise.all([getSettings(), getSettingsTerminalStatus()]).then(([settings, terminal]) => { setView(settings); setTerminalStatus(terminal); setDraft(settings.draft); setEntrySwitchTarget(settings.draft.entry); setBaseline(JSON.stringify(settings.draft)); setPageState("clean"); }).catch((reason) => { setError(String(reason)); setPageState("error"); }); }, []);
   useEffect(() => { if (pageState === "error") errorRef.current?.focus(); }, [pageState]);
+  useEffect(() => {
+    if (pageState !== "checking" && pageState !== "applying") {
+      setSlowOperation(false);
+      setCancelRequested(false);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setSlowOperation(true), 2_000);
+    return () => window.clearTimeout(timer);
+  }, [pageState]);
 
   const invalidatePreview = () => {
     previewGeneration.current += 1; setPreview(null); setError(null); setPageState("dirty");
@@ -66,7 +78,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     if (!draft) return null;
     const request = buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById);
     const generation = ++previewGeneration.current;
-    setPageState("checking"); setError(null);
+    setOperationStage("正在校验配置"); setPageState("checking"); setError(null);
     try {
       const result = await previewSettings(request);
       if (!isCurrentPreviewResponse(generation, previewGeneration.current, request.request_fingerprint, result.request_fingerprint)) return null;
@@ -78,9 +90,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
       } else if (outcome === "no_changes") {
         setError("没有可应用的设置变更。");
         setPageState("error");
-      } else {
-        setPageState(outcome === "confirm_reload" ? "confirm_reload" : "preview");
-      }
+      } else setPageState("preview");
       return result;
     } catch (reason) {
       if (generation !== previewGeneration.current) return null;
@@ -93,7 +103,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     if (!draft || approved.issues.length > 0) return;
     const request = buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById);
     if (request.request_fingerprint !== approved.request_fingerprint) { invalidatePreview(); return; }
-    setPageState("applying"); setError(null);
+    setOperationStage("正在原子提交并应用 runtime"); setPageState("applying"); setError(null);
     try {
       const pending = dispatchOneShotSettingsApply({
         draft,
@@ -104,13 +114,13 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
       previewGeneration.current += 1;
       setCredentialIntentById({}); setPreview(null);
       const result = await pending;
-      setView(result.settings); setDraft(result.settings.draft); setBaseline(JSON.stringify(result.settings.draft)); setReplacement(null); setFailClosed(false); setPageState("success");
+      setView(result.settings); setDraft(result.settings.draft); setBaseline(JSON.stringify(result.settings.draft)); setReplacement(null); setFailClosed(false); setOperationStage("配置已生效，后台正在连接"); setPageState("success");
       onNotice(result.managed_core_restarted
         ? `设置已原子应用，自管核心已安全重启并通过权威回读；清理 ${result.removed_history_rows} 条过期历史。`
         : `设置已在线应用；核心未重启，清理 ${result.removed_history_rows} 条过期历史。`);
       try { await onApplied(); } catch { onNotice("设置已应用，但仪表盘刷新失败；请稍后手动刷新。"); }
     } catch (reason) {
-      previewGeneration.current += 1; credentialInputs.current.clear(); setCredentialIntentById({}); setPreview(null); setError(String(reason)); setPageState("error");
+      previewGeneration.current += 1; credentialInputs.current.clear(); setCredentialIntentById({}); setPreview(null); setOperationStage("应用失败；已执行安全恢复"); setError(String(reason)); setPageState("error");
     }
   };
 
@@ -124,15 +134,6 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     if (!dirty || operationInFlight.current) return;
     operationInFlight.current = true;
     try {
-      const request = draft
-        ? buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById)
-        : null;
-      const confirmed = pageState === "confirm_reload" && preview && request
-        && preview.request_fingerprint === request.request_fingerprint;
-      if (confirmed) {
-        await commitPreview(preview);
-        return;
-      }
       const checked = await requestCurrentPreview();
       if (checked && settingsPreviewOutcome(checked) === "live_apply") await commitPreview(checked);
     } finally {
@@ -143,7 +144,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const runTerminalRecovery = async () => {
     if (operationInFlight.current) return;
     operationInFlight.current = true;
-    setPageState("applying"); setError(null);
+    setOperationStage("正在执行受鉴权恢复"); setPageState("applying"); setError(null);
     try {
       const status = await recoverSettingsTerminal();
       setTerminalStatus(status); setPageState("clean");
@@ -160,7 +161,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     if (dirty || terminalStatus.active || !entrySwitchTarget
       || !entrySwitchPreview.executable || operationInFlight.current) return;
     operationInFlight.current = true;
-    setPageState("applying"); setError(null);
+    setOperationStage("正在切换入口并验证 ownership"); setPageState("applying"); setError(null);
     try {
       const authorized = await previewEntrySwitch(
         entrySwitchTarget,
@@ -229,6 +230,18 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     }
   };
 
+  const cancelCurrentOperation = async () => {
+    if (!busy || cancelRequested) return;
+    setCancelRequested(true);
+    setOperationStage("正在取消并安全恢复");
+    try {
+      const accepted = await cancelForegroundOperation();
+      if (!accepted) setOperationStage("操作已进入原子收尾，等待权威结果");
+    } catch (reason) {
+      setError(`取消请求未确认：${String(reason)}`);
+    }
+  };
+
   if (!draft || !view) return (
     <main className="settings-view" aria-busy={pageState === "loading"}>
       {error
@@ -248,9 +261,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
       ? "正在应用已校验设置；完成前字段与操作保持锁定。"
       : !dirty
         ? "当前没有待应用的变更。"
-        : pageState === "confirm_reload" && previewMatches
-          ? "这些变更需要短暂中断连接；再次点击将确认受控重载。"
-          : "点击“应用设置”会自动校验；在线变更直接应用，需要重载时再请求确认。";
+        : "点击“应用设置”会自动校验并立即应用；优先同 PID 热重载，失败时执行受控重启。";
   const impactLabel = {
     live_apply: "在线应用",
     managed_core_reload: "需核心重载",
@@ -302,13 +313,18 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
         <div className="settings-actions">
           <span className={`settings-stage${pageState === "applying" ? " is-busy" : dirty ? " is-dirty" : ""}`} role="status" aria-live="polite">
             <span className="stage-dot" aria-hidden="true" />
-            {pageState === "checking" ? "正在自动校验" : pageState === "applying" ? "正在原子应用" : pageState === "confirm_reload" ? "等待重载确认" : dirty ? "有未应用变更" : pageState === "success" ? "应用成功" : "已同步"}
+            {pageState === "checking" || pageState === "applying" ? operationStage : dirty ? "有未应用变更" : pageState === "success" ? operationStage : "已同步"}
           </span>
+          {slowOperation && (
+            <button className="danger-button" type="button" disabled={cancelRequested} onClick={() => void cancelCurrentOperation()}>
+              <Square />{cancelRequested ? "正在取消…" : "取消当前操作"}
+            </button>
+          )}
           <button className="secondary-button" type="button" aria-disabled={actionUnavailable} aria-describedby="settings-action-reason" onClick={() => void runPreview()}>
             <Eye />查看变更
           </button>
           <button className="primary-button" type="button" aria-disabled={actionUnavailable} aria-describedby="settings-action-reason" onClick={() => void runApply()}>
-            <Save />{pageState === "checking" ? "正在校验…" : pageState === "applying" ? "正在应用…" : pageState === "confirm_reload" && previewMatches ? "确认并重启核心" : "应用设置"}
+            <Save />{pageState === "checking" ? "正在校验…" : pageState === "applying" ? "正在应用…" : "应用设置"}
           </button>
           <p className="settings-action-reason" id="settings-action-reason">{actionReason}</p>
         </div>
@@ -331,7 +347,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
           <h2>变更预览</h2>
           <ul>
             {preview.diff.changes.map((change) => <li key={change.code}><span className={`impact-badge is-${change.impact}`}>{impactLabel[change.impact]}</span>{change.summary}</li>)}
-            {preview.requires_managed_core_restart && <li className="restart-warning">确认后将短暂中断连接：候选校验 → 精确停止自管核心 → 原子提交 → 重启 → Controller/Guardian 权威回读；失败时恢复最后有效配置，绝不回退 DIRECT。</li>}
+            {preview.requires_managed_core_restart && <li className="restart-warning">优先对 exact-owned 核心执行同 PID 热重载并验证双 REJECT；仅在热重载失败时执行有界重启，完整 Guardian 在后台运行。</li>}
           </ul>
           {preview.issues.length > 0 && (
             <div id="settings-validation-summary" role="group" aria-label="设置问题摘要">

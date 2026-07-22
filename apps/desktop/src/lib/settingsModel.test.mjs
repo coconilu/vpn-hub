@@ -56,10 +56,10 @@ test("credential intent invalidates a matching draft preview", () => {
   assert.notEqual(clean, intent.request_fingerprint);
 });
 
-test("automatic apply distinguishes errors, live apply, and reload confirmation", () => {
+test("automatic apply keeps managed reload on the one-click fast path", () => {
   const base = { issues: [], can_apply: true, requires_managed_core_restart: false };
   assert.equal(settingsPreviewOutcome(base), "live_apply");
-  assert.equal(settingsPreviewOutcome({ ...base, requires_managed_core_restart: true }), "confirm_reload");
+  assert.equal(settingsPreviewOutcome({ ...base, requires_managed_core_restart: true }), "live_apply");
   assert.equal(settingsPreviewOutcome({ ...base, issues: [{ field: "outlets" }] }), "error");
   assert.equal(settingsPreviewOutcome({ ...base, can_apply: false }), "no_changes");
 });
@@ -131,11 +131,13 @@ test("unsupported TUN stays visibly off and cannot record consent", () => {
   assert.equal(source.includes("missing_executable_identity_outlet_ids"), true);
 });
 
-test("managed-core reload is one explicit confirmation with fail-closed recovery copy", () => {
+test("managed-core reload exposes hot reload fallback and slow-operation cancellation", () => {
   const source = fs.readFileSync(new URL("../SettingsPage.tsx", import.meta.url), "utf8");
-  assert.equal(source.includes("确认并重启核心"), true);
-  assert.equal(source.includes("候选校验 → 精确停止自管核心 → 原子提交 → 重启 → Controller/Guardian 权威回读"), true);
-  assert.equal(source.includes("失败时恢复最后有效配置，绝不回退 DIRECT"), true);
+  assert.equal(source.includes("同 PID 热重载并验证双 REJECT"), true);
+  assert.equal(source.includes("仅在热重载失败时执行有界重启"), true);
+  assert.equal(source.includes("完整 Guardian 在后台运行"), true);
+  assert.equal(source.includes("取消当前操作"), true);
+  assert.equal(source.includes("2_000"), true);
 });
 
 test("settings primary action auto-validates and exposes accessible disabled reasons", () => {

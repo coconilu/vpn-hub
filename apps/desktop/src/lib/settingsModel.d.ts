@@ -7,7 +7,7 @@ export function credentialIntents(intentById: Record<string, CredentialIntentAct
 export function settingsRequestFingerprint(draft: SettingsDraft, activeOutletReplacement: string | null, failClosedOnRemovedActive: boolean, intents: CredentialMutationIntent[]): string;
 export function buildSettingsPreviewRequest(draft: SettingsDraft, activeOutletReplacement: string | null, failClosedOnRemovedActive: boolean, intentById: Record<string, CredentialIntentAction>): SettingsPreviewRequest;
 export function isCurrentPreviewResponse(startedGeneration: number, currentGeneration: number, currentFingerprint: string, responseFingerprint: string): boolean;
-export function settingsPreviewOutcome(preview: SettingsPreview): "error" | "no_changes" | "confirm_reload" | "live_apply";
+export function settingsPreviewOutcome(preview: SettingsPreview): "error" | "no_changes" | "live_apply";
 export function settingsValidationTargetIds(field: string): string[];
 export function takeCredentialMutations(inputById: Map<string, Pick<HTMLInputElement, "value">>, intentById: Record<string, CredentialIntentAction>): CredentialMutation[];
 export function consumeSettingsPreviewTicket(currentTicket: string | null, requestedFingerprint: string): null;

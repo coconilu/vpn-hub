@@ -19,6 +19,7 @@
 | D-009 | 历史数据只记录出口质量和状态 | 不采集域名、URL、目标 IP 或用户流量内容 |
 | D-010 | 先通过 Phase 0 再进入正式开发 | 端口可修改和并行运行是方案成立的硬门槛 |
 | D-011 | 运行中设置重载只允许停止可同时证明 PID、Supervisor authority 与 Controller ownership 的自管核心；配置在首次 Guardian 权威回读前保持可回滚 | 防止误停第三方进程，并确保提交后启动失败不会把无效配置提升为最后有效配置 |
+| D-012 | 配置生效只等待本地 runtime、入口、Controller ownership 与双 `REJECT` 回读；provider 和 Guardian 健康确认在提交后异步进行 | 把安全提交与不可控外部网络延迟解耦，同时在连接未确认时继续 Fail Closed |
 
 ## 默认检测参数
 

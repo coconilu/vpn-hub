@@ -13,6 +13,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   cancelSubscriptionNodeLatencyBatch,
   getSubscriptionNodeCatalog,
+  retrySubscriptionProvider,
   selectSubscriptionNode,
   testSubscriptionNodeLatencies,
   testSubscriptionNodeLatency,
@@ -39,7 +40,13 @@ function groupStateMessage(group: SubscriptionNodeGroup) {
     return "请先在总览中启动本应用自管 Mihomo 核心。不会连接或控制其他代理客户端。";
   }
   if (group.state === "provider_unavailable") {
-    return "订阅 provider 尚未返回可选节点。请等待订阅刷新后重试，原选择保持不变。";
+    return "订阅 provider 尚未返回可选节点。可以立即重试；配置无需再次保存。";
+  }
+  if (group.state === "provider_loading") {
+    return "配置已生效，provider 正在后台加载；完成后刷新即可加入路由。";
+  }
+  if (group.state === "provider_failed") {
+    return "provider 刷新失败。凭据与配置仍已安全保存，可以重试且无需再次保存。";
   }
   return null;
 }
@@ -68,6 +75,7 @@ export function NodesPage() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
+  const [retryingProvider, setRetryingProvider] = useState(false);
   const [selecting, setSelecting] = useState<string | null>(null);
   const [testingNode, setTestingNode] = useState<string | null>(null);
   const [batchOperation, setBatchOperation] = useState<string | null>(null);
@@ -121,7 +129,25 @@ export function NodesPage() {
   );
   const stateMessage = activeGroup ? groupStateMessage(activeGroup) : null;
   const testing = testingNode !== null || batchOperation !== null;
-  const busy = loading || selecting !== null || testing;
+  const busy = loading || selecting !== null || testing || retryingProvider;
+
+  const retryProvider = async () => {
+    if (!activeGroup || busy) return;
+    setRetryingProvider(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const updated = await retrySubscriptionProvider(activeGroup.subscription_id);
+      setCatalog((current) => current ? replaceSubscriptionNodeGroup(current, updated) : current);
+      setNotice(updated.state === "provider_failed"
+        ? "Provider 重试已明确失败；可稍后再次重试。"
+        : "Provider 重试已提交，正在后台加载；无需再次保存配置。");
+    } catch (retryError) {
+      setError(String(retryError));
+    } finally {
+      setRetryingProvider(false);
+    }
+  };
 
   const chooseNode = async (nodeName: string) => {
     if (!activeGroup || nodeName === activeGroup.current_node || testing) return;
@@ -276,7 +302,7 @@ export function NodesPage() {
           </section>
 
           {stateMessage ? (
-            <div className="node-empty is-warning"><CircleAlert aria-hidden="true" /><h2>节点列表暂不可用</h2><p>{stateMessage}</p></div>
+            <div className="node-empty is-warning"><CircleAlert aria-hidden="true" /><h2>节点列表暂不可用</h2><p>{stateMessage}</p>{activeGroup?.state !== "core_unavailable" && <button className="secondary-button" disabled={retryingProvider} onClick={() => void retryProvider()} type="button"><RefreshCw aria-hidden="true" className={retryingProvider ? "spin" : ""} />{retryingProvider ? "正在提交重试…" : "重试 Provider"}</button>}</div>
           ) : visibleNodes.length === 0 ? (
             <div className="node-empty"><Search aria-hidden="true" /><h2>没有匹配节点</h2><p>换一个关键词，或清空搜索条件。</p></div>
           ) : (

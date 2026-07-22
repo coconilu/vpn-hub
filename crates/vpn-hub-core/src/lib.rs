@@ -35,8 +35,9 @@ pub use entry_switch::{
     WindowsProxyMode,
 };
 pub use guardian_cycle::{
-    GuardianCycleError, GuardianCycleOutcome, RoutingSession, RoutingStateError,
-    run_controller_guardian_cycle,
+    DEFAULT_GUARDIAN_CONCURRENCY, DEFAULT_GUARDIAN_CYCLE_BUDGET, GuardianCycleError,
+    GuardianCycleOutcome, RoutingSession, RoutingStateError, run_controller_guardian_cycle,
+    run_controller_guardian_cycle_controlled,
 };
 pub use history::{
     HistoryEventType, HistoryExport, HistoryFilter, HistoryMetric, HistoryOutletKind,

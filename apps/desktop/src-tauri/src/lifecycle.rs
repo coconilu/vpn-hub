@@ -654,6 +654,22 @@ impl DesktopCoordinator {
         self.invalidate_recovery();
     }
 
+    /// Requests prompt cancellation of the current background probe or
+    /// recovery task so a foreground configuration transaction can proceed.
+    /// The task itself owns cleanup and late-result suppression.
+    pub fn cancel_background_work(&self) {
+        if let Ok(active) = self.active_cancel.lock()
+            && let Some(cancel) = active.as_ref()
+        {
+            cancel.store(true, Ordering::Release);
+        }
+        if let Ok(manual) = self.manual_cancel.lock()
+            && let Some((_, cancel)) = manual.as_ref()
+        {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+
     pub fn prepare_manual_start(&self, cancel: &Arc<AtomicBool>) -> Result<u64, String> {
         if self.pending_stop.load(Ordering::Acquire) {
             return Err("停止请求尚未完成；不会启动迟到的应用自管核心".into());
@@ -1008,7 +1024,6 @@ fn start_probe_work(app: &AppHandle, id: u64, sender: mpsc::Sender<WorkMessage>)
     let task_app = app.clone();
     let handle = tokio::spawn(async move {
         let state = task_app.state::<AppState>();
-        let _transaction = state.lock_routing_transaction().await;
         if task_cancel.load(Ordering::Acquire) {
             let _ = sender
                 .send(WorkMessage::ProbeFinished {
@@ -1019,7 +1034,8 @@ fn start_probe_work(app: &AppHandle, id: u64, sender: mpsc::Sender<WorkMessage>)
                 .await;
             return;
         }
-        let result = commands::record_routing_cycle_locked(&state).await;
+        let result =
+            commands::record_routing_cycle_controlled(&state, true, Arc::clone(&task_cancel)).await;
         let succeeded = result.is_ok() && !task_cancel.load(Ordering::Acquire);
         let _ = sender
             .send(WorkMessage::ProbeFinished {
@@ -1134,8 +1150,6 @@ async fn run_restart_task(
         send_restart_finished(&sender, id, Some(pid), outcome).await;
         return;
     }
-    let guardian_succeeded = state.uses_helper_authority()
-        || commands::record_routing_cycle_locked(&state).await.is_ok();
     let child_alive = state
         .owned_core_controller_is_running_authoritative(pid)
         .await
@@ -1144,7 +1158,7 @@ async fn run_restart_task(
     let deliberately_cancelled = cancel.load(Ordering::Acquire)
         && !owned_child_exited.load(Ordering::Acquire)
         || !epoch_current;
-    let committed = guardian_succeeded && !deliberately_cancelled && child_alive;
+    let committed = !deliberately_cancelled && child_alive;
     if !committed {
         let _ = state.stop_supervised_core_if_pid(pid).await;
     }
@@ -1328,7 +1342,7 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                         match outcome {
                             RestartOutcome::Succeeded => {
                                 if let Some(pid) = pid {
-                                    pending_probe = false;
+                                    pending_probe = true;
                                     consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::RecoverySucceeded { pid }), &mut pending_probe, &mut restart_at);
                                     publish_transition_notifications(&app, &mut transitions, &mut deduper);
                                 }

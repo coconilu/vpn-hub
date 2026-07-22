@@ -1,14 +1,19 @@
 use std::{
     collections::{BTreeMap, HashSet},
-    time::Instant,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use chrono::{SecondsFormat, Utc};
 use thiserror::Error;
+use tokio::{sync::Semaphore, task::JoinSet, time::Instant as TokioInstant};
 
 use crate::{
     ControllerClient, ControllerError, GuardianStore, HealthStatus, MonitorConfig, OutletConfig,
-    OutletHealth, OutletKind, PrivateRoutingConfig, ProbeOutletConfig, ProbeResult, RouteDecision,
+    OutletHealth, PrivateRoutingConfig, ProbeOutletConfig, ProbeResult, RouteDecision,
     RouteSwitchEvent, RoutingEngine, RoutingPolicy, StoreError, UDP_SELECTOR, UdpCapabilityStatus,
     current_udp_status, outlet_proxy_name, unknown_udp_evidence,
 };
@@ -81,7 +86,12 @@ pub enum GuardianCycleError {
     Store(#[from] StoreError),
     #[error("routing state operation failed: {0}")]
     RoutingState(#[from] RoutingStateError),
+    #[error("Guardian cycle was cancelled before commit")]
+    Cancelled,
 }
+
+pub const DEFAULT_GUARDIAN_CYCLE_BUDGET: Duration = Duration::from_secs(8);
+pub const DEFAULT_GUARDIAN_CONCURRENCY: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct GuardianCycleOutcome {
@@ -109,6 +119,44 @@ pub async fn run_controller_guardian_cycle(
     routing: &impl RoutingSession,
     now_ms: u64,
 ) -> Result<GuardianCycleOutcome, GuardianCycleError> {
+    run_controller_guardian_cycle_controlled(
+        controller,
+        private,
+        resolved,
+        monitor,
+        store,
+        routing,
+        now_ms,
+        Arc::new(AtomicBool::new(false)),
+        DEFAULT_GUARDIAN_CYCLE_BUDGET,
+        DEFAULT_GUARDIAN_CONCURRENCY,
+    )
+    .await
+}
+
+/// Executes a cancellable, globally bounded Guardian cycle. Probes run with a
+/// shared concurrency limit; cancellation is checked before any durable or
+/// Controller routing mutation so an obsolete configuration generation cannot
+/// overwrite a newer one.
+///
+/// # Errors
+///
+/// Returns `Cancelled` without committing probe or selector state when the
+/// caller invalidates this cycle, plus the same sanitized errors as the normal
+/// Guardian entry point.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn run_controller_guardian_cycle_controlled(
+    controller: &ControllerClient,
+    private: &PrivateRoutingConfig,
+    resolved: &crate::ResolvedSubscriptionUrls,
+    monitor: &MonitorConfig,
+    store: &mut GuardianStore,
+    routing: &impl RoutingSession,
+    now_ms: u64,
+    cancel: Arc<AtomicBool>,
+    budget: Duration,
+    concurrency: usize,
+) -> Result<GuardianCycleOutcome, GuardianCycleError> {
     for outlet in private.enabled_outlets() {
         store.ensure_udp_capability(
             &outlet.id,
@@ -116,10 +164,25 @@ pub async fn run_controller_guardian_cycle(
             &unknown_udp_evidence(outlet, "not_yet_validated"),
         )?;
     }
-    let observed =
-        probe_configured_outlets(controller, private, resolved, monitor.request_timeout_ms).await;
+    let observed = probe_configured_outlets(
+        controller,
+        private,
+        resolved,
+        monitor.request_timeout_ms,
+        Arc::clone(&cancel),
+        budget,
+        concurrency,
+    )
+    .await;
+
+    if cancel.load(Ordering::Acquire) {
+        return Err(GuardianCycleError::Cancelled);
+    }
 
     for (outlet, result) in &observed {
+        if cancel.load(Ordering::Acquire) {
+            return Err(GuardianCycleError::Cancelled);
+        }
         store.record_probe(
             outlet,
             result,
@@ -161,6 +224,9 @@ pub async fn run_controller_guardian_cycle(
     };
     let decision = routing.evaluate_route(now_ms, &health, &policy)?;
     let started = Instant::now();
+    if cancel.load(Ordering::Acquire) {
+        return Err(GuardianCycleError::Cancelled);
+    }
     if let Some(decision) = &decision {
         controller
             .select(
@@ -169,6 +235,10 @@ pub async fn run_controller_guardian_cycle(
             )
             .await?;
     }
+    if cancel.load(Ordering::Acquire) {
+        force_controller_fail_closed(controller).await?;
+        return Err(GuardianCycleError::Cancelled);
+    }
     let selected_outlet = decision
         .as_ref()
         .map(|decision| decision.to_outlet.clone())
@@ -176,10 +246,12 @@ pub async fn run_controller_guardian_cycle(
     let udp_capabilities = store.udp_capabilities()?;
     let udp_target = udp_selector_target(private, selected_outlet.as_deref(), &udp_capabilities);
     if let Err(error) = controller.select(UDP_SELECTOR, &udp_target).await {
-        let _ = controller
-            .select(UDP_SELECTOR, crate::FAIL_CLOSED_PROXY)
-            .await;
+        force_controller_fail_closed(controller).await?;
         return Err(error.into());
+    }
+    if cancel.load(Ordering::Acquire) {
+        force_controller_fail_closed(controller).await?;
+        return Err(GuardianCycleError::Cancelled);
     }
     if let Some(decision) = &decision {
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -198,6 +270,17 @@ pub async fn run_controller_guardian_cycle(
         observed: observed.into_iter().map(|(_, result)| result).collect(),
         decision,
     })
+}
+
+async fn force_controller_fail_closed(
+    controller: &ControllerClient,
+) -> Result<(), ControllerError> {
+    controller
+        .select(crate::MASTER_SELECTOR, crate::FAIL_CLOSED_PROXY)
+        .await?;
+    controller
+        .select(UDP_SELECTOR, crate::FAIL_CLOSED_PROXY)
+        .await
 }
 
 pub(crate) fn udp_selector_target(
@@ -232,25 +315,62 @@ async fn probe_configured_outlets(
     private: &PrivateRoutingConfig,
     resolved: &crate::ResolvedSubscriptionUrls,
     timeout_ms: u64,
+    cancel: Arc<AtomicBool>,
+    budget: Duration,
+    concurrency: usize,
 ) -> Vec<(ProbeOutletConfig, ProbeResult)> {
-    let mut observed = Vec::new();
-    for outlet in private.enabled_outlets() {
-        let result = match &outlet.kind {
-            OutletKind::Subscription { secret_ref, .. } if !resolved.contains_key(secret_ref) => {
-                unavailable_result(
-                    outlet,
-                    "subscription_not_configured",
-                    private.probe_targets.len(),
+    let outlets = private.enabled_outlets().cloned().collect::<Vec<_>>();
+    let deadline = TokioInstant::now() + budget;
+    let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+    let targets = Arc::new(private.probe_targets.clone());
+    let mut tasks = JoinSet::new();
+    for (index, outlet) in outlets.iter().cloned().enumerate() {
+        let configured = outlet
+            .secret_ref()
+            .is_none_or(|secret_ref| resolved.contains_key(secret_ref));
+        let controller = controller.clone();
+        let targets = Arc::clone(&targets);
+        let semaphore = Arc::clone(&semaphore);
+        let cancel = Arc::clone(&cancel);
+        tasks.spawn(async move {
+            let result = if configured {
+                probe_controller_outlet(
+                    &controller,
+                    &outlet,
+                    &targets,
+                    timeout_ms,
+                    deadline,
+                    semaphore,
+                    cancel,
                 )
-            }
-            _ => {
-                probe_controller_outlet(controller, outlet, &private.probe_targets, timeout_ms)
-                    .await
-            }
-        };
-        observed.push((virtual_outlet(outlet, &private.entry), result));
+                .await
+            } else {
+                unavailable_result(&outlet, "subscription_not_configured", targets.len())
+            };
+            (index, result)
+        });
     }
-    observed
+
+    let mut results = BTreeMap::new();
+    while !tasks.is_empty() && !cancel.load(Ordering::Acquire) {
+        let next = tokio::time::timeout_at(deadline, tasks.join_next()).await;
+        let Ok(Some(Ok((index, result)))) = next else {
+            break;
+        };
+        results.insert(index, result);
+    }
+    tasks.abort_all();
+
+    outlets
+        .iter()
+        .enumerate()
+        .map(|(index, outlet)| {
+            let result = results.remove(&index).unwrap_or_else(|| {
+                unavailable_result(outlet, "guardian_cycle_deadline", targets.len())
+            });
+            (virtual_outlet(outlet, &private.entry), result)
+        })
+        .collect()
 }
 
 async fn probe_controller_outlet(
@@ -258,15 +378,45 @@ async fn probe_controller_outlet(
     outlet: &OutletConfig,
     targets: &[String],
     timeout_ms: u64,
+    deadline: TokioInstant,
+    semaphore: Arc<Semaphore>,
+    cancel: Arc<AtomicBool>,
 ) -> ProbeResult {
     let proxy_name = outlet_proxy_name(&outlet.id);
-    let mut delays = Vec::new();
+    let mut tasks = JoinSet::new();
     for target in targets {
-        let delay = controller.delay(&proxy_name, target, timeout_ms).await;
-        if let Ok(delay) = delay {
+        let target = target.clone();
+        let controller = controller.clone();
+        let proxy_name = proxy_name.clone();
+        let semaphore = Arc::clone(&semaphore);
+        let cancel = Arc::clone(&cancel);
+        tasks.spawn(async move {
+            if cancel.load(Ordering::Acquire) {
+                return None;
+            }
+            let permit = tokio::select! {
+                permit = semaphore.acquire_owned() => permit.ok()?,
+                () = wait_for_cancel(Arc::clone(&cancel)) => return None,
+                () = tokio::time::sleep_until(deadline) => return None,
+            };
+            let _permit = permit;
+            tokio::select! {
+                result = controller.delay(&proxy_name, &target, timeout_ms) => result.ok(),
+                () = wait_for_cancel(cancel) => None,
+                () = tokio::time::sleep_until(deadline) => None,
+            }
+        });
+    }
+    let mut delays = Vec::new();
+    while !tasks.is_empty() && !cancel.load(Ordering::Acquire) {
+        let Ok(Some(Ok(delay))) = tokio::time::timeout_at(deadline, tasks.join_next()).await else {
+            break;
+        };
+        if let Some(delay) = delay {
             delays.push(delay);
         }
     }
+    tasks.abort_all();
     delays.sort_unstable();
     let successful_targets = u32::try_from(delays.len()).unwrap_or(u32::MAX);
     let total_targets = u32::try_from(targets.len()).unwrap_or(u32::MAX);
@@ -282,6 +432,12 @@ async fn probe_controller_outlet(
         error_code: (status == HealthStatus::Down).then(|| "multi_target_quorum_failed".into()),
         successful_targets,
         total_targets,
+    }
+}
+
+async fn wait_for_cancel(cancel: Arc<AtomicBool>) {
+    while !cancel.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -331,6 +487,75 @@ fn virtual_outlet(outlet: &OutletConfig, entry: &crate::EntryConfig) -> ProbeOut
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OutletKind;
+    use std::{net::Ipv4Addr, sync::atomic::AtomicUsize};
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    async fn delayed_controller(
+        delay: Duration,
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+    ) -> (ControllerClient, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("controller listener");
+        let address = listener.local_addr().expect("controller address");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                tokio::spawn(async move {
+                    let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    maximum.fetch_max(current, Ordering::AcqRel);
+                    let mut request = [0_u8; 2_048];
+                    let _ = stream.read(&mut request).await;
+                    tokio::time::sleep(delay).await;
+                    let body = br#"{"delay":42}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    active.fetch_sub(1, Ordering::AcqRel);
+                });
+            }
+        });
+        let controller = ControllerClient::new(
+            &format!("http://{address}"),
+            "synthetic-secret".into(),
+            2_000,
+        )
+        .expect("controller client");
+        (controller, handle)
+    }
+
+    fn concurrent_fixture() -> PrivateRoutingConfig {
+        let mut private = PrivateRoutingConfig::default();
+        private.probe_targets = vec![
+            "https://probe-a.invalid/".into(),
+            "https://probe-b.invalid/".into(),
+            "https://probe-c.invalid/".into(),
+        ];
+        private.outlets = (0..3)
+            .map(|index| OutletConfig {
+                id: format!("local-{index}"),
+                label: format!("Local {index}"),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: format!("socks5://127.0.0.1:{}", 45_000 + index),
+                },
+            })
+            .collect();
+        private
+    }
 
     #[test]
     fn multi_target_quorum_avoids_single_target_false_down() {
@@ -343,5 +568,68 @@ mod tests {
             classify_delays(&[80, 100, 120], 3),
             (HealthStatus::Healthy, Some(100))
         );
+    }
+
+    #[tokio::test]
+    async fn outlet_target_matrix_is_bounded_and_concurrent() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (controller, server) = delayed_controller(
+            Duration::from_millis(120),
+            Arc::clone(&active),
+            Arc::clone(&maximum),
+        )
+        .await;
+        let private = concurrent_fixture();
+        let started = TokioInstant::now();
+        let observed = probe_configured_outlets(
+            &controller,
+            &private,
+            &crate::ResolvedSubscriptionUrls::new(),
+            1_000,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(700),
+            4,
+        )
+        .await;
+        server.abort();
+
+        assert_eq!(observed.len(), 3);
+        assert!(
+            observed
+                .iter()
+                .all(|(_, result)| result.successful_targets == 3)
+        );
+        assert!(maximum.load(Ordering::Acquire) <= 4);
+        assert!(maximum.load(Ordering::Acquire) > 1);
+        assert!(started.elapsed() < Duration::from_millis(650));
+    }
+
+    #[tokio::test]
+    async fn global_deadline_retains_partial_results_without_waiting_per_target() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let (controller, server) =
+            delayed_controller(Duration::from_secs(2), active, maximum).await;
+        let private = concurrent_fixture();
+        let started = TokioInstant::now();
+        let observed = probe_configured_outlets(
+            &controller,
+            &private,
+            &crate::ResolvedSubscriptionUrls::new(),
+            5_000,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(100),
+            4,
+        )
+        .await;
+        server.abort();
+
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(observed.len(), 3);
+        assert!(observed.iter().all(|(_, result)| {
+            result.status == HealthStatus::Down
+                && result.error_code.as_deref() == Some("guardian_cycle_deadline")
+        }));
     }
 }
