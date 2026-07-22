@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, Eye, Gauge, KeyRound, ListOrdered, Plus, RadioTower, Route, Save, ShieldAlert, ShieldCheck, Trash2 } from "lucide-react";
-import { applySettings, getSettings, getSettingsTerminalStatus, previewSettings, recoverSettingsTerminal } from "./lib/bridge";
+import { applyEntrySwitch, applySettings, getSettings, getSettingsTerminalStatus, previewEntrySwitch, previewSettings, recoverSettingsTerminal } from "./lib/bridge";
 import {
   buildSettingsPreviewRequest,
   createOutletId,
@@ -28,6 +28,7 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const [entrySwitchConfirmed, setEntrySwitchConfirmed] = useState(false);
   const [applySystemProxy, setApplySystemProxy] = useState(false);
   const [entrySwitchTarget, setEntrySwitchTarget] = useState<{ host: string; port: number } | null>(null);
+  const [entrySwitchCompleted, setEntrySwitchCompleted] = useState(false);
   const [preview, setPreview] = useState<SettingsPreview | null>(null);
   const [pageState, setPageState] = useState<PageState>("loading");
   const [error, setError] = useState<string | null>(null);
@@ -155,6 +156,79 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     }
   };
 
+  const runEntrySwitch = async () => {
+    if (dirty || terminalStatus.active || !entrySwitchTarget
+      || !entrySwitchPreview.executable || operationInFlight.current) return;
+    operationInFlight.current = true;
+    setPageState("applying"); setError(null);
+    try {
+      const authorized = await previewEntrySwitch(
+        entrySwitchTarget,
+        applySystemProxy,
+        entrySwitchConfirmed,
+      );
+      if (!authorized.can_execute || !authorized.authorization) {
+        throw new Error(authorized.issues.map((issue) => issue.message).join("；")
+          || "入口切换预览未签发执行授权。");
+      }
+      const result = await applyEntrySwitch({
+        target: entrySwitchTarget,
+        apply_system_proxy: applySystemProxy,
+        authorization: authorized.authorization,
+      });
+      setView(result.settings);
+      setDraft(result.settings.draft);
+      setBaseline(JSON.stringify(result.settings.draft));
+      previewGeneration.current += 1;
+      credentialInputs.current.forEach((input) => { input.value = ""; });
+      setCredentialIntentById({});
+      setPreview(null);
+      setReplacement(null);
+      setFailClosed(false);
+      setEntrySwitchTarget(result.current_entry);
+      setEntrySwitchConfirmed(false);
+      setEntrySwitchCompleted(true);
+      setPageState("success");
+      onNotice(result.system_proxy_applied
+        ? `入口已从 ${result.previous_entry.host}:${result.previous_entry.port} 安全切换到 ${result.current_entry.host}:${result.current_entry.port}，Windows 系统代理已回读确认。`
+        : `入口已安全切换到 ${result.current_entry.host}:${result.current_entry.port}；Windows 系统代理保持不变。`);
+      await onApplied();
+    } catch (reason) {
+      const message = String(reason);
+      if (message.startsWith("entry_switch_recovery_pending: settings and runtime committed")) {
+        try {
+          const [settings, terminal] = await Promise.all([
+            getSettings(),
+            getSettingsTerminalStatus(),
+          ]);
+          setView(settings);
+          setDraft(settings.draft);
+          setBaseline(JSON.stringify(settings.draft));
+          setTerminalStatus(terminal);
+          previewGeneration.current += 1;
+          credentialInputs.current.forEach((input) => { input.value = ""; });
+          setCredentialIntentById({});
+          setPreview(null);
+          setReplacement(null);
+          setFailClosed(false);
+          setEntrySwitchTarget(settings.draft.entry);
+          setEntrySwitchConfirmed(false);
+          setEntrySwitchCompleted(true);
+          setPageState("success");
+          onNotice("入口与运行时已经提交，但恢复日志仍待下次启动幂等清理；页面已按权威设置重新同步。");
+          try { await onApplied(); } catch { onNotice("入口已提交，但仪表盘刷新失败；请稍后手动刷新。"); }
+        } catch (refreshError) {
+          setError(`${message}；权威设置重读失败：${String(refreshError)}`);
+          setPageState("error");
+        }
+      } else {
+        setError(message); setPageState("error");
+      }
+    } finally {
+      operationInFlight.current = false;
+    }
+  };
+
   if (!draft || !view) return (
     <main className="settings-view" aria-busy={pageState === "loading"}>
       {error
@@ -204,6 +278,19 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     applySystemProxy,
     entrySwitchConfirmed,
   );
+  const entrySwitchUnavailable = busy || dirty || terminalStatus.active
+    || entrySwitchCompleted || !entrySwitchPreview.executable;
+  const entrySwitchReason = busy
+    ? "入口切换事务执行中；字段保持锁定。"
+    : dirty
+      ? "存在未应用的普通设置变更；请先应用或撤销，避免入口切换覆盖本地草稿。"
+      : terminalStatus.active
+        ? "设置 terminal 安全门尚未解除，不能执行入口切换。"
+        : entrySwitchCompleted
+          ? "本次入口切换已完成；修改目标地址或端口后可重新预检。"
+          : entrySwitchPreview.executable
+            ? "点击后签发一次性授权，并在提交前完成权威二次检查。"
+            : "请先修正上方问题并完成确认。";
 
   return (
     <main className="settings-view" aria-busy={busy}>
@@ -396,18 +483,18 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
           <div className="card-title">
             <ShieldCheck aria-hidden="true" />
             <div>
-              <h2 id="entry-switch-title">安全入口切换预览</h2>
+              <h2 id="entry-switch-title">安全入口切换</h2>
               <p>当前入口 {originalEntry.host}:{originalEntry.port}。普通“应用设置”不能修改入口或 Windows 系统代理。</p>
             </div>
           </div>
         </div>
         <div className="field-grid">
-          <label className="field"><span>目标 loopback 地址</span><input value={entrySwitchTarget?.host ?? originalEntry.host} onChange={(event) => setEntrySwitchTarget((current) => ({ host: event.target.value, port: current?.port ?? originalEntry.port }))} /></label>
-          <label className="field"><span>目标端口</span><input type="number" min="1" max="65535" value={entrySwitchTarget?.port ?? originalEntry.port} onChange={(event) => setEntrySwitchTarget((current) => ({ host: current?.host ?? originalEntry.host, port: Number(event.target.value) }))} /></label>
+          <label className="field"><span>目标 loopback 地址</span><input disabled={busy} value={entrySwitchTarget?.host ?? originalEntry.host} onChange={(event) => { setEntrySwitchCompleted(false); setEntrySwitchTarget((current) => ({ host: event.target.value, port: current?.port ?? originalEntry.port })); }} /></label>
+          <label className="field"><span>目标端口</span><input disabled={busy} type="number" min="1" max="65535" value={entrySwitchTarget?.port ?? originalEntry.port} onChange={(event) => { setEntrySwitchCompleted(false); setEntrySwitchTarget((current) => ({ host: current?.host ?? originalEntry.host, port: Number(event.target.value) })); }} /></label>
         </div>
         <div className="safety-checks">
-          <label className="check-field"><input type="checkbox" checked={applySystemProxy} onChange={(event) => setApplySystemProxy(event.target.checked)} />切换成功后同时应用当前用户的 Windows 系统代理</label>
-          <label className="check-field"><input type="checkbox" checked={entrySwitchConfirmed} onChange={(event) => setEntrySwitchConfirmed(event.target.checked)} />我确认：只有 Controller、出口和 Fail Closed 全部验证通过后才提交入口</label>
+          <label className="check-field"><input disabled={busy} type="checkbox" checked={applySystemProxy} onChange={(event) => { setEntrySwitchCompleted(false); setApplySystemProxy(event.target.checked); }} />切换成功后同时应用当前用户的 Windows 系统代理</label>
+          <label className="check-field"><input disabled={busy} type="checkbox" checked={entrySwitchConfirmed} onChange={(event) => { setEntrySwitchCompleted(false); setEntrySwitchConfirmed(event.target.checked); }} />我确认：只有 Controller、出口和 Fail Closed 全部验证通过后才提交入口</label>
         </div>
         <div className="safety-columns">
           <div className="safety-steps">
@@ -415,12 +502,20 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
             <ol>{entrySwitchPreview.steps.map((step) => <li key={step}>{step}</li>)}</ol>
           </div>
           <div className="safety-issues" role="status" aria-live="polite">
-            <h3>当前不可执行</h3>
-            <ul>{entrySwitchPreview.issues.map((issue) => <li key={issue.code}>{issue.message}</li>)}</ul>
+            <h3>{entrySwitchCompleted ? "切换已完成" : entrySwitchUnavailable ? "当前不可执行" : "本地预检通过"}</h3>
+            {entrySwitchCompleted
+              ? <p>当前入口已经按权威设置同步；修改目标后可发起下一次预检。</p>
+              : dirty
+                ? <p>普通设置草稿尚未应用，入口切换不会覆盖这些编辑。</p>
+                : terminalStatus.active
+                  ? <p>请先执行受鉴权 terminal 恢复并解除 Fail Closed 安全门。</p>
+                : entrySwitchPreview.executable
+              ? <p>执行时仍会重新检查端口所有权、当前核心与 Windows 系统代理快照。</p>
+              : <ul>{entrySwitchPreview.issues.map((issue) => <li key={issue.code}>{issue.message}</li>)}</ul>}
           </div>
         </div>
-        <p className="disabled-action-reason" id="entry-switch-unavailable">当前不可执行：等待隔离 Windows live acceptance 与专用授权/回滚事务就绪。</p>
-        <button className="primary-button" type="button" disabled aria-disabled="true" aria-describedby="entry-switch-unavailable">执行安全切换</button>
+        <p className="disabled-action-reason" id="entry-switch-unavailable">{entrySwitchReason}</p>
+        <button className="primary-button" type="button" disabled={entrySwitchUnavailable} aria-disabled={entrySwitchUnavailable} aria-describedby="entry-switch-unavailable" onClick={() => void runEntrySwitch()}>{busy ? "正在安全切换…" : "执行安全切换"}</button>
       </section>
 
       <section className="settings-card safety-card">

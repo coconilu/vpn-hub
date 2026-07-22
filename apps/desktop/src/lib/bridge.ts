@@ -1,9 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { mockSnapshot } from "../data/mock";
 import { consumeSettingsPreviewTicket, settingsRequestFingerprint } from "./settingsModel";
+import { isSupportedLoopbackHost } from "./entrySwitchModel";
 import type {
   CoreStatus,
   DashboardSnapshot,
+  EntrySwitchApplyRequest,
+  EntrySwitchApplyResult,
+  EntrySwitchPreview,
   HistoryExport,
   HistoryFilter,
   HistoryResponse,
@@ -69,6 +73,8 @@ let browserSettings: SafeSettingsView = {
 };
 let browserSettingsTerminalStatus: SettingsTerminalStatus = { active: false, state: null };
 let browserSettingsPreviewTicket: string | null = null;
+let browserEntrySwitchAuthorization: string | null = null;
+let browserEntrySwitchAuthorizationExpiresAt = 0;
 
 function browserSettingsDiff(
   draft: SettingsDraft,
@@ -259,6 +265,81 @@ export async function setHistoryRetention(days: number): Promise<number> {
 export async function getSettings(): Promise<SafeSettingsView> {
   if (!isTauriRuntime()) return structuredClone(browserSettings);
   return invoke<SafeSettingsView>("get_settings");
+}
+
+export async function previewEntrySwitch(
+  target: { host: string; port: number },
+  applySystemProxy: boolean,
+  confirmed: boolean,
+): Promise<EntrySwitchPreview> {
+  if (!isTauriRuntime()) {
+    const current = structuredClone(browserSettings.draft.entry);
+    const issues: ValidationIssue[] = [];
+    if (!isSupportedLoopbackHost(target.host)
+      || !Number.isInteger(target.port) || target.port < 1 || target.port > 65535) {
+      issues.push({ field: "entry", code: "invalid_entry_target", message: "入口只能使用合法的显式 loopback 地址与端口。" });
+    }
+    if (current.host === target.host && current.port === target.port) {
+      issues.push({ field: "entry", code: "entry_unchanged", message: "目标入口与当前入口相同。" });
+    }
+    if (!confirmed) {
+      issues.push({ field: "entry", code: "confirmation_required", message: "请确认理解切换顺序和回滚边界。" });
+    }
+    if (!browserSnapshot.mihomo.managed || browserSnapshot.mihomo.pid === null) {
+      issues.push({ field: "runtime", code: "owned_core_required", message: "请先启动 VPN Hub 自管核心。" });
+    }
+    browserEntrySwitchAuthorization = issues.length === 0
+      ? `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`
+      : null;
+    browserEntrySwitchAuthorizationExpiresAt = browserEntrySwitchAuthorization
+      ? Date.now() + 120_000
+      : 0;
+    return {
+      current,
+      target: structuredClone(target),
+      apply_system_proxy: applySystemProxy,
+      can_execute: issues.length === 0,
+      issues,
+      authorization: browserEntrySwitchAuthorization,
+    };
+  }
+  return invoke<EntrySwitchPreview>("preview_entry_switch", {
+    target,
+    applySystemProxy,
+    confirmed,
+  });
+}
+
+export async function applyEntrySwitch(
+  request: EntrySwitchApplyRequest,
+): Promise<EntrySwitchApplyResult> {
+  if (!isTauriRuntime()) {
+    if (!browserEntrySwitchAuthorization
+      || Date.now() >= browserEntrySwitchAuthorizationExpiresAt
+      || request.authorization !== browserEntrySwitchAuthorization) {
+      browserEntrySwitchAuthorization = null;
+      browserEntrySwitchAuthorizationExpiresAt = 0;
+      throw new Error("入口切换授权不存在、已过期或已被使用，请重新预览。");
+    }
+    browserEntrySwitchAuthorization = null;
+    browserEntrySwitchAuthorizationExpiresAt = 0;
+    const previous = structuredClone(browserSettings.draft.entry);
+    browserSettings.draft.entry = structuredClone(request.target);
+    browserSnapshot.entry = {
+      host: request.target.host,
+      port: request.target.port,
+      reachable: true,
+      owner_pid: browserSnapshot.mihomo.pid,
+    };
+    return {
+      settings: structuredClone(browserSettings),
+      previous_entry: previous,
+      current_entry: structuredClone(request.target),
+      system_proxy_applied: request.apply_system_proxy,
+      managed_core_restarted: true,
+    };
+  }
+  return invoke<EntrySwitchApplyResult>("apply_entry_switch", { request });
 }
 
 export async function getSettingsTerminalStatus(): Promise<SettingsTerminalStatus> {

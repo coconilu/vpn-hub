@@ -38,6 +38,8 @@ pub fn run() {
             commands::export_history,
             commands::set_history_retention,
             commands::get_settings,
+            commands::preview_entry_switch,
+            commands::apply_entry_switch,
             commands::get_subscription_node_catalog,
             commands::select_subscription_node,
             commands::test_subscription_node_latency,

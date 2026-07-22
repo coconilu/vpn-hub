@@ -113,6 +113,16 @@ test("settings component has no controlled or React-state credential plaintext",
   assert.equal(source.includes("dispatchOneShotSettingsApply"), true);
 });
 
+test("entry switching preserves dirty drafts and resyncs committed recovery-pending state", () => {
+  const source = fs.readFileSync(new URL("../SettingsPage.tsx", import.meta.url), "utf8");
+  assert.equal(source.includes("if (dirty || terminalStatus.active || !entrySwitchTarget"), true);
+  assert.equal(source.includes("entry_switch_recovery_pending: settings and runtime committed"), true);
+  assert.equal(source.includes("getSettingsTerminalStatus()"), true);
+  assert.equal(source.includes("setCredentialIntentById({})"), true);
+  assert.equal(source.includes("setReplacement(null)"), true);
+  assert.equal(source.includes("setFailClosed(false)"), true);
+});
+
 test("unsupported TUN stays visibly off and cannot record consent", () => {
   const source = fs.readFileSync(new URL("../SettingsPage.tsx", import.meta.url), "utf8");
   assert.equal(source.includes("checked={false} disabled aria-describedby=\"tun-unavailable-reason\" />启用 TUN"), true);

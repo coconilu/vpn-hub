@@ -1,15 +1,16 @@
 //! Interactive-desktop `WinINet` adapter.
 //!
-//! The adapter is intentionally not wired to an IPC command until isolated
-//! Windows acceptance proves the scope classifier. It cannot be constructed
-//! for a service, RAS/VPN, named connection, or multi-connection context.
-#![allow(dead_code)] // Compiled now; wiring stays disabled until isolated acceptance.
+//! It can only be constructed for the active interactive console user when no
+//! RAS/VPN connection is present. The caller still owns transaction ordering,
+//! durable recovery, and exact-owned core verification.
+#![allow(dead_code)] // Installer-scoped journal remains for the packaged Helper path.
 
 use std::{
     io::{Read as _, Seek as _},
     path::PathBuf,
 };
 
+use serde::{Deserialize, Serialize};
 use vpn_hub_core::{
     ConfidentialProtector, ConsentKey, EntrySwitchAuthorityGuard, EntrySwitchContext,
     EntrySwitchError, EntrySwitchJournal, EntrySwitchJournalRecord, ProtectedJournalCodec,
@@ -18,10 +19,11 @@ use vpn_hub_core::{
 };
 use vpn_hub_helper::{AuthorityFileGuard, InstallationReference, SupervisorAuthority};
 use vpn_hub_windows_security::{
-    ProtectedPathPolicy, WinInetLanProxySnapshot, open_current_user_mutable_directory,
-    open_current_user_mutable_file, protect_current_user_data,
-    query_current_user_default_lan_proxy, set_current_user_default_lan_proxy,
-    unprotect_current_user_data, validate_protected_installation,
+    ProtectedPathPolicy, WinInetLanProxySnapshot, current_interactive_session_scope,
+    current_process_user_sid, open_current_user_mutable_directory, open_current_user_mutable_file,
+    protect_current_user_data, query_current_user_default_lan_proxy,
+    set_current_user_default_lan_proxy, unprotect_current_user_data,
+    validate_protected_installation,
 };
 
 const PROXY_TYPE_DIRECT: u32 = 1;
@@ -40,6 +42,117 @@ pub(crate) struct InteractiveUserLanScopeEvidence {
 
 pub(crate) struct WinInetUserProxyAdapter {
     scope_id: String,
+}
+
+/// Lossless recovery material. It is never returned through Tauri IPC and is
+/// persisted only inside a current-user DPAPI envelope.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ProtectedProxySnapshotWire {
+    flags: u32,
+    proxy_server: Option<String>,
+    proxy_bypass: Option<String>,
+    auto_config_url: Option<String>,
+}
+
+impl ProtectedProxySnapshotWire {
+    pub(crate) fn for_entry(
+        entry: &vpn_hub_core::EntryConfig,
+        original: &Self,
+    ) -> Result<Self, String> {
+        let host = vpn_hub_core::normalize_loopback_host(&entry.host)
+            .ok_or_else(|| "入口只能绑定显式 loopback 地址".to_string())?;
+        let host = if host.is_ipv6() {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        let desired = Self {
+            flags: PROXY_TYPE_PROXY,
+            proxy_server: Some(format!(
+                "http={host}:{};https={host}:{}",
+                entry.port, entry.port
+            )),
+            proxy_bypass: original.proxy_bypass.clone(),
+            auto_config_url: None,
+        };
+        desired.validate()?;
+        Ok(desired)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        self.to_raw()
+            .validate()
+            .map_err(|_| "当前 Windows 系统代理超出受支持的 default-LAN 范围".to_string())
+    }
+
+    fn to_raw(&self) -> WinInetLanProxySnapshot {
+        WinInetLanProxySnapshot {
+            flags: self.flags,
+            proxy_server: self.proxy_server.clone(),
+            proxy_bypass: self.proxy_bypass.clone(),
+            auto_config_url: self.auto_config_url.clone(),
+        }
+    }
+}
+
+impl From<WinInetLanProxySnapshot> for ProtectedProxySnapshotWire {
+    fn from(value: WinInetLanProxySnapshot) -> Self {
+        Self {
+            flags: value.flags,
+            proxy_server: value.proxy_server,
+            proxy_bypass: value.proxy_bypass,
+            auto_config_url: value.auto_config_url,
+        }
+    }
+}
+
+pub(crate) fn current_interactive_user_scope() -> Result<InteractiveUserLanScopeEvidence, String> {
+    let scope = current_interactive_session_scope()
+        .map_err(|_| "无法确认当前 Windows 交互会话或 RAS/VPN 范围".to_string())?;
+    let sid = current_process_user_sid()
+        .map_err(|_| "无法从当前进程 token 确认交互用户 SID".to_string())?
+        .to_ascii_lowercase();
+    Ok(InteractiveUserLanScopeEvidence {
+        interactive_user_scope_id: sid,
+        interactive_session: scope.interactive_console,
+        active_connection_count: if scope.has_ras_or_vpn { 2 } else { 1 },
+        has_ras_or_vpn: scope.has_ras_or_vpn,
+        connection_name: None,
+    })
+}
+
+pub(crate) fn snapshot_current_user_proxy() -> Result<ProtectedProxySnapshotWire, String> {
+    let evidence = current_interactive_user_scope()?;
+    let adapter = WinInetUserProxyAdapter::from_scope(evidence)
+        .map_err(|_| "当前 Windows 会话不满足 default-LAN 系统代理切换条件".to_string())?;
+    let snapshot = adapter
+        .query()
+        .map_err(|_| "无法读取当前用户的 Windows 系统代理".to_string())?;
+    let raw = to_raw(&snapshot).map_err(|_| "当前 Windows 系统代理超出受支持范围".to_string())?;
+    Ok(raw.into())
+}
+
+pub(crate) fn compare_then_apply_proxy(
+    expected: &ProtectedProxySnapshotWire,
+    replacement: &ProtectedProxySnapshotWire,
+) -> Result<bool, String> {
+    expected.validate()?;
+    replacement.validate()?;
+    let evidence = current_interactive_user_scope()?;
+    let _scope = WinInetUserProxyAdapter::from_scope(evidence)
+        .map_err(|_| "写入前 Windows 会话或 RAS/VPN 范围已变化，拒绝应用系统代理".to_string())?;
+    let observed = query_current_user_default_lan_proxy()
+        .map(ProtectedProxySnapshotWire::from)
+        .map_err(|_| "无法重新读取当前用户的 Windows 系统代理".to_string())?;
+    if observed != *expected {
+        return Ok(false);
+    }
+    set_current_user_default_lan_proxy(&replacement.to_raw())
+        .map_err(|_| "无法应用当前用户的 Windows 系统代理".to_string())?;
+    let verified = query_current_user_default_lan_proxy()
+        .map(ProtectedProxySnapshotWire::from)
+        .map_err(|_| "无法回读当前用户的 Windows 系统代理".to_string())?;
+    Ok(verified == *replacement)
 }
 
 pub(crate) struct EntrySwitchDesktopAuthorityGuard {

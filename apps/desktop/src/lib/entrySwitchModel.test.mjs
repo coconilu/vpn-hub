@@ -1,18 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildEntrySwitchFoundationPreview } from "./entrySwitchModel.js";
+import { buildEntrySwitchFoundationPreview, isSupportedLoopbackHost } from "./entrySwitchModel.js";
 
-test("preview stays disabled while exposing the fail-closed transaction order", () => {
+test("valid confirmed preview becomes executable and exposes the fail-closed order", () => {
   const preview = buildEntrySwitchFoundationPreview(
     { host: "127.0.0.1", port: 41001 },
     { host: "127.0.0.8", port: 41002 },
     true,
     true,
   );
-  assert.equal(preview.executable, false);
+  assert.equal(preview.executable, true);
   assert.equal(preview.steps.length, 5);
   assert.match(preview.steps[2], /Controller.*Fail Closed/);
-  assert.equal(preview.issues.at(-1).code, "isolated_acceptance_pending");
+  assert.deepEqual(preview.issues, []);
 });
 
 test("non-loopback and missing confirmation are explicit accessible issues", () => {
@@ -24,7 +24,15 @@ test("non-loopback and missing confirmation are explicit accessible issues", () 
   );
   assert.deepEqual(
     preview.issues.map((issue) => issue.code),
-    ["loopback_required", "invalid_port", "confirmation_required", "isolated_acceptance_pending"],
+    ["loopback_required", "invalid_port", "confirmation_required"],
   );
   assert.equal(preview.steps.at(-1), "不调用任何系统代理 backend");
+});
+
+test("browser loopback validation matches Rust parsing for leading-zero IPv4", () => {
+  assert.equal(isSupportedLoopbackHost("127.0.0.1"), true);
+  assert.equal(isSupportedLoopbackHost("localhost"), true);
+  assert.equal(isSupportedLoopbackHost("[::1]"), true);
+  assert.equal(isSupportedLoopbackHost("127.0.0.01"), false);
+  assert.equal(isSupportedLoopbackHost("127.0.0.256"), false);
 });
