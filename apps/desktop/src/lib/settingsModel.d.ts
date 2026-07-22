@@ -12,3 +12,7 @@ export function settingsValidationTargetIds(field: string): string[];
 export function takeCredentialMutations(inputById: Map<string, Pick<HTMLInputElement, "value">>, intentById: Record<string, CredentialIntentAction>): CredentialMutation[];
 export function consumeSettingsPreviewTicket(currentTicket: string | null, requestedFingerprint: string): null;
 export function dispatchOneShotSettingsApply<R>(requestWithoutCredentials: Omit<SettingsApplyRequest, "credential_mutations">, inputById: Map<string, Pick<HTMLInputElement, "value">>, intentById: Record<string, CredentialIntentAction>, dispatch: (request: SettingsApplyRequest) => Promise<R>): Promise<R>;
+export function continueAfterPreviewIfCurrent<P, R>(preview: () => Promise<P>, canContinue: (preview: P) => boolean, apply: (preview: P) => Promise<R>): Promise<R | null>;
+export type ForegroundOperationStage = "validating" | "applying" | "hot_reload" | "fallback_restart" | "rollback" | "recovery" | "committed";
+export const foregroundOperationStageOrder: readonly ForegroundOperationStage[];
+export function acceptForegroundOperationStage(activeOperationId: string | null, currentStage: ForegroundOperationStage | null, status: { operation_id: string; stage: ForegroundOperationStage } | null): ForegroundOperationStage | null;

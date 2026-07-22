@@ -49,6 +49,7 @@ pub fn run() {
             commands::preview_settings,
             commands::apply_settings,
             commands::cancel_foreground_operation,
+            commands::get_foreground_operation_status,
             commands::get_fast_path_performance,
             commands::get_settings_terminal_status,
             commands::recover_settings_terminal,

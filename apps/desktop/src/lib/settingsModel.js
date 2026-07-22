@@ -129,3 +129,36 @@ export function dispatchOneShotSettingsApply(
   const credential_mutations = takeCredentialMutations(inputById, intentById);
   return dispatch({ ...requestWithoutCredentials, credential_mutations });
 }
+
+export async function continueAfterPreviewIfCurrent(
+  preview,
+  canContinue,
+  apply,
+) {
+  const result = await preview();
+  if (!canContinue(result)) return null;
+  return apply(result);
+}
+
+export const foregroundOperationStageOrder = [
+  "validating",
+  "applying",
+  "hot_reload",
+  "fallback_restart",
+  "rollback",
+  "recovery",
+  "committed",
+];
+
+export function acceptForegroundOperationStage(
+  activeOperationId,
+  currentStage,
+  status,
+) {
+  if (!status || status.operation_id !== activeOperationId) return currentStage;
+  const incoming = foregroundOperationStageOrder.indexOf(status.stage);
+  const current = currentStage === null
+    ? -1
+    : foregroundOperationStageOrder.indexOf(currentStage);
+  return incoming >= current ? status.stage : currentStage;
+}

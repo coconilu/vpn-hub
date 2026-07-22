@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::{
     HealthStatus, HistoryEventType, HistoryFilter, HistoryMetric, HistoryOutletKind,
     HistoryOutletOption, HistoryOutletSnapshot, HistoryRecord, HistoryResponse, LatencySample,
-    OutletSummary, ProbeOutletConfig, ProbeResult, RouteSwitchEvent, StateEvent,
+    OutletHealth, OutletSummary, ProbeOutletConfig, ProbeResult, RouteSwitchEvent, StateEvent,
     UdpCapabilityEvidence, UdpCapabilityStatus,
 };
 
@@ -471,6 +471,65 @@ impl GuardianStore {
         }
         transaction.commit()?;
         Ok(event)
+    }
+
+    /// Projects the post-cycle health state without mutating `SQLite`. Guardian
+    /// uses this to choose selectors before committing a generation, so a
+    /// configuration invalidation can discard the whole late cycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the current state cannot be read.
+    pub fn project_probe_health(
+        &self,
+        observed: &[(ProbeOutletConfig, ProbeResult)],
+        failure_threshold: u32,
+        recovery_threshold: u32,
+    ) -> Result<BTreeMap<String, OutletHealth>, StoreError> {
+        let mut health = BTreeMap::new();
+        for (outlet, result) in observed {
+            let previous = self
+                .connection
+                .query_row(
+                    "SELECT status, consecutive_successes, consecutive_failures FROM outlet_state WHERE outlet_id=?1",
+                    [&outlet.id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u32>(1)?,
+                            row.get::<_, u32>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let previous = match previous {
+                Some((status, successes, failures)) => StoredState {
+                    status: HealthStatus::try_from(status.as_str())
+                        .map_err(StoreError::InvalidStatus)?,
+                    consecutive_successes: successes,
+                    consecutive_failures: failures,
+                },
+                None => StoredState {
+                    status: HealthStatus::Unknown,
+                    consecutive_successes: 0,
+                    consecutive_failures: 0,
+                },
+            };
+            let (status, _, _) = next_state(
+                &previous,
+                result.status,
+                failure_threshold,
+                recovery_threshold,
+            );
+            health.insert(
+                outlet.id.clone(),
+                OutletHealth {
+                    status,
+                    latency_ms: result.latency_ms,
+                },
+            );
+        }
+        Ok(health)
     }
 
     /// Returns aggregate availability and latency summaries for all outlets.

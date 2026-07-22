@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { ArrowDown, ArrowUp, Eye, Gauge, KeyRound, ListOrdered, Plus, RadioTower, Route, Save, ShieldAlert, ShieldCheck, Square, Trash2 } from "lucide-react";
-import { applyEntrySwitch, applySettings, cancelForegroundOperation, getSettings, getSettingsTerminalStatus, previewEntrySwitch, previewSettings, recoverSettingsTerminal } from "./lib/bridge";
+import { applyEntrySwitch, applySettings, cancelForegroundOperation, getForegroundOperationStatus, getSettings, getSettingsTerminalStatus, previewEntrySwitch, previewSettings, recoverSettingsTerminal } from "./lib/bridge";
 import {
   buildSettingsPreviewRequest,
+  acceptForegroundOperationStage,
+  continueAfterPreviewIfCurrent,
   createOutletId,
   dispatchOneShotSettingsApply,
   isCurrentPreviewResponse,
@@ -15,6 +17,16 @@ import type { CredentialState, LocalProxyProtocol, SafeSettingsView, SettingsDra
 
 interface Props { currentOutletId: string | null; onApplied: () => Promise<void>; onNotice: (message: string) => void }
 type PageState = "loading" | "clean" | "dirty" | "checking" | "preview" | "applying" | "success" | "error";
+type UiOperation = { id: string; generation: number; cancelled: boolean; backendStarted: boolean };
+const backendStageLabel = {
+  validating: "正在校验配置",
+  applying: "正在写入候选配置",
+  hot_reload: "正在热重载并权威回读",
+  fallback_restart: "正在受控重启核心",
+  rollback: "正在安全回滚",
+  recovery: "正在恢复最后有效配置",
+  committed: "配置已提交，正在收尾",
+} as const;
 const credentialLabel: Record<CredentialState, string> = { configured: "已配置", missing: "未配置", unavailable: "存储不可用", corrupted: "凭据损坏" };
 
 export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
@@ -39,6 +51,10 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const credentialInputs = useRef(new Map<string, HTMLInputElement>());
   const previewGeneration = useRef(0);
   const operationInFlight = useRef(false);
+  const operationGeneration = useRef(0);
+  const activeOperation = useRef<UiOperation | null>(null);
+  const backendStage = useRef<keyof typeof backendStageLabel | null>(null);
+  const [activeOperationId, setActiveOperationId] = useState<string | null>(null);
   const credentialIntentCount = Object.keys(credentialIntentById).length;
   const dirty = draft !== null && (JSON.stringify(draft) !== baseline
     || credentialIntentCount > 0 || replacement !== null || failClosed);
@@ -54,6 +70,56 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     const timer = window.setTimeout(() => setSlowOperation(true), 2_000);
     return () => window.clearTimeout(timer);
   }, [pageState]);
+  useEffect(() => {
+    if (!activeOperationId) return undefined;
+    let disposed = false;
+    const poll = async () => {
+      try {
+        const status = await getForegroundOperationStatus(activeOperationId);
+        if (!disposed && status && status.operation_id === activeOperation.current?.id) {
+          const accepted = acceptForegroundOperationStage(
+            activeOperation.current?.id ?? null,
+            backendStage.current,
+            status,
+          );
+          backendStage.current = accepted;
+          if (accepted) setOperationStage(backendStageLabel[accepted]);
+          if (status.cancel_requested) setCancelRequested(true);
+        }
+      } catch {
+        // Status polling is advisory; the apply result remains authoritative.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 200);
+    return () => { disposed = true; window.clearInterval(timer); };
+  }, [activeOperationId]);
+
+  const beginUiOperation = (): UiOperation => {
+    const generation = ++operationGeneration.current;
+    const operation = {
+      id: `settings-${Date.now()}-${generation}`,
+      generation,
+      cancelled: false,
+      backendStarted: false,
+    };
+    activeOperation.current = operation;
+    backendStage.current = null;
+    setActiveOperationId(operation.id);
+    return operation;
+  };
+  const isCurrentOperation = (operation: UiOperation) => (
+    activeOperation.current === operation
+    && operation.generation === operationGeneration.current
+    && !operation.cancelled
+  );
+  const finishUiOperation = (operation: UiOperation) => {
+    if (activeOperation.current === operation) {
+      activeOperation.current = null;
+      backendStage.current = null;
+      setActiveOperationId(null);
+    }
+  };
 
   const invalidatePreview = () => {
     previewGeneration.current += 1; setPreview(null); setError(null); setPageState("dirty");
@@ -74,13 +140,14 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     changeDraft((current) => ({ ...current, manual_outlet: current.manual_outlet === id ? null : current.manual_outlet, outlets: current.outlets.filter((_, itemIndex) => itemIndex !== index) }));
   };
 
-  const requestCurrentPreview = async () => {
+  const requestCurrentPreview = async (operation?: UiOperation) => {
     if (!draft) return null;
     const request = buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById);
     const generation = ++previewGeneration.current;
     setOperationStage("正在校验配置"); setPageState("checking"); setError(null);
     try {
       const result = await previewSettings(request);
+      if (operation && !isCurrentOperation(operation)) return null;
       if (!isCurrentPreviewResponse(generation, previewGeneration.current, request.request_fingerprint, result.request_fingerprint)) return null;
       setPreview(result);
       const outcome = settingsPreviewOutcome(result);
@@ -99,18 +166,19 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     }
   };
 
-  const commitPreview = async (approved: SettingsPreview) => {
-    if (!draft || approved.issues.length > 0) return;
+  const commitPreview = async (approved: SettingsPreview, operation: UiOperation) => {
+    if (!draft || approved.issues.length > 0 || !isCurrentOperation(operation)) return;
     const request = buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById);
     if (request.request_fingerprint !== approved.request_fingerprint) { invalidatePreview(); return; }
     setOperationStage("正在原子提交并应用 runtime"); setPageState("applying"); setError(null);
     try {
+      operation.backendStarted = true;
       const pending = dispatchOneShotSettingsApply({
         draft,
         active_outlet_replacement: replacement,
         fail_closed_on_removed_active: failClosed,
         preview_fingerprint: approved.request_fingerprint,
-      }, credentialInputs.current, credentialIntentById, applySettings);
+      }, credentialInputs.current, credentialIntentById, (request) => applySettings(request, operation.id));
       previewGeneration.current += 1;
       setCredentialIntentById({}); setPreview(null);
       const result = await pending;
@@ -127,16 +195,29 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
   const runPreview = async () => {
     if (!dirty || operationInFlight.current) return;
     operationInFlight.current = true;
-    try { await requestCurrentPreview(); } finally { operationInFlight.current = false; }
+    const operation = beginUiOperation();
+    try { await requestCurrentPreview(operation); } finally {
+      if (operation.cancelled) { setOperationStage("校验已取消"); setPageState("dirty"); }
+      finishUiOperation(operation); operationInFlight.current = false;
+    }
   };
 
   const runApply = async () => {
     if (!dirty || operationInFlight.current) return;
     operationInFlight.current = true;
+    const operation = beginUiOperation();
     try {
-      const checked = await requestCurrentPreview();
-      if (checked && settingsPreviewOutcome(checked) === "live_apply") await commitPreview(checked);
+      await continueAfterPreviewIfCurrent(
+        () => requestCurrentPreview(operation),
+        (checked) => checked !== null && isCurrentOperation(operation)
+          && settingsPreviewOutcome(checked) === "live_apply",
+        (checked) => commitPreview(checked!, operation),
+      );
     } finally {
+      if (operation.cancelled && !operation.backendStarted) {
+        setOperationStage("应用已在校验阶段取消"); setPageState("dirty");
+      }
+      finishUiOperation(operation);
       operationInFlight.current = false;
     }
   };
@@ -161,22 +242,27 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     if (dirty || terminalStatus.active || !entrySwitchTarget
       || !entrySwitchPreview.executable || operationInFlight.current) return;
     operationInFlight.current = true;
+    const operation = beginUiOperation();
     setOperationStage("正在切换入口并验证 ownership"); setPageState("applying"); setError(null);
     try {
-      const authorized = await previewEntrySwitch(
-        entrySwitchTarget,
-        applySystemProxy,
-        entrySwitchConfirmed,
+      const result = await continueAfterPreviewIfCurrent(
+        () => previewEntrySwitch(entrySwitchTarget, applySystemProxy, entrySwitchConfirmed),
+        (authorized) => isCurrentOperation(operation)
+          && authorized.can_execute && authorized.authorization !== null,
+        async (authorized) => {
+          if (!authorized.authorization) throw new Error("入口切换预览未签发执行授权。");
+          operation.backendStarted = true;
+          return applyEntrySwitch({
+            target: entrySwitchTarget,
+            apply_system_proxy: applySystemProxy,
+            authorization: authorized.authorization,
+          }, operation.id);
+        },
       );
-      if (!authorized.can_execute || !authorized.authorization) {
-        throw new Error(authorized.issues.map((issue) => issue.message).join("；")
-          || "入口切换预览未签发执行授权。");
+      if (!result) {
+        if (operation.cancelled) return;
+        throw new Error("入口切换预览未签发执行授权。");
       }
-      const result = await applyEntrySwitch({
-        target: entrySwitchTarget,
-        apply_system_proxy: applySystemProxy,
-        authorization: authorized.authorization,
-      });
       setView(result.settings);
       setDraft(result.settings.draft);
       setBaseline(JSON.stringify(result.settings.draft));
@@ -226,17 +312,26 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
         setError(message); setPageState("error");
       }
     } finally {
+      if (operation.cancelled && !operation.backendStarted) {
+        setOperationStage("入口切换已在预览阶段取消"); setPageState("clean");
+      }
+      finishUiOperation(operation);
       operationInFlight.current = false;
     }
   };
 
   const cancelCurrentOperation = async () => {
     if (!busy || cancelRequested) return;
+    const operation = activeOperation.current;
+    if (!operation) return;
+    operation.cancelled = true;
+    operationGeneration.current += 1;
+    previewGeneration.current += 1;
     setCancelRequested(true);
     setOperationStage("正在取消并安全恢复");
     try {
-      const accepted = await cancelForegroundOperation();
-      if (!accepted) setOperationStage("操作已进入原子收尾，等待权威结果");
+      const accepted = await cancelForegroundOperation(operation.id);
+      if (!accepted && operation.backendStarted) setOperationStage("操作已进入原子收尾，等待权威结果");
     } catch (reason) {
       setError(`取消请求未确认：${String(reason)}`);
     }

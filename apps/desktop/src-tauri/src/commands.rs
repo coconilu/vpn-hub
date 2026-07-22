@@ -29,14 +29,27 @@ use crate::{
     },
     runtime::{DeferredSettingsApply, EntrySwitchRuntimeJournal, EntrySwitchRuntimePhase},
 };
+
+const FOREGROUND_FALLBACK_BUDGET: Duration = Duration::from_secs(10);
+
+async fn await_foreground_step<T>(
+    deadline: tokio::time::Instant,
+    label: &str,
+    future: impl Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| format!("{label} 超过前台回退总预算 10 秒"))
+}
 use crate::{
     lifecycle::{self, LifecycleEvent},
     runtime::{
         AppState, CoreStatus, EntrySwitchApplyRequest, EntrySwitchApplyResult, EntrySwitchPreview,
         EntrySwitchPreviewChecks, FastPathPerformanceReport, FastPathResultCode, FastPathStage,
-        NodeLatencyBatchResult, NodeLatencyResult, PortSnapshot, RoutingStatus,
-        SettingsApplyRequest, SettingsApplyResult, SettingsPreview, SettingsPreviewRequest,
-        SettingsTerminalStatus, SubscriptionNodeCatalog, SubscriptionNodeGroup,
+        ForegroundOperationStage, NodeLatencyBatchResult, NodeLatencyResult, PortSnapshot,
+        RoutingStatus, SettingsApplyRequest, SettingsApplyResult, SettingsPreview,
+        SettingsPreviewRequest, SettingsTerminalStatus, SubscriptionNodeCatalog,
+        SubscriptionNodeGroup,
     },
 };
 
@@ -296,16 +309,28 @@ fn owned_core_stop_confirmed(
 async fn compensate_failed_entry_switch(
     app: &AppHandle,
     state: &AppState,
+    operation: &crate::runtime::ForegroundOperation<'_>,
+    deadline: tokio::time::Instant,
     pending: Option<&DeferredSettingsApply>,
     journal: &EntrySwitchRuntimeJournal,
     failure: &str,
 ) -> String {
+    operation.set_stage(ForegroundOperationStage::Rollback);
     if pending.is_some_and(|value| state.deferred_settings_commit_decided(value)) {
         return format!(
             "entry_switch_recovery_pending：{failure}；入口提交决定已持久化，系统代理与配置只允许幂等前滚"
         );
     }
-    let stop_result = lifecycle::dispatch_stop_and_wait(app).await;
+    let stop_result = match await_foreground_step(
+        deadline,
+        "入口回滚停止核心",
+        lifecycle::dispatch_stop_and_wait(app),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return format!("entry_switch_recovery_pending：{failure}；{error}"),
+    };
     let authoritative_pid = match state.owned_core_pid_authoritative().await {
         Ok(pid) => pid,
         Err(error) => {
@@ -356,9 +381,16 @@ async fn compensate_failed_entry_switch(
     {
         notes.push("停止请求优先，原入口配置已恢复且核心保持停止");
     } else {
+        operation.set_stage(ForegroundOperationStage::Recovery);
         let restart = {
             let _transaction = state.lock_routing_transaction().await;
-            start_owned_core_verified(app, state).await
+            await_foreground_step(
+                deadline,
+                "入口回滚恢复旧核心",
+                start_owned_core_verified(app, state),
+            )
+            .await
+            .and_then(std::convert::identity)
         };
         if let Err(error) = restart {
             return format!(
@@ -427,9 +459,12 @@ async fn prepare_entry_switch_transaction(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 async fn finalize_entry_switch_transaction(
     app: &AppHandle,
     state: &AppState,
+    operation: &crate::runtime::ForegroundOperation<'_>,
+    deadline: tokio::time::Instant,
     request: &EntrySwitchApplyRequest,
     previous_entry: vpn_hub_core::EntryConfig,
     mut pending: DeferredSettingsApply,
@@ -447,6 +482,8 @@ async fn finalize_entry_switch_transaction(
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 &error,
@@ -463,6 +500,8 @@ async fn finalize_entry_switch_transaction(
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 &error,
@@ -475,6 +514,8 @@ async fn finalize_entry_switch_transaction(
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 &error,
@@ -488,6 +529,8 @@ async fn finalize_entry_switch_transaction(
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 &error,
@@ -495,6 +538,7 @@ async fn finalize_entry_switch_transaction(
             .await);
         }
     };
+    operation.set_stage(ForegroundOperationStage::Committed);
     if let Err(error) =
         state.set_entry_switch_runtime_phase(&mut journal, EntrySwitchRuntimePhase::CommitDecided)
     {
@@ -530,6 +574,8 @@ async fn run_entry_switch_transaction(
         previous_entry,
         mut journal,
     } = prepared;
+    let deadline = tokio::time::Instant::now() + FOREGROUND_FALLBACK_BUDGET;
+    operation.set_stage(ForegroundOperationStage::Applying);
     let owned_pid = state
         .owned_core_pid_authoritative()
         .await?
@@ -546,10 +592,18 @@ async fn run_entry_switch_transaction(
     if let Err(error) =
         state.set_entry_switch_runtime_phase(&mut journal, EntrySwitchRuntimePhase::SettingsPending)
     {
-        return Err(
-            compensate_failed_entry_switch(app, state, Some(&pending), &journal, &error).await,
-        );
+        return Err(compensate_failed_entry_switch(
+            app,
+            state,
+            operation,
+            deadline,
+            Some(&pending),
+            &journal,
+            &error,
+        )
+        .await);
     }
+    operation.set_stage(ForegroundOperationStage::HotReload);
     let hot_reload = {
         let _transaction = state.lock_routing_transaction().await;
         tokio::time::timeout(
@@ -567,18 +621,28 @@ async fn run_entry_switch_transaction(
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 &error,
             )
             .await);
         }
-        let stop_result = lifecycle::dispatch_stop_and_wait(app).await;
+        operation.set_stage(ForegroundOperationStage::FallbackRestart);
+        let stop_result = await_foreground_step(
+            deadline,
+            "入口回退停止旧核心",
+            lifecycle::dispatch_stop_and_wait(app),
+        )
+        .await?;
         let authoritative_pid = state.owned_core_pid_authoritative().await?;
         if !owned_core_stop_confirmed(stop_result, authoritative_pid) {
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 "入口热重载失败，且未能确认 exact-owned core 已停止",
@@ -590,6 +654,8 @@ async fn run_entry_switch_transaction(
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 error,
@@ -598,12 +664,20 @@ async fn run_entry_switch_transaction(
         }
         let runtime_start = {
             let _transaction = state.lock_routing_transaction().await;
-            start_owned_core_verified(app, state).await
+            await_foreground_step(
+                deadline,
+                "入口回退启动候选核心",
+                start_owned_core_verified(app, state),
+            )
+            .await
+            .and_then(std::convert::identity)
         };
         if let Err(error) = runtime_start {
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 &error,
@@ -615,13 +689,29 @@ async fn run_entry_switch_transaction(
     if let Err(error) =
         state.set_entry_switch_runtime_phase(&mut journal, EntrySwitchRuntimePhase::RuntimeVerified)
     {
-        return Err(
-            compensate_failed_entry_switch(app, state, Some(&pending), &journal, &error).await,
-        );
+        return Err(compensate_failed_entry_switch(
+            app,
+            state,
+            operation,
+            deadline,
+            Some(&pending),
+            &journal,
+            &error,
+        )
+        .await);
     }
-    let mut result =
-        finalize_entry_switch_transaction(app, state, request, previous_entry, pending, journal)
-            .await?;
+    operation.enter_commit_barrier()?;
+    let mut result = finalize_entry_switch_transaction(
+        app,
+        state,
+        operation,
+        deadline,
+        request,
+        previous_entry,
+        pending,
+        journal,
+    )
+    .await?;
     result.managed_core_restarted = managed_core_restarted;
     Ok(result)
 }
@@ -632,16 +722,17 @@ pub async fn apply_entry_switch(
     app: AppHandle,
     state: State<'_, AppState>,
     request: EntrySwitchApplyRequest,
+    operation_id: String,
 ) -> Result<EntrySwitchApplyResult, String> {
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, state, request);
+        let _ = (app, state, request, operation_id);
         Err("安全入口切换只支持 Windows 当前用户 default-LAN 系统代理".into())
     }
     #[cfg(target_os = "windows")]
     {
         let _settings_apply = state.lock_settings_apply().await;
-        let operation = state.begin_foreground_operation()?;
+        let operation = state.begin_foreground_operation(&operation_id)?;
         if state.settings_terminal_active() {
             return Err("terminal_recovery_active：设置安全门未解除，拒绝入口切换".into());
         }
@@ -650,6 +741,7 @@ pub async fn apply_entry_switch(
         }
         app.state::<lifecycle::DesktopCoordinator>()
             .cancel_background_work();
+        state.advance_config_generation()?;
         let prepared = prepare_entry_switch_transaction(&state, &request).await?;
         run_entry_switch_transaction(&app, &state, &request, prepared, &operation).await
     }
@@ -706,7 +798,6 @@ pub async fn test_subscription_node_latency(
     subscription_id: String,
     node_name: String,
 ) -> Result<NodeLatencyResult, String> {
-    let _transaction = state.lock_routing_transaction().await;
     state
         .test_subscription_node_latency(&subscription_id, &node_name)
         .await
@@ -719,7 +810,6 @@ pub async fn test_subscription_node_latencies(
     subscription_id: String,
     operation_id: String,
 ) -> Result<NodeLatencyBatchResult, String> {
-    let _transaction = state.lock_routing_transaction().await;
     state
         .test_subscription_node_latencies(&subscription_id, &operation_id)
         .await
@@ -787,9 +877,10 @@ pub async fn apply_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     request: SettingsApplyRequest,
+    operation_id: String,
 ) -> Result<SettingsApplyResult, String> {
     let started_at = Instant::now();
-    let result = apply_settings_inner(app, &state, request).await;
+    let result = apply_settings_inner(app, &state, request, &operation_id).await;
     let result_code = if result.is_ok() {
         FastPathResultCode::Ok
     } else {
@@ -804,9 +895,10 @@ async fn apply_settings_inner(
     app: AppHandle,
     state: &AppState,
     request: SettingsApplyRequest,
+    operation_id: &str,
 ) -> Result<SettingsApplyResult, String> {
     let _settings_apply = state.lock_settings_apply().await;
-    let operation = state.begin_foreground_operation()?;
+    let operation = state.begin_foreground_operation(operation_id)?;
     if state.settings_terminal_active() {
         return Err(
             "terminal_recovery_active：设置安全门仍处于 Fail Closed；请先执行显式受鉴权恢复".into(),
@@ -814,6 +906,7 @@ async fn apply_settings_inner(
     }
     let coordinator = app.state::<lifecycle::DesktopCoordinator>();
     coordinator.cancel_background_work();
+    state.advance_config_generation()?;
     operation.ensure_active()?;
     let (preflight, managed_core_running) = {
         let _transaction = state.lock_routing_transaction().await;
@@ -845,6 +938,8 @@ async fn apply_settings_inner(
         (preview, managed_core_running)
     };
     if !preflight.requires_managed_core_restart {
+        operation.set_stage(ForegroundOperationStage::Applying);
+        operation.enter_commit_barrier()?;
         let _transaction = state.lock_routing_transaction().await;
         let requires_controller_confirmation =
             managed_core_running && preflight.diff.requires_authenticated_controller_apply();
@@ -873,6 +968,7 @@ async fn apply_settings_inner(
                 return Err(error);
             }
         };
+        operation.set_stage(ForegroundOperationStage::Committed);
         lifecycle::dispatch(
             &app,
             LifecycleEvent::ConfigReload {
@@ -893,6 +989,7 @@ async fn apply_settings_inner(
         return Err("无法同时证明 PID 与 Controller ownership；不会停止或改写未知核心".into());
     }
     operation.ensure_active()?;
+    operation.set_stage(ForegroundOperationStage::Applying);
     let pending_result = {
         let _transaction = state.lock_routing_transaction().await;
         state.apply_settings_deferred(request)
@@ -910,7 +1007,9 @@ async fn apply_settings_inner(
             ));
         }
     };
+    let fallback_deadline = tokio::time::Instant::now() + FOREGROUND_FALLBACK_BUDGET;
 
+    operation.set_stage(ForegroundOperationStage::HotReload);
     let hot_reload = {
         let _transaction = state.lock_routing_transaction().await;
         tokio::time::timeout(
@@ -922,12 +1021,14 @@ async fn apply_settings_inner(
         .and_then(std::convert::identity)
     };
     if hot_reload.is_ok() {
+        operation.enter_commit_barrier()?;
         let finalized = {
             let _transaction = state.lock_routing_transaction().await;
             state.finalize_deferred_settings(&mut pending, false)
         };
         match finalized {
             Ok(result) => {
+                operation.set_stage(ForegroundOperationStage::Committed);
                 coordinator.prepare_config_reload();
                 lifecycle::dispatch(
                     &app,
@@ -943,7 +1044,13 @@ async fn apply_settings_inner(
                 ));
             }
             Err(error) => {
-                let _ = lifecycle::dispatch_stop_and_wait(&app).await;
+                operation.set_stage(ForegroundOperationStage::Rollback);
+                let _ = await_foreground_step(
+                    fallback_deadline,
+                    "设置收尾回滚停止核心",
+                    lifecycle::dispatch_stop_and_wait(&app),
+                )
+                .await;
                 let rollback = {
                     let _transaction = state.lock_routing_transaction().await;
                     state.rollback_deferred_settings(&pending)
@@ -953,9 +1060,16 @@ async fn apply_settings_inner(
                         "热重载已通过但事务收尾和回滚均失败；核心已停止并保持 Fail Closed：{error}；{rollback_error}"
                     ));
                 }
+                operation.set_stage(ForegroundOperationStage::Recovery);
                 let recovery = {
                     let _transaction = state.lock_routing_transaction().await;
-                    start_owned_core_verified(&app, state).await
+                    await_foreground_step(
+                        fallback_deadline,
+                        "设置收尾恢复旧核心",
+                        start_owned_core_verified(&app, state),
+                    )
+                    .await
+                    .and_then(std::convert::identity)
                 };
                 return match recovery {
                     Ok(_) => Err(format!("热重载事务收尾失败，旧配置与核心已恢复：{error}")),
@@ -968,7 +1082,13 @@ async fn apply_settings_inner(
     }
 
     if let Err(cancelled) = operation.ensure_active() {
-        let stopped = lifecycle::dispatch_stop_and_wait(&app).await;
+        operation.set_stage(ForegroundOperationStage::Rollback);
+        let stopped = await_foreground_step(
+            fallback_deadline,
+            "取消设置时停止核心",
+            lifecycle::dispatch_stop_and_wait(&app),
+        )
+        .await?;
         let rollback = {
             let _transaction = state.lock_routing_transaction().await;
             state.rollback_deferred_settings(&pending)
@@ -993,9 +1113,16 @@ async fn apply_settings_inner(
                 "{cancelled}；旧配置已恢复，停止请求优先，核心保持停止"
             ));
         }
+        operation.set_stage(ForegroundOperationStage::Recovery);
         let recovery = {
             let _transaction = state.lock_routing_transaction().await;
-            start_owned_core_verified(&app, state).await
+            await_foreground_step(
+                fallback_deadline,
+                "取消设置后恢复旧核心",
+                start_owned_core_verified(&app, state),
+            )
+            .await
+            .and_then(std::convert::identity)
         };
         return match recovery {
             Ok(_) => Err(format!("{cancelled}；旧配置与旧核心已恢复")),
@@ -1004,8 +1131,15 @@ async fn apply_settings_inner(
             )),
         };
     }
+    operation.set_stage(ForegroundOperationStage::FallbackRestart);
     let fallback_started_at = Instant::now();
-    if lifecycle::dispatch_stop_and_wait(&app).await != lifecycle::StopRequestResult::Stopped
+    if await_foreground_step(
+        fallback_deadline,
+        "设置回退停止旧核心",
+        lifecycle::dispatch_stop_and_wait(&app),
+    )
+    .await?
+        != lifecycle::StopRequestResult::Stopped
         || state.owned_core_pid_authoritative().await?.is_some()
     {
         state.record_fast_path(
@@ -1013,6 +1147,7 @@ async fn apply_settings_inner(
             fallback_started_at,
             FastPathResultCode::Error,
         );
+        operation.set_stage(ForegroundOperationStage::Rollback);
         let rollback = {
             let _transaction = state.lock_routing_transaction().await;
             state.rollback_deferred_settings(&pending)
@@ -1030,7 +1165,13 @@ async fn apply_settings_inner(
         .recovery_epoch();
     let start_result = {
         let _transaction = state.lock_routing_transaction().await;
-        start_owned_core_verified(&app, state).await
+        await_foreground_step(
+            fallback_deadline,
+            "设置回退启动候选核心",
+            start_owned_core_verified(&app, state),
+        )
+        .await
+        .and_then(std::convert::identity)
     };
     state.record_fast_path(
         FastPathStage::FallbackRestart,
@@ -1042,6 +1183,7 @@ async fn apply_settings_inner(
         },
     );
     if let Err(start_error) = start_result {
+        operation.set_stage(ForegroundOperationStage::Rollback);
         let rollback = {
             let _transaction = state.lock_routing_transaction().await;
             state.rollback_deferred_settings(&pending)
@@ -1051,6 +1193,7 @@ async fn apply_settings_inner(
                 "新核心启动失败且最后有效配置回滚未完成；保持 Fail Closed：{start_error}；{rollback_error}"
             ));
         }
+        operation.set_stage(ForegroundOperationStage::Recovery);
         let coordinator = app.state::<lifecycle::DesktopCoordinator>();
         if coordinator.stop_requested()
             || coordinator.recovery_epoch() != reload_epoch_before_start.saturating_add(1)
@@ -1059,7 +1202,13 @@ async fn apply_settings_inner(
         }
         let recovery = {
             let _transaction = state.lock_routing_transaction().await;
-            start_owned_core_verified(&app, state).await
+            await_foreground_step(
+                fallback_deadline,
+                "设置回退恢复旧核心",
+                start_owned_core_verified(&app, state),
+            )
+            .await
+            .and_then(std::convert::identity)
         };
         return match recovery {
             Ok(_) => Err(format!(
@@ -1071,19 +1220,29 @@ async fn apply_settings_inner(
         };
     }
 
+    operation.enter_commit_barrier()?;
     let finalized = {
         let _transaction = state.lock_routing_transaction().await;
         state.finalize_deferred_settings(&mut pending, true)
     };
     match finalized {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            operation.set_stage(ForegroundOperationStage::Committed);
+            Ok(result)
+        }
         Err(finalize_error) => {
             if state.deferred_settings_commit_decided(&pending) {
                 return Err(format!(
                     "settings_commit_recovery_pending：提交决定已持久化；设置与 Controller 保持新状态，剩余收尾只会幂等前滚：{finalize_error}"
                 ));
             }
-            let _ = lifecycle::dispatch_stop_and_wait(&app).await;
+            operation.set_stage(ForegroundOperationStage::Rollback);
+            let _ = await_foreground_step(
+                fallback_deadline,
+                "设置终态回滚停止核心",
+                lifecycle::dispatch_stop_and_wait(&app),
+            )
+            .await;
             let rollback = {
                 let _transaction = state.lock_routing_transaction().await;
                 state.rollback_deferred_settings(&pending)
@@ -1099,9 +1258,16 @@ async fn apply_settings_inner(
             {
                 return Err("停止请求优先于设置收尾；已恢复最后有效配置并保持核心停止".into());
             }
+            operation.set_stage(ForegroundOperationStage::Recovery);
             let recovery = {
                 let _transaction = state.lock_routing_transaction().await;
-                start_owned_core_verified(&app, state).await
+                await_foreground_step(
+                    fallback_deadline,
+                    "设置终态恢复旧核心",
+                    start_owned_core_verified(&app, state),
+                )
+                .await
+                .and_then(std::convert::identity)
             };
             match recovery {
                 Ok(_) => Err(format!(
@@ -1117,11 +1283,24 @@ async fn apply_settings_inner(
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
-pub fn cancel_foreground_operation(app: AppHandle, state: State<'_, AppState>) -> bool {
-    let cancelled = state.cancel_foreground_operation();
+pub fn cancel_foreground_operation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> bool {
+    let cancelled = state.cancel_foreground_operation(&operation_id);
     app.state::<lifecycle::DesktopCoordinator>()
         .cancel_background_work();
     cancelled
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn get_foreground_operation_status(
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Option<crate::runtime::ForegroundOperationStatus> {
+    state.foreground_operation_status(&operation_id)
 }
 
 #[tauri::command]
@@ -1758,6 +1937,28 @@ pub async fn stop_development_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreground_fallback_steps_share_one_total_deadline() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        await_foreground_step(
+            deadline,
+            "stop",
+            tokio::time::sleep(Duration::from_millis(65)),
+        )
+        .await
+        .expect("first step");
+        let error = await_foreground_step(
+            deadline,
+            "recovery",
+            tokio::time::sleep(Duration::from_millis(65)),
+        )
+        .await
+        .expect_err("second step must consume only the remaining time");
+        assert!(error.contains("总预算 10 秒"));
+        assert!(started.elapsed() < Duration::from_millis(180));
+    }
 
     #[test]
     fn entry_switch_preview_rejects_terminal_and_unsupported_platform() {

@@ -312,6 +312,7 @@ export async function previewEntrySwitch(
 
 export async function applyEntrySwitch(
   request: EntrySwitchApplyRequest,
+  operationId: string,
 ): Promise<EntrySwitchApplyResult> {
   if (!isTauriRuntime()) {
     if (!browserEntrySwitchAuthorization
@@ -339,7 +340,7 @@ export async function applyEntrySwitch(
       managed_core_restarted: true,
     };
   }
-  return invoke<EntrySwitchApplyResult>("apply_entry_switch", { request });
+  return invoke<EntrySwitchApplyResult>("apply_entry_switch", { request, operationId });
 }
 
 export async function getSettingsTerminalStatus(): Promise<SettingsTerminalStatus> {
@@ -566,7 +567,10 @@ export async function previewSettings(request: SettingsPreviewRequest): Promise<
   return invoke<SettingsPreview>("preview_settings", { request });
 }
 
-export async function applySettings(request: SettingsApplyRequest): Promise<SettingsApplyResult> {
+export async function applySettings(
+  request: SettingsApplyRequest,
+  operationId: string,
+): Promise<SettingsApplyResult> {
   if (!isTauriRuntime()) {
     const intents = request.credential_mutations.map(({ subscription_id, action }) => ({
       subscription_id,
@@ -613,7 +617,7 @@ export async function applySettings(request: SettingsApplyRequest): Promise<Sett
       managed_core_restarted: false,
     };
   }
-  return invoke<SettingsApplyResult>("apply_settings", { request });
+  return invoke<SettingsApplyResult>("apply_settings", { request, operationId });
 }
 
 export async function retrySubscriptionProvider(
@@ -636,7 +640,26 @@ export async function retrySubscriptionProvider(
   return invoke<SubscriptionNodeGroup>("retry_subscription_provider", { subscriptionId });
 }
 
-export async function cancelForegroundOperation(): Promise<boolean> {
+export type ForegroundOperationStage = "validating" | "applying" | "hot_reload"
+  | "fallback_restart" | "rollback" | "recovery" | "committed";
+
+export interface ForegroundOperationStatus {
+  operation_id: string;
+  stage: ForegroundOperationStage;
+  cancellable: boolean;
+  cancel_requested: boolean;
+}
+
+export async function cancelForegroundOperation(operationId: string): Promise<boolean> {
   if (!isTauriRuntime()) return true;
-  return invoke<boolean>("cancel_foreground_operation");
+  return invoke<boolean>("cancel_foreground_operation", { operationId });
+}
+
+export async function getForegroundOperationStatus(
+  operationId: string,
+): Promise<ForegroundOperationStatus | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<ForegroundOperationStatus | null>("get_foreground_operation_status", {
+    operationId,
+  });
 }

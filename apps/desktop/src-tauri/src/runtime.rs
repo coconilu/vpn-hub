@@ -6,7 +6,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -138,6 +138,59 @@ pub enum SubscriptionNodeGroupState {
     ProviderFailed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForegroundOperationStage {
+    Validating,
+    Applying,
+    HotReload,
+    FallbackRestart,
+    Rollback,
+    Recovery,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ForegroundOperationStatus {
+    pub operation_id: String,
+    pub stage: ForegroundOperationStage,
+    pub cancellable: bool,
+    pub cancel_requested: bool,
+}
+
+struct ForegroundOperationState {
+    operation_id: String,
+    stage: ForegroundOperationStage,
+    cancellable: bool,
+    cancel: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PersistedProviderState {
+    Loading,
+    Available,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderRuntimeJournal {
+    version: u32,
+    config_generation: u64,
+    states: BTreeMap<String, PersistedProviderState>,
+}
+
+impl ProviderRuntimeJournal {
+    fn empty(config_generation: u64) -> Self {
+        Self {
+            version: 1,
+            config_generation,
+            states: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionNodeGroup {
     pub subscription_id: String,
@@ -196,6 +249,7 @@ pub struct NodeLatencyBatchResult {
 
 #[derive(Clone)]
 struct AuthorizedNodeLatencyContext {
+    generation: u64,
     selector: String,
     provider: String,
     target: String,
@@ -533,7 +587,7 @@ struct SettingsFingerprintBasis<'a> {
     credential_intents: &'a [CredentialMutationIntent],
 }
 
-fn settings_request_fingerprint(
+pub(crate) fn settings_request_fingerprint(
     draft: &SettingsDraft,
     active_outlet_replacement: Option<&str>,
     fail_closed_on_removed_active: bool,
@@ -796,7 +850,10 @@ pub struct AppState {
     initialization_error: Option<String>,
     settings_recovery_error: Mutex<Option<String>>,
     node_latency_batches: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    foreground_operation: Mutex<Option<Arc<AtomicBool>>>,
+    foreground_operation: Mutex<Option<ForegroundOperationState>>,
+    config_generation: AtomicU64,
+    guardian_commit_gate: Mutex<()>,
+    provider_runtime: Mutex<ProviderRuntimeJournal>,
     fast_path_samples: Mutex<VecDeque<FastPathPerformanceSample>>,
     supervisor_route: SupervisorRoute,
     #[cfg(test)]
@@ -811,6 +868,8 @@ pub struct AppState {
     settings_compensation_hook: Mutex<Option<SettingsCompensationHook>>,
     #[cfg(test)]
     controller_client_override: Mutex<Option<ControllerClient>>,
+    #[cfg(test)]
+    hot_reload_failure_hook: Mutex<Option<Box<dyn FnOnce() -> String + Send>>>,
     #[cfg(test)]
     node_latency_authorized_subscriptions: Mutex<HashSet<String>>,
 }
@@ -899,6 +958,7 @@ impl Drop for PendingChild {
 
 pub struct ForegroundOperation<'a> {
     state: &'a AppState,
+    operation_id: String,
     cancel: Arc<AtomicBool>,
 }
 
@@ -914,6 +974,32 @@ impl ForegroundOperation<'_> {
             Ok(())
         }
     }
+
+    pub fn set_stage(&self, stage: ForegroundOperationStage) {
+        if let Ok(mut current) = self.state.foreground_operation.lock()
+            && let Some(current) = current.as_mut()
+            && current.operation_id == self.operation_id
+        {
+            current.stage = stage;
+        }
+    }
+
+    pub fn enter_commit_barrier(&self) -> Result<(), String> {
+        let mut current = self
+            .state
+            .foreground_operation
+            .lock()
+            .map_err(|_| "前台操作状态锁已损坏".to_string())?;
+        let current = current
+            .as_mut()
+            .filter(|current| current.operation_id == self.operation_id)
+            .ok_or_else(|| "前台操作 generation 已失效".to_string())?;
+        if current.cancel.load(Ordering::Acquire) {
+            return Err("前台操作已取消；不会跨越原子提交边界".into());
+        }
+        current.cancellable = false;
+        Ok(())
+    }
 }
 
 impl Drop for ForegroundOperation<'_> {
@@ -921,7 +1007,7 @@ impl Drop for ForegroundOperation<'_> {
         if let Ok(mut current) = self.state.foreground_operation.lock()
             && current
                 .as_ref()
-                .is_some_and(|cancel| Arc::ptr_eq(cancel, &self.cancel))
+                .is_some_and(|current| current.operation_id == self.operation_id)
         {
             *current = None;
         }
@@ -1078,6 +1164,10 @@ impl Drop for OwnedProbeCore {
 }
 
 impl RoutingSession for AppState {
+    fn config_generation(&self) -> Result<u64, RoutingStateError> {
+        Ok(self.config_generation())
+    }
+
     fn current_outlet(&self) -> Result<Option<String>, RoutingStateError> {
         self.routing_engine
             .lock()
@@ -1103,6 +1193,30 @@ impl RoutingSession for AppState {
             .map_err(|_| RoutingStateError::Unavailable)?
             .apply(decision, now_ms);
         Ok(())
+    }
+
+    fn commit_cycle_if_current<F>(
+        &self,
+        expected_generation: u64,
+        decision: Option<&RouteDecision>,
+        now_ms: u64,
+        durable_commit: F,
+    ) -> Result<bool, vpn_hub_core::GuardianCycleError>
+    where
+        F: FnOnce() -> Result<(), vpn_hub_core::GuardianCycleError>,
+    {
+        let _gate = self
+            .guardian_commit_gate
+            .lock()
+            .map_err(|_| RoutingStateError::Unavailable)?;
+        if self.config_generation() != expected_generation {
+            return Ok(false);
+        }
+        durable_commit()?;
+        if let Some(decision) = decision {
+            self.apply_route(decision, now_ms)?;
+        }
+        Ok(true)
     }
 }
 
@@ -1298,6 +1412,9 @@ impl AppState {
             &private_config,
             recovered_routing_action.as_ref(),
         );
+        let provider_runtime = load_provider_runtime_journal(&runtime_directory)
+            .unwrap_or_else(|| ProviderRuntimeJournal::empty(1));
+        let config_generation = provider_runtime.config_generation.max(1);
         Self {
             workspace_root,
             guardian_config_path,
@@ -1316,6 +1433,9 @@ impl AppState {
             settings_recovery_error: Mutex::new(settings_recovery_error),
             node_latency_batches: Mutex::new(HashMap::new()),
             foreground_operation: Mutex::new(None),
+            config_generation: AtomicU64::new(config_generation),
+            guardian_commit_gate: Mutex::new(()),
+            provider_runtime: Mutex::new(provider_runtime),
             fast_path_samples: Mutex::new(VecDeque::with_capacity(MAX_FAST_PATH_SAMPLES)),
             supervisor_route,
             #[cfg(test)]
@@ -1330,6 +1450,8 @@ impl AppState {
             settings_compensation_hook: Mutex::new(None),
             #[cfg(test)]
             controller_client_override: Mutex::new(None),
+            #[cfg(test)]
+            hot_reload_failure_hook: Mutex::new(None),
             #[cfg(test)]
             node_latency_authorized_subscriptions: Mutex::new(HashSet::new()),
         }
@@ -1400,6 +1522,15 @@ impl AppState {
             .controller_client_override
             .lock()
             .expect("Controller override") = Some(controller);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_hot_reload_for_test(&self, message: impl Into<String>) {
+        let message = message.into();
+        *self
+            .hot_reload_failure_hook
+            .lock()
+            .expect("hot reload hook") = Some(Box::new(move || message));
     }
 
     #[must_use]
@@ -2994,7 +3125,9 @@ impl AppState {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn subscription_node_catalog(&self) -> Result<SubscriptionNodeCatalog, String> {
+        let generation = self.config_generation();
         let config = self.private_config()?;
         let credential_states = self
             .subscription_credential_statuses()?
@@ -3005,8 +3138,15 @@ impl AppState {
         let eligible_outlets = config
             .enabled_outlets()
             .filter(|outlet| {
-                matches!(outlet.kind, OutletKind::Subscription { .. })
-                    && credential_states.get(&outlet.id) == Some(&CredentialState::Configured)
+                let configured =
+                    credential_states.get(&outlet.id) == Some(&CredentialState::Configured);
+                #[cfg(test)]
+                let configured = configured
+                    || self
+                        .node_latency_authorized_subscriptions
+                        .lock()
+                        .is_ok_and(|authorized| authorized.contains(&outlet.id));
+                matches!(outlet.kind, OutletKind::Subscription { .. }) && configured
             })
             .collect::<Vec<_>>();
         let selectors = eligible_outlets
@@ -3024,8 +3164,27 @@ impl AppState {
                             .remove(selector)
                             .unwrap_or_else(empty_selector_node_snapshot);
                         let state = if snapshot.nodes.is_empty() {
-                            SubscriptionNodeGroupState::ProviderUnavailable
+                            match self.provider_state(&outlet.id, generation) {
+                                Some(PersistedProviderState::Loading) => {
+                                    SubscriptionNodeGroupState::ProviderLoading
+                                }
+                                Some(PersistedProviderState::Failed) => {
+                                    SubscriptionNodeGroupState::ProviderFailed
+                                }
+                                Some(PersistedProviderState::Available) | None => {
+                                    SubscriptionNodeGroupState::ProviderUnavailable
+                                }
+                            }
                         } else {
+                            if !self.set_provider_state_if_current(
+                                &outlet.id,
+                                generation,
+                                PersistedProviderState::Available,
+                            )? {
+                                return Err(
+                                    "配置 generation 已更新，迟到 provider 目录已丢弃".into()
+                                );
+                            }
                             SubscriptionNodeGroupState::Available
                         };
                         subscriptions.push(subscription_node_group(outlet, state, snapshot));
@@ -3055,10 +3214,14 @@ impl AppState {
             "没有已启用且凭据可用的订阅出口；请先在设置中完成订阅配置".into()
         } else if !controller_ready {
             "本应用自管 Mihomo Controller 当前不可用；请检查核心状态后刷新".into()
-        } else if subscriptions
-            .iter()
-            .any(|group| group.state == SubscriptionNodeGroupState::ProviderUnavailable)
-        {
+        } else if subscriptions.iter().any(|group| {
+            matches!(
+                group.state,
+                SubscriptionNodeGroupState::ProviderUnavailable
+                    | SubscriptionNodeGroupState::ProviderLoading
+                    | SubscriptionNodeGroupState::ProviderFailed
+            )
+        }) {
             "部分订阅 provider 尚未就绪；原节点选择保持不变".into()
         } else {
             "节点列表来自本机 Mihomo Controller，不会写入配置、历史或日志".into()
@@ -3112,6 +3275,7 @@ impl AppState {
         &self,
         subscription_id: &str,
     ) -> Result<SubscriptionNodeGroup, String> {
+        let generation = self.config_generation();
         let config = self.private_config()?;
         let outlet = config
             .enabled_outlets()
@@ -3133,15 +3297,30 @@ impl AppState {
         let controller = self
             .controller_client()?
             .ok_or_else(|| "应用自管核心未启动，无法重试 provider".to_string())?;
-        let state = if tokio::time::timeout(
+        if !self.set_provider_state_if_current(
+            subscription_id,
+            generation,
+            PersistedProviderState::Loading,
+        )? {
+            return Err("配置 generation 已更新，provider 重试已失效".into());
+        }
+        let updated = tokio::time::timeout(
             Duration::from_secs(2),
             controller.update_proxy_provider(&provider_name(subscription_id)),
         )
         .await
-        .is_ok_and(|result| result.is_ok())
-        {
+        .is_ok_and(|result| result.is_ok());
+        if self.config_generation() != generation {
+            return Err("配置 generation 已更新，迟到 provider 结果已丢弃".into());
+        }
+        let state = if updated {
             SubscriptionNodeGroupState::ProviderLoading
         } else {
+            let _ = self.set_provider_state_if_current(
+                subscription_id,
+                generation,
+                PersistedProviderState::Failed,
+            )?;
             SubscriptionNodeGroupState::ProviderFailed
         };
         Ok(subscription_node_group(
@@ -3180,31 +3359,39 @@ impl AppState {
             }
         };
 
-        Ok(
-            match controller
-                .delay_provider_member_preserving_selection(
-                    &context.selector,
-                    &context.provider,
-                    node_name,
-                    &context.target,
-                    context.timeout_ms,
-                )
-                .await
-            {
-                Ok(latency_ms) => NodeLatencyResult {
-                    node_name: node_name.into(),
-                    status: NodeLatencyStatus::Success,
-                    latency_ms: Some(latency_ms),
-                    tested_at,
-                    error_code: None,
-                    message: "本次延迟测试成功；权威当前节点保持不变".into(),
-                    selection_unchanged: true,
-                },
-                Err(error) => node_latency_controller_failure(node_name, tested_at, &error),
+        let result = match controller
+            .delay_provider_member_preserving_selection(
+                &context.selector,
+                &context.provider,
+                node_name,
+                &context.target,
+                context.timeout_ms,
+            )
+            .await
+        {
+            Ok(latency_ms) => NodeLatencyResult {
+                node_name: node_name.into(),
+                status: NodeLatencyStatus::Success,
+                latency_ms: Some(latency_ms),
+                tested_at,
+                error_code: None,
+                message: "本次延迟测试成功；权威当前节点保持不变".into(),
+                selection_unchanged: true,
             },
-        )
+            Err(error) => node_latency_controller_failure(node_name, tested_at, &error),
+        };
+        if self.config_generation() != context.generation {
+            return Ok(node_latency_failure(
+                node_name,
+                chrono::Utc::now().to_rfc3339(),
+                NodeLatencyErrorCode::Cancelled,
+                false,
+            ));
+        }
+        Ok(result)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn test_subscription_node_latencies(
         &self,
         subscription_id: &str,
@@ -3240,6 +3427,9 @@ impl AppState {
                 ));
             }
         };
+        if self.config_generation() != context.generation {
+            return Ok(node_latency_batch_obsolete(subscription_id));
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         {
             let mut batches = self
@@ -3258,14 +3448,26 @@ impl AppState {
             .lock()
             .map_err(|_| "测速取消状态锁已损坏".to_string())?
             .remove(operation_id);
-        let cancelled = cancel.load(Ordering::Acquire)
+        let obsolete = self.config_generation() != context.generation;
+        let cancelled = obsolete
+            || cancel.load(Ordering::Acquire)
             || results
                 .iter()
                 .any(|result| result.status == NodeLatencyStatus::Cancelled);
-        let selection_unchanged = controller
-            .selector_nodes(&context.selector)
-            .await
-            .is_ok_and(|after| after.current_node == before.current_node);
+        if obsolete {
+            for result in &mut results {
+                result.status = NodeLatencyStatus::Cancelled;
+                result.latency_ms = None;
+                result.error_code = Some(NodeLatencyErrorCode::Cancelled);
+                result.message = "配置 generation 已更新，迟到测速结果已丢弃".into();
+                result.selection_unchanged = false;
+            }
+        }
+        let selection_unchanged = !obsolete
+            && controller
+                .selector_nodes(&context.selector)
+                .await
+                .is_ok_and(|after| after.current_node == before.current_node);
         if !selection_unchanged {
             for result in &mut results {
                 if result.status == NodeLatencyStatus::Success {
@@ -3285,8 +3487,14 @@ impl AppState {
             results,
             cancelled,
             selection_unchanged,
-            error_code: (!selection_unchanged).then_some(NodeLatencyErrorCode::ControllerError),
-            message: if !selection_unchanged {
+            error_code: if obsolete {
+                Some(NodeLatencyErrorCode::Cancelled)
+            } else {
+                (!selection_unchanged).then_some(NodeLatencyErrorCode::ControllerError)
+            },
+            message: if obsolete {
+                "配置已更新；旧 generation 测速结果已取消且未提交".into()
+            } else if !selection_unchanged {
                 "无法确认测速前后的权威当前节点；本次成功结果已拒绝".into()
             } else if cancelled {
                 "批量测速已取消；已完成的结果仍保留在当前界面".into()
@@ -3356,6 +3564,7 @@ impl AppState {
         let guardian = GuardianConfig::load(&self.guardian_config_path)
             .map_err(|_| NodeLatencyErrorCode::ProviderUnavailable)?;
         Ok(AuthorizedNodeLatencyContext {
+            generation: self.config_generation(),
             selector: outlet_proxy_name(subscription_id),
             provider: provider_name(subscription_id),
             target,
@@ -3621,7 +3830,13 @@ impl AppState {
         self.settings_apply_transaction.lock().await
     }
 
-    pub fn begin_foreground_operation(&self) -> Result<ForegroundOperation<'_>, String> {
+    pub fn begin_foreground_operation(
+        &self,
+        operation_id: &str,
+    ) -> Result<ForegroundOperation<'_>, String> {
+        if !valid_operation_id(operation_id) {
+            return Err("前台操作标识无效".into());
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let mut current = self
             .foreground_operation
@@ -3630,22 +3845,118 @@ impl AppState {
         if current.is_some() {
             return Err("已有设置操作正在进行，请等待或取消后重试".into());
         }
-        *current = Some(Arc::clone(&cancel));
+        *current = Some(ForegroundOperationState {
+            operation_id: operation_id.into(),
+            stage: ForegroundOperationStage::Validating,
+            cancellable: true,
+            cancel: Arc::clone(&cancel),
+        });
         Ok(ForegroundOperation {
             state: self,
+            operation_id: operation_id.into(),
             cancel,
         })
     }
 
-    pub fn cancel_foreground_operation(&self) -> bool {
-        self.foreground_operation
-            .lock()
-            .ok()
-            .and_then(|current| current.as_ref().cloned())
-            .is_some_and(|cancel| {
-                cancel.store(true, Ordering::Release);
-                true
+    pub fn cancel_foreground_operation(&self, operation_id: &str) -> bool {
+        let Ok(mut current) = self.foreground_operation.lock() else {
+            return false;
+        };
+        let Some(current) = current
+            .as_mut()
+            .filter(|current| current.operation_id == operation_id && current.cancellable)
+        else {
+            return false;
+        };
+        current.stage = ForegroundOperationStage::Rollback;
+        current.cancel.store(true, Ordering::Release);
+        true
+    }
+
+    pub fn foreground_operation_status(
+        &self,
+        operation_id: &str,
+    ) -> Option<ForegroundOperationStatus> {
+        self.foreground_operation.lock().ok().and_then(|current| {
+            current.as_ref().and_then(|current| {
+                (current.operation_id == operation_id).then(|| ForegroundOperationStatus {
+                    operation_id: current.operation_id.clone(),
+                    stage: current.stage,
+                    cancellable: current.cancellable,
+                    cancel_requested: current.cancel.load(Ordering::Acquire),
+                })
             })
+        })
+    }
+
+    #[must_use]
+    pub fn config_generation(&self) -> u64 {
+        self.config_generation.load(Ordering::Acquire)
+    }
+
+    pub fn advance_config_generation(&self) -> Result<u64, String> {
+        let _gate = self
+            .guardian_commit_gate
+            .lock()
+            .map_err(|_| "配置 generation 提交锁已损坏".to_string())?;
+        let next = self.config_generation().saturating_add(1);
+        let next_journal = ProviderRuntimeJournal::empty(next);
+        write_provider_runtime_journal(&self.runtime_directory, &next_journal)?;
+        *self
+            .provider_runtime
+            .lock()
+            .map_err(|_| "provider runtime 状态锁已损坏".to_string())? = next_journal;
+        self.config_generation.store(next, Ordering::Release);
+        if let Ok(batches) = self.node_latency_batches.lock() {
+            for cancel in batches.values() {
+                cancel.store(true, Ordering::Release);
+            }
+        }
+        Ok(next)
+    }
+
+    fn provider_state(
+        &self,
+        subscription_id: &str,
+        generation: u64,
+    ) -> Option<PersistedProviderState> {
+        self.provider_runtime.lock().ok().and_then(|journal| {
+            (journal.config_generation == generation)
+                .then(|| journal.states.get(subscription_id).copied())
+                .flatten()
+        })
+    }
+
+    fn set_provider_state_if_current(
+        &self,
+        subscription_id: &str,
+        generation: u64,
+        state: PersistedProviderState,
+    ) -> Result<bool, String> {
+        let _gate = self
+            .guardian_commit_gate
+            .lock()
+            .map_err(|_| "配置 generation 提交锁已损坏".to_string())?;
+        if self.config_generation() != generation {
+            return Ok(false);
+        }
+        let mut journal = self
+            .provider_runtime
+            .lock()
+            .map_err(|_| "provider runtime 状态锁已损坏".to_string())?;
+        if journal.config_generation != generation {
+            *journal = ProviderRuntimeJournal::empty(generation);
+        }
+        if journal.states.get(subscription_id) == Some(&state) {
+            return Ok(true);
+        }
+        let previous = journal.clone();
+        journal.states.insert(subscription_id.into(), state);
+        if let Err(error) = write_provider_runtime_journal(&self.runtime_directory, &journal) {
+            *journal = previous;
+            return Err(error);
+        }
+        Ok(true)
     }
 
     pub fn record_fast_path(
@@ -3799,6 +4110,15 @@ impl AppState {
         cancel: &AtomicBool,
     ) -> Result<CoreStatus, String> {
         ensure_core_start_not_cancelled(cancel)?;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .hot_reload_failure_hook
+            .lock()
+            .map_err(|_| "热重载测试钩子锁已损坏".to_string())?
+            .take()
+        {
+            return Err(hook());
+        }
         let (secret, previous_entry, controller_address, started_at) = {
             let mut guard = self
                 .managed_core
@@ -4686,6 +5006,10 @@ fn spawn_node_latency_task(
 }
 
 fn valid_node_latency_operation_id(operation_id: &str) -> bool {
+    valid_operation_id(operation_id)
+}
+
+fn valid_operation_id(operation_id: &str) -> bool {
     !operation_id.is_empty()
         && operation_id.len() <= 96
         && operation_id
@@ -4704,6 +5028,17 @@ fn node_latency_batch_failure(
         selection_unchanged: true,
         error_code: Some(code),
         message: node_latency_error_message(code).into(),
+    }
+}
+
+fn node_latency_batch_obsolete(subscription_id: &str) -> NodeLatencyBatchResult {
+    NodeLatencyBatchResult {
+        subscription_id: subscription_id.into(),
+        results: Vec::new(),
+        cancelled: true,
+        selection_unchanged: false,
+        error_code: Some(NodeLatencyErrorCode::Cancelled),
+        message: "配置已更新；旧 generation 测速结果已取消且未提交".into(),
     }
 }
 
@@ -4869,6 +5204,65 @@ fn settings_transaction_artifacts_exist(runtime_directory: &Path) -> bool {
 
 fn settings_terminal_gate_path(runtime_directory: &Path) -> PathBuf {
     runtime_directory.join("settings-terminal.json")
+}
+
+fn provider_runtime_path(runtime_directory: &Path) -> PathBuf {
+    runtime_directory.join("provider-runtime.json")
+}
+
+fn provider_runtime_backup_path(runtime_directory: &Path) -> PathBuf {
+    runtime_directory.join("provider-runtime.json.bak")
+}
+
+fn load_provider_runtime_journal(runtime_directory: &Path) -> Option<ProviderRuntimeJournal> {
+    for path in [
+        provider_runtime_path(runtime_directory),
+        provider_runtime_backup_path(runtime_directory),
+    ] {
+        let Ok(content) = fs::read(path) else {
+            continue;
+        };
+        if content.len() > 64 * 1024 {
+            continue;
+        }
+        let Ok(journal) = serde_json::from_slice::<ProviderRuntimeJournal>(&content) else {
+            continue;
+        };
+        if journal.version == 1
+            && journal.config_generation > 0
+            && journal.states.len() <= 128
+            && journal.states.keys().all(|id| valid_operation_id(id))
+        {
+            return Some(journal);
+        }
+    }
+    None
+}
+
+fn write_provider_runtime_journal(
+    runtime_directory: &Path,
+    journal: &ProviderRuntimeJournal,
+) -> Result<(), String> {
+    let content =
+        serde_json::to_vec(journal).map_err(|_| "无法序列化 provider runtime 状态".to_string())?;
+    let path = provider_runtime_path(runtime_directory);
+    let temporary = runtime_directory.join("provider-runtime.json.new");
+    let backup = provider_runtime_backup_path(runtime_directory);
+    let backup_temporary = runtime_directory.join("provider-runtime.json.bak.new");
+    fs::create_dir_all(runtime_directory)
+        .map_err(|_| "无法创建 provider runtime 目录".to_string())?;
+    fs::write(&temporary, content).map_err(|_| "无法写入 provider runtime 临时状态".to_string())?;
+    if path.exists() {
+        fs::copy(&path, &backup_temporary)
+            .map_err(|_| "无法备份 provider runtime 状态".to_string())?;
+        if backup.exists() {
+            fs::remove_file(&backup).map_err(|_| "无法替换 provider runtime 备份".to_string())?;
+        }
+        fs::rename(&backup_temporary, &backup)
+            .map_err(|_| "无法提交 provider runtime 备份".to_string())?;
+        fs::remove_file(&path).map_err(|_| "无法替换 provider runtime 状态".to_string())?;
+    }
+    fs::rename(&temporary, &path).map_err(|_| "无法提交 provider runtime 状态".to_string())
 }
 
 fn settings_terminal_gate_backup_path(runtime_directory: &Path) -> PathBuf {
@@ -5823,11 +6217,56 @@ mod tests {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
         let state = AppState::new_for_test(workspace_root, directory.path());
-        let operation = state.begin_foreground_operation().expect("operation");
-        assert!(state.cancel_foreground_operation());
+        let operation = state
+            .begin_foreground_operation("settings-cancel")
+            .expect("operation");
+        assert!(!state.cancel_foreground_operation("stale-operation"));
+        assert!(state.cancel_foreground_operation("settings-cancel"));
         assert!(operation.ensure_active().is_err());
         drop(operation);
-        assert!(state.begin_foreground_operation().is_ok());
+        assert!(state.begin_foreground_operation("entry-reuse").is_ok());
+    }
+
+    #[test]
+    fn foreground_commit_barrier_is_authoritative_for_settings_and_entry_cancel_races() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        for operation_id in ["settings-race", "entry-race"] {
+            let operation = state
+                .begin_foreground_operation(operation_id)
+                .expect("operation");
+            let start = std::sync::Barrier::new(2);
+            let (committed, cancelled) = std::thread::scope(|scope| {
+                let commit = scope.spawn(|| {
+                    start.wait();
+                    operation.enter_commit_barrier().is_ok()
+                });
+                start.wait();
+                let cancelled = state.cancel_foreground_operation(operation_id);
+                (commit.join().expect("commit racer"), cancelled)
+            });
+            assert_ne!(
+                committed, cancelled,
+                "exactly one side may cross the boundary"
+            );
+            if committed {
+                operation.set_stage(ForegroundOperationStage::Committed);
+            }
+            let status = state
+                .foreground_operation_status(operation_id)
+                .expect("status");
+            if committed {
+                assert_eq!(status.stage, ForegroundOperationStage::Committed);
+                assert!(!status.cancellable);
+                assert!(!status.cancel_requested);
+            } else {
+                assert_eq!(status.stage, ForegroundOperationStage::Rollback);
+                assert!(status.cancellable);
+                assert!(status.cancel_requested);
+            }
+            drop(operation);
+        }
     }
 
     #[test]
@@ -6359,6 +6798,165 @@ mod tests {
                 .any(|item| item.status == NodeLatencyStatus::Cancelled)
         );
         assert_eq!(controller.max_active(), 4);
+    }
+
+    #[tokio::test]
+    async fn delayed_node_latency_never_holds_config_locks_and_late_results_are_discarded() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = Arc::new(AppState::new_for_test(workspace_root, directory.path()));
+        configure_node_latency_subscription(&state);
+        let nodes = ["Synthetic Current", "Synthetic Alpha", "Synthetic Beta"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        let controller = FakeNodeLatencyController::start(nodes, Duration::from_millis(600));
+        install_fake_controller_client(&state, controller.port);
+        let batch_state = Arc::clone(&state);
+        let batch = tokio::spawn(async move {
+            batch_state
+                .test_subscription_node_latencies("sub-a", "batch-obsolete")
+                .await
+                .expect("batch result")
+        });
+        for _ in 0..100 {
+            if controller.max_active() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            controller.max_active() > 0,
+            "delayed request must be in flight"
+        );
+
+        let routing_guard =
+            tokio::time::timeout(Duration::from_millis(100), state.lock_routing_transaction())
+                .await
+                .expect("settings/entry routing lock stays available");
+        drop(routing_guard);
+        let settings_guard =
+            tokio::time::timeout(Duration::from_millis(100), state.lock_settings_apply())
+                .await
+                .expect("settings apply lock stays available");
+        drop(settings_guard);
+        let invalidated_at = Instant::now();
+        state.advance_config_generation().expect("generation bump");
+        assert!(invalidated_at.elapsed() < Duration::from_millis(100));
+
+        let result = tokio::time::timeout(Duration::from_secs(1), batch)
+            .await
+            .expect("obsolete batch is promptly cancelled")
+            .expect("batch task");
+        assert!(result.cancelled);
+        assert_eq!(result.error_code, Some(NodeLatencyErrorCode::Cancelled));
+        assert!(
+            result
+                .results
+                .iter()
+                .all(|item| item.status == NodeLatencyStatus::Cancelled)
+        );
+        assert!(
+            !String::from_utf8_lossy(
+                &fs::read(&state.private_config_path).expect("private config")
+            )
+            .contains("Synthetic Alpha")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_state_survives_refresh_and_restart_for_the_same_generation() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root.clone(), directory.path());
+        configure_node_latency_subscription(&state);
+        let generation = state.config_generation();
+        assert!(state
+            .set_provider_state_if_current(
+                "sub-a",
+                generation,
+                PersistedProviderState::Loading,
+            )
+            .expect("persist loading"));
+        let controller = FakeNodeLatencyController::start(Vec::new(), Duration::ZERO);
+        install_fake_controller_client(&state, controller.port);
+        let first = state
+            .subscription_node_catalog()
+            .await
+            .expect("first catalog");
+        assert_eq!(
+            first.subscriptions[0].state,
+            SubscriptionNodeGroupState::ProviderLoading
+        );
+        let refreshed = state
+            .subscription_node_catalog()
+            .await
+            .expect("refresh catalog");
+        assert_eq!(
+            refreshed.subscriptions[0].state,
+            SubscriptionNodeGroupState::ProviderLoading
+        );
+        drop(state);
+
+        let restarted = AppState::new_for_test(workspace_root, directory.path());
+        configure_node_latency_subscription(&restarted);
+        install_fake_controller_client(&restarted, controller.port);
+        assert_eq!(restarted.config_generation(), generation);
+        let catalog = restarted
+            .subscription_node_catalog()
+            .await
+            .expect("restart catalog");
+        assert_eq!(
+            catalog.subscriptions[0].state,
+            SubscriptionNodeGroupState::ProviderLoading
+        );
+        assert!(
+            restarted
+                .set_provider_state_if_current("sub-a", generation, PersistedProviderState::Failed,)
+                .expect("persist failed")
+        );
+        let failed = restarted
+            .subscription_node_catalog()
+            .await
+            .expect("failed catalog");
+        assert_eq!(
+            failed.subscriptions[0].state,
+            SubscriptionNodeGroupState::ProviderFailed
+        );
+    }
+
+    #[test]
+    fn stale_provider_callback_cannot_overwrite_a_new_config_generation() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let old_generation = state.config_generation();
+        assert!(
+            state
+                .set_provider_state_if_current(
+                    "sub-a",
+                    old_generation,
+                    PersistedProviderState::Loading,
+                )
+                .expect("old loading")
+        );
+        let new_generation = state.advance_config_generation().expect("generation bump");
+        assert!(
+            !state
+                .set_provider_state_if_current(
+                    "sub-a",
+                    old_generation,
+                    PersistedProviderState::Failed,
+                )
+                .expect("late callback")
+        );
+        assert_eq!(state.provider_state("sub-a", new_generation), None);
+        let restarted = AppState::new_for_test(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."),
+            directory.path(),
+        );
+        assert_eq!(restarted.config_generation(), new_generation);
+        assert_eq!(restarted.provider_state("sub-a", new_generation), None);
     }
 
     fn install_fake_owned_controller(state: &AppState, lifetime_ms: u64) -> u32 {
@@ -8926,6 +9524,187 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             !runtime_yaml.exists(),
             "settings validation must not start or install a core"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires repository-pinned Mihomo; runs real settings and entry fallback transactions on random loopback ports"]
+    #[allow(clippy::too_many_lines)]
+    async fn fixed_mihomo_runs_real_settings_and_entry_fallback_and_failure_recovery() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let entry = ProbePortLease::reserve().expect("entry");
+        let controller = ProbePortLease::reserve_excluding(&[entry.port()]).expect("controller");
+        let local =
+            ProbePortLease::reserve_excluding(&[entry.port(), controller.port()]).expect("local");
+        let target =
+            ProbePortLease::reserve_excluding(&[entry.port(), controller.port(), local.port()])
+                .expect("target");
+        let initial_entry = entry.port();
+        let controller_port = controller.port();
+        let local_port = local.port();
+        let target_port = target.port();
+        drop((entry, controller, local, target));
+        let mut private = PrivateRoutingConfig::default();
+        private.entry = EntryConfig {
+            host: "127.0.0.1".into(),
+            port: initial_entry,
+        };
+        private.controller_port = controller_port;
+        private.outlets = vec![OutletConfig {
+            id: "local-fallback".into(),
+            label: "Local fallback".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: format!("socks5://127.0.0.1:{local_port}"),
+            },
+        }];
+        private
+            .save(state.private_config_path_for_test())
+            .expect("save initial config");
+        let running = state
+            .start_development_core()
+            .await
+            .expect("start fixed Mihomo");
+        let pid = running.pid.expect("initial pid");
+
+        let mut draft = state.settings_view().expect("settings").draft;
+        if let SettingsOutletDraft::LocalProxy { label, .. } = &mut draft.outlets[0] {
+            *label = "Local fallback updated".into();
+        }
+        let preview = state
+            .preview_settings(&preview_request(&draft, None, false, Vec::new()))
+            .expect("settings preview");
+        assert!(preview.requires_managed_core_restart);
+        let mut pending = state
+            .apply_settings_deferred(SettingsApplyRequest {
+                draft,
+                credential_mutations: Vec::new(),
+                active_outlet_replacement: None,
+                fail_closed_on_removed_active: false,
+                preview_fingerprint: preview.request_fingerprint,
+            })
+            .expect("settings deferred");
+        state.fail_next_hot_reload_for_test("fixture settings hot reload failure");
+        assert!(
+            state
+                .reload_owned_core_config_verified(pid, &AtomicBool::new(false))
+                .await
+                .is_err()
+        );
+        let settings_started = Instant::now();
+        state
+            .stop_development_core()
+            .expect("stop settings fallback");
+        let restarted = state
+            .start_development_core()
+            .await
+            .expect("settings fallback start");
+        let settings = state
+            .finalize_deferred_settings(&mut pending, true)
+            .expect("settings fallback finalize");
+        assert!(settings.managed_core_restarted);
+        assert_ne!(restarted.pid, Some(pid));
+        assert!(settings_started.elapsed() < Duration::from_secs(10));
+
+        let preview = state
+            .prepare_entry_switch_preview(
+                EntryConfig {
+                    host: "127.0.0.1".into(),
+                    port: target_port,
+                },
+                false,
+                EntrySwitchPreviewChecks {
+                    confirmed: EntrySwitchCheck::Passed,
+                    managed_core_ready: EntrySwitchCheck::Passed,
+                    target_available: EntrySwitchCheck::Passed,
+                    proxy_scope_supported: EntrySwitchCheck::Passed,
+                },
+            )
+            .expect("entry preview");
+        let request = EntrySwitchApplyRequest {
+            target: preview.target.clone(),
+            apply_system_proxy: false,
+            authorization: preview.authorization.expect("entry authorization"),
+        };
+        let fingerprint = state
+            .consume_entry_switch_ticket(&request)
+            .expect("entry ticket");
+        let mut pending = state
+            .apply_entry_switch_settings_deferred(request.target.clone(), fingerprint)
+            .expect("entry deferred");
+        let pid = state.owned_core_pid().expect("settings fallback pid");
+        state.fail_next_hot_reload_for_test("fixture entry hot reload failure");
+        assert!(
+            state
+                .reload_owned_core_config_verified(pid, &AtomicBool::new(false))
+                .await
+                .is_err()
+        );
+        let entry_started = Instant::now();
+        state.stop_development_core().expect("stop entry fallback");
+        state
+            .start_development_core()
+            .await
+            .expect("entry fallback start");
+        state
+            .finalize_deferred_settings(&mut pending, true)
+            .expect("entry fallback finalize");
+        assert_eq!(
+            state.private_config().expect("entry config").entry,
+            request.target
+        );
+        assert!(entry_started.elapsed() < Duration::from_secs(10));
+
+        let failed_target = ProbePortLease::reserve().expect("failed target");
+        let failed_port = failed_target.port();
+        drop(failed_target);
+        let preview = state
+            .prepare_entry_switch_preview(
+                EntryConfig {
+                    host: "127.0.0.1".into(),
+                    port: failed_port,
+                },
+                false,
+                EntrySwitchPreviewChecks {
+                    confirmed: EntrySwitchCheck::Passed,
+                    managed_core_ready: EntrySwitchCheck::Passed,
+                    target_available: EntrySwitchCheck::Passed,
+                    proxy_scope_supported: EntrySwitchCheck::Passed,
+                },
+            )
+            .expect("failure preview");
+        let failed_request = EntrySwitchApplyRequest {
+            target: preview.target,
+            apply_system_proxy: false,
+            authorization: preview.authorization.expect("failure authorization"),
+        };
+        let fingerprint = state
+            .consume_entry_switch_ticket(&failed_request)
+            .expect("failure ticket");
+        let pending = state
+            .apply_entry_switch_settings_deferred(failed_request.target, fingerprint)
+            .expect("failure deferred");
+        let previous_entry = request.target;
+        state
+            .stop_development_core()
+            .expect("stop before failed candidate");
+        let occupied =
+            TcpListener::bind((Ipv4Addr::LOCALHOST, failed_port)).expect("occupy candidate entry");
+        assert!(state.start_development_core().await.is_err());
+        state
+            .rollback_deferred_settings(&pending)
+            .expect("rollback failed candidate");
+        drop(occupied);
+        state
+            .start_development_core()
+            .await
+            .expect("recover old core");
+        assert_eq!(
+            state.private_config().expect("recovered config").entry,
+            previous_entry
+        );
+        state.stop_development_core().expect("final stop");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

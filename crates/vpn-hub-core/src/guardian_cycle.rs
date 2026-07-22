@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -25,6 +25,13 @@ pub enum RoutingStateError {
 }
 
 pub trait RoutingSession {
+    /// Returns the current monotonic configuration generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the generation cannot be read atomically.
+    fn config_generation(&self) -> Result<u64, RoutingStateError>;
+
     /// Returns the currently applied outlet, if any.
     ///
     /// # Errors
@@ -50,9 +57,30 @@ pub trait RoutingSession {
     ///
     /// Returns an error when the session state cannot be updated.
     fn apply_route(&self, decision: &RouteDecision, now_ms: u64) -> Result<(), RoutingStateError>;
+
+    /// Commits the durable cycle and in-memory route under the same
+    /// generation synchronization boundary. Returns `false` when a newer
+    /// configuration won before the boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the durable commit or routing update fails.
+    fn commit_cycle_if_current<F>(
+        &self,
+        expected_generation: u64,
+        decision: Option<&RouteDecision>,
+        now_ms: u64,
+        durable_commit: F,
+    ) -> Result<bool, GuardianCycleError>
+    where
+        F: FnOnce() -> Result<(), GuardianCycleError>;
 }
 
 impl RoutingSession for std::sync::Mutex<RoutingEngine> {
+    fn config_generation(&self) -> Result<u64, RoutingStateError> {
+        Ok(0)
+    }
+
     fn current_outlet(&self) -> Result<Option<String>, RoutingStateError> {
         self.lock()
             .map_err(|_| RoutingStateError::Unavailable)
@@ -76,6 +104,26 @@ impl RoutingSession for std::sync::Mutex<RoutingEngine> {
             .apply(decision, now_ms);
         Ok(())
     }
+
+    fn commit_cycle_if_current<F>(
+        &self,
+        expected_generation: u64,
+        decision: Option<&RouteDecision>,
+        now_ms: u64,
+        durable_commit: F,
+    ) -> Result<bool, GuardianCycleError>
+    where
+        F: FnOnce() -> Result<(), GuardianCycleError>,
+    {
+        if expected_generation != 0 {
+            return Ok(false);
+        }
+        durable_commit()?;
+        if let Some(decision) = decision {
+            self.apply_route(decision, now_ms)?;
+        }
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -88,6 +136,8 @@ pub enum GuardianCycleError {
     RoutingState(#[from] RoutingStateError),
     #[error("Guardian cycle was cancelled before commit")]
     Cancelled,
+    #[error("Guardian cycle exceeded its end-to-end deadline")]
+    Deadline,
 }
 
 pub const DEFAULT_GUARDIAN_CYCLE_BUDGET: Duration = Duration::from_secs(8);
@@ -157,86 +207,58 @@ pub async fn run_controller_guardian_cycle_controlled(
     budget: Duration,
     concurrency: usize,
 ) -> Result<GuardianCycleOutcome, GuardianCycleError> {
-    for outlet in private.enabled_outlets() {
-        store.ensure_udp_capability(
-            &outlet.id,
-            &outlet.label,
-            &unknown_udp_evidence(outlet, "not_yet_validated"),
-        )?;
-    }
+    let cycle_started = Instant::now();
+    let deadline = TokioInstant::now() + budget;
+    let expected_generation = routing.config_generation()?;
     let observed = probe_configured_outlets(
         controller,
         private,
         resolved,
         monitor.request_timeout_ms,
         Arc::clone(&cancel),
-        budget,
+        deadline,
         concurrency,
     )
     .await;
 
-    if cancel.load(Ordering::Acquire) {
+    if cancel.load(Ordering::Acquire) || routing.config_generation()? != expected_generation {
+        force_controller_fail_closed_bounded(controller).await;
         return Err(GuardianCycleError::Cancelled);
     }
-
-    for (outlet, result) in &observed {
-        if cancel.load(Ordering::Acquire) {
-            return Err(GuardianCycleError::Cancelled);
-        }
-        store.record_probe(
-            outlet,
-            result,
-            monitor.failure_threshold,
-            monitor.recovery_threshold,
-        )?;
+    if TokioInstant::now() >= deadline {
+        force_controller_fail_closed_bounded(controller).await;
+        return Err(GuardianCycleError::Deadline);
     }
 
-    let enabled_ids = private
-        .enabled_outlets()
-        .map(|outlet| outlet.id.as_str())
-        .collect::<HashSet<_>>();
-    let latest_latency = observed
-        .iter()
-        .map(|(outlet, result)| (outlet.id.as_str(), result.latency_ms))
-        .collect::<BTreeMap<_, _>>();
-    let health = store
-        .summaries()?
-        .into_iter()
-        .filter(|item| enabled_ids.contains(item.outlet_id.as_str()))
-        .map(|item| {
-            let latency_ms = latest_latency
-                .get(item.outlet_id.as_str())
-                .copied()
-                .flatten();
-            (
-                item.outlet_id,
-                OutletHealth {
-                    status: item.last_status,
-                    latency_ms,
-                },
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let health = store.project_probe_health(
+        &observed,
+        monitor.failure_threshold,
+        monitor.recovery_threshold,
+    )?;
     let policy = RoutingPolicy {
         priority: private.priority(),
         cooldown_ms: private.cooldown_seconds.saturating_mul(1_000),
         minimum_improvement_ms: private.minimum_improvement_ms,
     };
     let decision = routing.evaluate_route(now_ms, &health, &policy)?;
-    let started = Instant::now();
-    if cancel.load(Ordering::Acquire) {
+    if cycle_invalid(routing, expected_generation, &cancel)? {
+        force_controller_fail_closed_bounded(controller).await;
         return Err(GuardianCycleError::Cancelled);
     }
-    if let Some(decision) = &decision {
-        controller
-            .select(
-                crate::MASTER_SELECTOR,
-                &outlet_proxy_name(&decision.to_outlet),
-            )
-            .await?;
+    if let Some(decision) = &decision
+        && let Err(error) = select_before_deadline(
+            controller,
+            deadline,
+            crate::MASTER_SELECTOR,
+            &outlet_proxy_name(&decision.to_outlet),
+        )
+        .await
+    {
+        force_controller_fail_closed_bounded(controller).await;
+        return Err(error);
     }
-    if cancel.load(Ordering::Acquire) {
-        force_controller_fail_closed(controller).await?;
+    if cycle_invalid(routing, expected_generation, &cancel)? {
+        force_controller_fail_closed_bounded(controller).await;
         return Err(GuardianCycleError::Cancelled);
     }
     let selected_outlet = decision
@@ -245,25 +267,50 @@ pub async fn run_controller_guardian_cycle_controlled(
         .or(routing.current_outlet()?);
     let udp_capabilities = store.udp_capabilities()?;
     let udp_target = udp_selector_target(private, selected_outlet.as_deref(), &udp_capabilities);
-    if let Err(error) = controller.select(UDP_SELECTOR, &udp_target).await {
-        force_controller_fail_closed(controller).await?;
-        return Err(error.into());
+    if let Err(error) =
+        select_before_deadline(controller, deadline, UDP_SELECTOR, &udp_target).await
+    {
+        force_controller_fail_closed_bounded(controller).await;
+        return Err(error);
     }
-    if cancel.load(Ordering::Acquire) {
-        force_controller_fail_closed(controller).await?;
+    if cycle_invalid(routing, expected_generation, &cancel)? {
+        force_controller_fail_closed_bounded(controller).await;
         return Err(GuardianCycleError::Cancelled);
     }
-    if let Some(decision) = &decision {
-        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        routing.apply_route(decision, now_ms)?;
-        store.record_route_switch(&RouteSwitchEvent {
-            occurred_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-            from_outlet: decision.from_outlet.clone(),
-            to_outlet: decision.to_outlet.clone(),
-            mode: private.route_mode.as_str().into(),
-            reason: decision.reason.clone(),
-            duration_ms,
+
+    let duration_ms = u64::try_from(cycle_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let committed =
+        routing.commit_cycle_if_current(expected_generation, decision.as_ref(), now_ms, || {
+            for outlet in private.enabled_outlets() {
+                store.ensure_udp_capability(
+                    &outlet.id,
+                    &outlet.label,
+                    &unknown_udp_evidence(outlet, "not_yet_validated"),
+                )?;
+            }
+            for (outlet, result) in &observed {
+                store.record_probe(
+                    outlet,
+                    result,
+                    monitor.failure_threshold,
+                    monitor.recovery_threshold,
+                )?;
+            }
+            if let Some(decision) = &decision {
+                store.record_route_switch(&RouteSwitchEvent {
+                    occurred_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    from_outlet: decision.from_outlet.clone(),
+                    to_outlet: decision.to_outlet.clone(),
+                    mode: private.route_mode.as_str().into(),
+                    reason: decision.reason.clone(),
+                    duration_ms,
+                })?;
+            }
+            Ok(())
         })?;
+    if !committed {
+        force_controller_fail_closed_bounded(controller).await;
+        return Err(GuardianCycleError::Cancelled);
     }
 
     Ok(GuardianCycleOutcome {
@@ -272,15 +319,43 @@ pub async fn run_controller_guardian_cycle_controlled(
     })
 }
 
-async fn force_controller_fail_closed(
+fn cycle_invalid(
+    routing: &impl RoutingSession,
+    expected_generation: u64,
+    cancel: &AtomicBool,
+) -> Result<bool, RoutingStateError> {
+    Ok(cancel.load(Ordering::Acquire) || routing.config_generation()? != expected_generation)
+}
+
+async fn select_before_deadline(
     controller: &ControllerClient,
-) -> Result<(), ControllerError> {
-    controller
-        .select(crate::MASTER_SELECTOR, crate::FAIL_CLOSED_PROXY)
-        .await?;
-    controller
-        .select(UDP_SELECTOR, crate::FAIL_CLOSED_PROXY)
+    deadline: TokioInstant,
+    selector: &str,
+    target: &str,
+) -> Result<(), GuardianCycleError> {
+    if TokioInstant::now() >= deadline {
+        return Err(GuardianCycleError::Deadline);
+    }
+    tokio::time::timeout_at(deadline, controller.select(selector, target))
         .await
+        .map_err(|_| GuardianCycleError::Deadline)?
+        .map_err(GuardianCycleError::Controller)
+}
+
+const FAIL_CLOSED_CLEANUP_BUDGET: Duration = Duration::from_millis(500);
+
+async fn force_controller_fail_closed_bounded(controller: &ControllerClient) {
+    let deadline = TokioInstant::now() + FAIL_CLOSED_CLEANUP_BUDGET;
+    for selector in [crate::MASTER_SELECTOR, UDP_SELECTOR] {
+        if TokioInstant::now() >= deadline {
+            break;
+        }
+        let _ = tokio::time::timeout_at(
+            deadline,
+            controller.select(selector, crate::FAIL_CLOSED_PROXY),
+        )
+        .await;
+    }
 }
 
 pub(crate) fn udp_selector_target(
@@ -316,11 +391,10 @@ async fn probe_configured_outlets(
     resolved: &crate::ResolvedSubscriptionUrls,
     timeout_ms: u64,
     cancel: Arc<AtomicBool>,
-    budget: Duration,
+    deadline: TokioInstant,
     concurrency: usize,
 ) -> Vec<(ProbeOutletConfig, ProbeResult)> {
     let outlets = private.enabled_outlets().cloned().collect::<Vec<_>>();
-    let deadline = TokioInstant::now() + budget;
     let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
     let targets = Arc::new(private.probe_targets.clone());
     let mut tasks = JoinSet::new();
@@ -487,8 +561,14 @@ fn virtual_outlet(outlet: &OutletConfig, entry: &crate::EntryConfig) -> ProbeOut
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::OutletKind;
-    use std::{net::Ipv4Addr, sync::atomic::AtomicUsize};
+    use crate::{OutletKind, RouteMode};
+    use std::{
+        net::Ipv4Addr,
+        sync::{
+            Mutex,
+            atomic::{AtomicU64, AtomicUsize},
+        },
+    };
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -537,6 +617,147 @@ mod tests {
         (controller, handle)
     }
 
+    async fn tracking_controller(
+        partial_probe: bool,
+        slow_next_put: Arc<AtomicBool>,
+    ) -> (
+        ControllerClient,
+        Arc<Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("controller listener");
+        let address = listener.local_addr().expect("controller address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let captured = Arc::clone(&captured);
+                let slow_next_put = Arc::clone(&slow_next_put);
+                tokio::spawn(async move {
+                    let mut request = vec![0_u8; 8_192];
+                    let Ok(read) = stream.read(&mut request).await else {
+                        return;
+                    };
+                    request.truncate(read);
+                    let request = String::from_utf8_lossy(&request).into_owned();
+                    captured.lock().expect("requests").push(request.clone());
+                    let is_put = request.starts_with("PUT ");
+                    if is_put && slow_next_put.swap(false, Ordering::AcqRel) {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    let (status, body) = if partial_probe
+                        && request.starts_with("GET ")
+                        && request.contains("probe-b.invalid")
+                    {
+                        ("503 Service Unavailable", "")
+                    } else if request.starts_with("GET ") {
+                        ("200 OK", r#"{"delay":42}"#)
+                    } else {
+                        ("204 No Content", "")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let controller = ControllerClient::new(
+            &format!("http://{address}"),
+            "synthetic-secret".into(),
+            3_000,
+        )
+        .expect("controller client");
+        (controller, requests, handle)
+    }
+
+    struct GenerationRoutingSession {
+        generation: AtomicU64,
+        invalidate_on_commit: AtomicBool,
+        engine: Mutex<RoutingEngine>,
+    }
+
+    impl GenerationRoutingSession {
+        fn new(invalidate_on_commit: bool, current: Option<String>) -> Self {
+            let mut engine = RoutingEngine::new(RouteMode::Priority, None);
+            engine.restore_current(current, None);
+            Self {
+                generation: AtomicU64::new(7),
+                invalidate_on_commit: AtomicBool::new(invalidate_on_commit),
+                engine: Mutex::new(engine),
+            }
+        }
+    }
+
+    impl RoutingSession for GenerationRoutingSession {
+        fn config_generation(&self) -> Result<u64, RoutingStateError> {
+            Ok(self.generation.load(Ordering::Acquire))
+        }
+
+        fn current_outlet(&self) -> Result<Option<String>, RoutingStateError> {
+            Ok(self
+                .engine
+                .lock()
+                .map_err(|_| RoutingStateError::Unavailable)?
+                .current_outlet()
+                .map(str::to_owned))
+        }
+
+        fn evaluate_route(
+            &self,
+            now_ms: u64,
+            health: &BTreeMap<String, OutletHealth>,
+            policy: &RoutingPolicy,
+        ) -> Result<Option<RouteDecision>, RoutingStateError> {
+            Ok(self
+                .engine
+                .lock()
+                .map_err(|_| RoutingStateError::Unavailable)?
+                .evaluate(now_ms, health, policy))
+        }
+
+        fn apply_route(
+            &self,
+            decision: &RouteDecision,
+            now_ms: u64,
+        ) -> Result<(), RoutingStateError> {
+            self.engine
+                .lock()
+                .map_err(|_| RoutingStateError::Unavailable)?
+                .apply(decision, now_ms);
+            Ok(())
+        }
+
+        fn commit_cycle_if_current<F>(
+            &self,
+            expected_generation: u64,
+            decision: Option<&RouteDecision>,
+            now_ms: u64,
+            durable_commit: F,
+        ) -> Result<bool, GuardianCycleError>
+        where
+            F: FnOnce() -> Result<(), GuardianCycleError>,
+        {
+            if self.invalidate_on_commit.swap(false, Ordering::AcqRel) {
+                self.generation.fetch_add(1, Ordering::AcqRel);
+            }
+            if self.generation.load(Ordering::Acquire) != expected_generation {
+                return Ok(false);
+            }
+            durable_commit()?;
+            if let Some(decision) = decision {
+                self.apply_route(decision, now_ms)?;
+            }
+            Ok(true)
+        }
+    }
+
     fn concurrent_fixture() -> PrivateRoutingConfig {
         let mut private = PrivateRoutingConfig::default();
         private.probe_targets = vec![
@@ -555,6 +776,16 @@ mod tests {
             })
             .collect();
         private
+    }
+
+    fn monitor_fixture() -> MonitorConfig {
+        MonitorConfig {
+            interval_seconds: 30,
+            connect_timeout_ms: 500,
+            request_timeout_ms: 500,
+            failure_threshold: 2,
+            recovery_threshold: 2,
+        }
     }
 
     #[test]
@@ -588,7 +819,7 @@ mod tests {
             &crate::ResolvedSubscriptionUrls::new(),
             1_000,
             Arc::new(AtomicBool::new(false)),
-            Duration::from_millis(700),
+            TokioInstant::now() + Duration::from_millis(700),
             4,
         )
         .await;
@@ -619,7 +850,7 @@ mod tests {
             &crate::ResolvedSubscriptionUrls::new(),
             5_000,
             Arc::new(AtomicBool::new(false)),
-            Duration::from_millis(100),
+            TokioInstant::now() + Duration::from_millis(100),
             4,
         )
         .await;
@@ -631,5 +862,100 @@ mod tests {
             result.status == HealthStatus::Down
                 && result.error_code.as_deref() == Some("guardian_cycle_deadline")
         }));
+    }
+
+    #[tokio::test]
+    async fn generation_change_at_final_commit_discards_cycle_and_restores_reject() {
+        let (controller, requests, server) =
+            tracking_controller(false, Arc::new(AtomicBool::new(false))).await;
+        let mut private = concurrent_fixture();
+        private.outlets.truncate(1);
+        private.probe_targets.truncate(1);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = GuardianStore::open(directory.path().join("guardian.db")).expect("store");
+        let routing = GenerationRoutingSession::new(true, None);
+
+        let result = run_controller_guardian_cycle_controlled(
+            &controller,
+            &private,
+            &crate::ResolvedSubscriptionUrls::new(),
+            &monitor_fixture(),
+            &mut store,
+            &routing,
+            1_000,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_secs(1),
+            2,
+        )
+        .await;
+        server.abort();
+
+        assert!(matches!(result, Err(GuardianCycleError::Cancelled)));
+        assert!(store.recent_samples(10).expect("samples").is_empty());
+        assert!(store.recent_events(10).expect("events").is_empty());
+        assert!(store.recent_route_switches(10).expect("routes").is_empty());
+        assert!(store.udp_capabilities().expect("udp").is_empty());
+        assert_eq!(routing.current_outlet().expect("route"), None);
+        let requests = requests.lock().expect("requests");
+        for selector in [crate::MASTER_SELECTOR, UDP_SELECTOR] {
+            let last = requests
+                .iter()
+                .rev()
+                .find(|request| request.starts_with("PUT ") && request.contains(selector))
+                .expect("selector request");
+            assert!(last.contains(r#""name":"REJECT""#), "{last}");
+        }
+    }
+
+    #[tokio::test]
+    async fn selector_timeout_shares_cycle_deadline_after_partial_probe_and_is_bounded() {
+        let (controller, requests, server) =
+            tracking_controller(true, Arc::new(AtomicBool::new(true))).await;
+        let mut private = concurrent_fixture();
+        private.outlets.truncate(1);
+        private.probe_targets.truncate(2);
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut store = GuardianStore::open(directory.path().join("guardian.db")).expect("store");
+        let routing = GenerationRoutingSession::new(false, Some("fail-closed".into()));
+        let started = TokioInstant::now();
+
+        let result = run_controller_guardian_cycle_controlled(
+            &controller,
+            &private,
+            &crate::ResolvedSubscriptionUrls::new(),
+            &monitor_fixture(),
+            &mut store,
+            &routing,
+            1_000,
+            Arc::new(AtomicBool::new(false)),
+            Duration::from_millis(150),
+            2,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        server.abort();
+
+        assert!(matches!(result, Err(GuardianCycleError::Deadline)));
+        assert!(elapsed < Duration::from_millis(700), "elapsed={elapsed:?}");
+        assert!(store.recent_samples(10).expect("samples").is_empty());
+        let requests = requests.lock().expect("requests");
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("probe-a.invalid"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.contains("probe-b.invalid"))
+        );
+        for selector in [crate::MASTER_SELECTOR, UDP_SELECTOR] {
+            let last = requests
+                .iter()
+                .rev()
+                .find(|request| request.starts_with("PUT ") && request.contains(selector))
+                .expect("selector request");
+            assert!(last.contains(r#""name":"REJECT""#), "{last}");
+        }
     }
 }

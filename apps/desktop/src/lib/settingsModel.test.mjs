@@ -3,7 +3,9 @@ import fs from "node:fs";
 import test from "node:test";
 import {
   buildSettingsPreviewRequest,
+  acceptForegroundOperationStage,
   consumeSettingsPreviewTicket,
+  continueAfterPreviewIfCurrent,
   createOutletId,
   dispatchOneShotSettingsApply,
   isCurrentPreviewResponse,
@@ -12,6 +14,45 @@ import {
   settingsRequestFingerprint,
   settingsValidationTargetIds,
 } from "./settingsModel.js";
+
+test("authoritative operation stages advance in order and reject late events", () => {
+  const id = "settings-42";
+  let stage = null;
+  for (const next of ["validating", "applying", "hot_reload", "fallback_restart"]) {
+    stage = acceptForegroundOperationStage(id, stage, { operation_id: id, stage: next });
+    assert.equal(stage, next);
+  }
+  assert.equal(
+    acceptForegroundOperationStage(id, stage, { operation_id: "stale", stage: "committed" }),
+    "fallback_restart",
+  );
+  stage = acceptForegroundOperationStage(id, stage, { operation_id: id, stage: "rollback" });
+  stage = acceptForegroundOperationStage(id, stage, { operation_id: id, stage: "recovery" });
+  assert.equal(stage, "recovery");
+  assert.equal(
+    acceptForegroundOperationStage(id, stage, { operation_id: id, stage: "applying" }),
+    "recovery",
+  );
+  assert.equal(
+    acceptForegroundOperationStage(id, stage, { operation_id: id, stage: "committed" }),
+    "committed",
+  );
+});
+
+test("cancelling while entry preview is delayed never dispatches apply", async () => {
+  let resolvePreview;
+  let current = true;
+  let applyCalls = 0;
+  const pending = continueAfterPreviewIfCurrent(
+    () => new Promise((resolve) => { resolvePreview = resolve; }),
+    (preview) => current && preview.can_execute,
+    async () => { applyCalls += 1; },
+  );
+  current = false;
+  resolvePreview({ can_execute: true });
+  assert.equal(await pending, null);
+  assert.equal(applyCalls, 0);
+});
 
 test("reordering and renaming do not regenerate stable outlet ids", () => {
   const outlets = [
@@ -138,11 +179,18 @@ test("managed-core reload exposes hot reload fallback and slow-operation cancell
   assert.equal(source.includes("完整 Guardian 在后台运行"), true);
   assert.equal(source.includes("取消当前操作"), true);
   assert.equal(source.includes("2_000"), true);
+  assert.equal(source.includes("getForegroundOperationStatus(activeOperationId)"), true);
+  assert.ok(
+    source.indexOf("operation.cancelled = true")
+      < source.indexOf("cancelForegroundOperation(operation.id)"),
+    "local generation must be invalidated before the backend cancellation round trip",
+  );
 });
 
 test("settings primary action auto-validates and exposes accessible disabled reasons", () => {
   const source = fs.readFileSync(new URL("../SettingsPage.tsx", import.meta.url), "utf8");
-  assert.equal(source.includes("const checked = await requestCurrentPreview()"), true);
+  assert.equal(source.includes("continueAfterPreviewIfCurrent("), true);
+  assert.equal(source.includes("requestCurrentPreview(operation)"), true);
   assert.equal(source.includes("settingsPreviewOutcome(checked) === \"live_apply\""), true);
   assert.equal(source.includes("aria-describedby=\"settings-action-reason\""), true);
   assert.equal(source.includes("请从问题摘要跳转到对应字段"), true);
