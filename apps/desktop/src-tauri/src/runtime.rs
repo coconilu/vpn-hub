@@ -1430,7 +1430,7 @@ impl AppState {
     }
 
     #[cfg(test)]
-    fn set_settings_validation_hook_for_test(
+    pub(crate) fn set_settings_validation_hook_for_test(
         &self,
         hook: impl Fn(&Path, &Path) -> Result<(), String> + Send + 'static,
     ) {

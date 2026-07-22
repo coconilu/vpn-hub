@@ -2380,8 +2380,11 @@ mod tests {
         use tokio::net::TcpListener;
         use vpn_hub_core::{ControllerClient, PrivateRoutingConfig, outlet_proxy_name};
 
-        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
+        let workspace_root = directory.path().join("workspace-without-mihomo");
+        std::fs::create_dir_all(&workspace_root).expect("empty workspace");
+        assert!(!workspace_root.join("tools/mihomo.lock.json").exists());
+        assert!(!workspace_root.join(".tools/mihomo").exists());
         let initial = AppState::new_for_test(workspace_root.clone(), directory.path());
         let mut private = PrivateRoutingConfig::default();
         private.route_mode = RouteMode::Priority;
@@ -2409,6 +2412,20 @@ mod tests {
             .expect("initial config");
         drop(initial);
         let state = AppState::new_for_test(workspace_root, directory.path());
+        let validation_invoked = Arc::new(AtomicBool::new(false));
+        let hook_validation_invoked = Arc::clone(&validation_invoked);
+        state.set_settings_validation_hook_for_test(move |validation_directory, candidate_path| {
+            if !validation_directory.is_dir() || !candidate_path.is_file() {
+                return Err("isolated candidate validation artifacts are missing".into());
+            }
+            let yaml = std::fs::read_to_string(candidate_path)
+                .map_err(|error| format!("cannot read isolated candidate: {error}"))?;
+            if yaml.lines().any(|line| line.trim() == "DIRECT") {
+                return Err("isolated candidate violates Fail Closed".into());
+            }
+            hook_validation_invoked.store(true, Ordering::Release);
+            Ok(())
+        });
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2575,6 +2592,9 @@ mod tests {
                 request_fingerprint: fingerprint,
             })
             .expect("preview");
+        assert_eq!(preview.diff.changes.len(), 1);
+        assert_eq!(preview.diff.changes[0].code, "route_policy_changed");
+        assert!(!preview.requires_managed_core_restart);
         let request = SettingsApplyRequest {
             draft,
             credential_mutations: Vec::new(),
@@ -2634,6 +2654,7 @@ mod tests {
             )
         });
 
+        assert!(validation_invoked.load(Ordering::Acquire));
         assert!(cancelled);
         assert!(cancelled_while_request_in_flight);
         let error = result.expect_err("cancelled live policy must not commit");
