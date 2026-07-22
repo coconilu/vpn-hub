@@ -263,14 +263,14 @@ export function SettingsPage({ currentOutletId, onApplied, onNotice }: Props) {
     return false;
   };
 
-  const requestCurrentPreview = async (operation?: UiOperation) => {
+  const requestCurrentPreview = async (operation: UiOperation) => {
     if (!draft || !ensureActiveOutletDecision()) return null;
     const request = buildSettingsPreviewRequest(draft, replacement, failClosed, credentialIntentById);
     const generation = ++previewGeneration.current;
     setOperationStage("正在校验配置"); setPageState("checking"); setError(null);
     try {
-      const result = await previewSettings(request);
-      if (operation && !isCurrentOperation(operation)) return null;
+      const result = await previewSettings(request, operation.id);
+      if (!isCurrentOperation(operation)) return null;
       if (!isCurrentPreviewResponse(generation, previewGeneration.current, request.request_fingerprint, result.request_fingerprint)) return null;
       setPreview(result);
       const outcome = settingsPreviewOutcome(result);

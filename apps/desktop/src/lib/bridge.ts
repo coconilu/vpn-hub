@@ -449,7 +449,10 @@ export async function cancelSubscriptionNodeLatencyBatch(operationId: string): P
   return invoke<boolean>("cancel_subscription_node_latency_batch", { operationId });
 }
 
-export async function previewSettings(request: SettingsPreviewRequest): Promise<SettingsPreview> {
+export async function previewSettings(
+  request: SettingsPreviewRequest,
+  operationId: string,
+): Promise<SettingsPreview> {
   if (!isTauriRuntime()) {
     const fingerprint = settingsRequestFingerprint(
       request.draft,
@@ -535,7 +538,7 @@ export async function previewSettings(request: SettingsPreviewRequest): Promise<
     browserSettingsPreviewTicket = result.can_apply ? fingerprint : null;
     return result;
   }
-  return invoke<SettingsPreview>("preview_settings", { request });
+  return invoke<SettingsPreview>("preview_settings", { request, operationId });
 }
 
 export async function applySettings(

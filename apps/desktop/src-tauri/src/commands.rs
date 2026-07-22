@@ -49,6 +49,19 @@ async fn wait_for_foreground_cancel(cancel: &AtomicBool) {
     }
 }
 
+fn ensure_foreground_before_deadline(
+    deadline: tokio::time::Instant,
+    label: &str,
+    operation: &crate::runtime::ForegroundOperation<'_>,
+) -> Result<(), String> {
+    operation.ensure_active()?;
+    if tokio::time::Instant::now() >= deadline {
+        Err(format!("{label} 超过前台策略事务总预算"))
+    } else {
+        Ok(())
+    }
+}
+
 async fn await_foreground_active<T>(
     deadline: tokio::time::Instant,
     label: &str,
@@ -80,6 +93,7 @@ async fn apply_live_policy_settings_transaction(
     let active_deadline = deadline
         .checked_sub(FOREGROUND_LIVE_POLICY_RECOVERY_RESERVE)
         .unwrap_or(deadline);
+    ensure_foreground_before_deadline(active_deadline, "在线策略 preflight", operation)?;
     let _transaction = await_foreground_active(
         active_deadline,
         "等待路由事务锁",
@@ -94,6 +108,7 @@ async fn apply_live_policy_settings_transaction(
         state.capture_controller_selector_snapshot(),
     )
     .await??;
+    ensure_foreground_before_deadline(active_deadline, "在线策略候选提交", operation)?;
     let mut pending = state.apply_settings_deferred(request)?;
     let validation = await_foreground_active(
         active_deadline,
@@ -937,11 +952,36 @@ pub fn cancel_subscription_node_latency_batch(
 pub async fn preview_settings(
     state: State<'_, AppState>,
     request: SettingsPreviewRequest,
+    operation_id: String,
 ) -> Result<SettingsPreview, String> {
-    let _transaction = state.lock_routing_transaction().await;
-    let core_status = state.core_status_authoritative().await?;
+    let deadline = tokio::time::Instant::now() + FOREGROUND_FALLBACK_BUDGET;
+    preview_settings_inner(&state, &request, &operation_id, deadline).await
+}
+
+async fn preview_settings_inner(
+    state: &AppState,
+    request: &SettingsPreviewRequest,
+    operation_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<SettingsPreview, String> {
+    let operation = state.begin_foreground_operation(operation_id)?;
+    let _transaction = await_foreground_active(
+        deadline,
+        "等待设置预览路由事务锁",
+        &operation,
+        state.lock_routing_transaction(),
+    )
+    .await?;
+    let core_status = await_foreground_active(
+        deadline,
+        "读取设置预览核心 authority",
+        &operation,
+        state.core_status_authoritative(),
+    )
+    .await??;
+    ensure_foreground_before_deadline(deadline, "设置预览 authority preflight", &operation)?;
     let managed_core_running = core_status.managed && core_status.pid.is_some();
-    let mut preview = state.preview_settings_with_core_state(&request, managed_core_running)?;
+    let mut preview = state.preview_settings_with_core_state(request, managed_core_running)?;
     if core_status.state == "external"
         && (preview.diff.affects_private_routing() || !request.credential_intents.is_empty())
     {
@@ -978,6 +1018,75 @@ pub async fn preview_settings(
     Ok(preview)
 }
 
+struct SettingsApplyEntry<'a> {
+    _settings_apply: tokio::sync::MutexGuard<'a, ()>,
+    operation: crate::runtime::ForegroundOperation<'a>,
+    preflight: SettingsPreview,
+    managed_core_running: bool,
+}
+
+async fn begin_settings_apply_entry<'a>(
+    state: &'a AppState,
+    request: &SettingsApplyRequest,
+    operation_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<SettingsApplyEntry<'a>, String> {
+    let operation = state.begin_foreground_operation(operation_id)?;
+    let settings_apply = await_foreground_active(
+        deadline,
+        "等待设置应用串行事务锁",
+        &operation,
+        state.lock_settings_apply(),
+    )
+    .await?;
+    if state.settings_terminal_active() {
+        return Err(
+            "terminal_recovery_active：设置安全门仍处于 Fail Closed；请先执行显式受鉴权恢复".into(),
+        );
+    }
+    let _transaction = await_foreground_active(
+        deadline,
+        "等待设置应用 preflight 路由事务锁",
+        &operation,
+        state.lock_routing_transaction(),
+    )
+    .await?;
+    let core_status = await_foreground_active(
+        deadline,
+        "读取设置应用核心 authority",
+        &operation,
+        state.core_status_authoritative(),
+    )
+    .await??;
+    ensure_foreground_before_deadline(deadline, "设置应用 authority preflight", &operation)?;
+    let managed_core_running = core_status.managed && core_status.pid.is_some();
+    let preflight = state.preflight_settings_apply(request, managed_core_running)?;
+    if helper_settings_deployment_required(
+        state.uses_helper_authority(),
+        preflight.diff.affects_private_routing(),
+        !request.credential_mutations.is_empty(),
+    ) {
+        return Err("Helper 核心使用受保护的 ProgramData 配置；拒绝把用户设置误报为已应用".into());
+    }
+    if core_status.state == "external"
+        && (preflight.diff.affects_private_routing() || !request.credential_mutations.is_empty())
+    {
+        return Err("入口或 Controller ownership 不可证明；不会停止、重启或改写未知核心".into());
+    }
+    if managed_core_running
+        && preflight.diff.requires_authenticated_controller_apply()
+        && state.controller_client()?.is_none()
+    {
+        return Err("自管核心未提供受鉴权 Controller；不会把路由策略误报为在线应用".into());
+    }
+    Ok(SettingsApplyEntry {
+        _settings_apply: settings_apply,
+        operation,
+        preflight,
+        managed_core_running,
+    })
+}
+
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_lines)]
@@ -988,7 +1097,8 @@ pub async fn apply_settings(
     operation_id: String,
 ) -> Result<SettingsApplyResult, String> {
     let started_at = Instant::now();
-    let result = apply_settings_inner(app, &state, request, &operation_id).await;
+    let deadline = tokio::time::Instant::now() + FOREGROUND_FALLBACK_BUDGET;
+    let result = apply_settings_inner(app, &state, request, &operation_id, deadline).await;
     let result_code = if result.is_ok() {
         FastPathResultCode::Ok
     } else {
@@ -1004,62 +1114,34 @@ async fn apply_settings_inner(
     state: &AppState,
     request: SettingsApplyRequest,
     operation_id: &str,
+    deadline: tokio::time::Instant,
 ) -> Result<SettingsApplyResult, String> {
-    let _settings_apply = state.lock_settings_apply().await;
-    let operation = state.begin_foreground_operation(operation_id)?;
-    if state.settings_terminal_active() {
-        return Err(
-            "terminal_recovery_active：设置安全门仍处于 Fail Closed；请先执行显式受鉴权恢复".into(),
-        );
-    }
+    let SettingsApplyEntry {
+        _settings_apply,
+        operation,
+        preflight,
+        managed_core_running,
+    } = begin_settings_apply_entry(state, &request, operation_id, deadline).await?;
     let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    ensure_foreground_before_deadline(deadline, "设置应用 preflight", &operation)?;
     coordinator.cancel_background_work();
     state.advance_config_generation()?;
     operation.ensure_active()?;
-    let (preflight, managed_core_running) = {
-        let _transaction = state.lock_routing_transaction().await;
-        let core_status = state.core_status_authoritative().await?;
-        let managed_core_running = core_status.managed && core_status.pid.is_some();
-        let preview = state.preflight_settings_apply(&request, managed_core_running)?;
-        if helper_settings_deployment_required(
-            state.uses_helper_authority(),
-            preview.diff.affects_private_routing(),
-            !request.credential_mutations.is_empty(),
-        ) {
-            return Err(
-                "Helper 核心使用受保护的 ProgramData 配置；拒绝把用户设置误报为已应用".into(),
-            );
-        }
-        if core_status.state == "external"
-            && (preview.diff.affects_private_routing() || !request.credential_mutations.is_empty())
-        {
-            return Err(
-                "入口或 Controller ownership 不可证明；不会停止、重启或改写未知核心".into(),
-            );
-        }
-        if managed_core_running
-            && preview.diff.requires_authenticated_controller_apply()
-            && state.controller_client()?.is_none()
-        {
-            return Err("自管核心未提供受鉴权 Controller；不会把路由策略误报为在线应用".into());
-        }
-        (preview, managed_core_running)
-    };
     if !preflight.requires_managed_core_restart {
         operation.set_stage(ForegroundOperationStage::Applying);
-        let live_deadline = tokio::time::Instant::now() + FOREGROUND_FALLBACK_BUDGET;
         let requires_controller_confirmation =
             managed_core_running && preflight.diff.requires_authenticated_controller_apply();
         let apply_result = if requires_controller_confirmation {
-            apply_live_policy_settings_transaction(state, request, &operation, live_deadline).await
+            apply_live_policy_settings_transaction(state, request, &operation, deadline).await
         } else {
             let _transaction = await_foreground_active(
-                live_deadline,
+                deadline,
                 "等待普通设置事务锁",
                 &operation,
                 state.lock_routing_transaction(),
             )
             .await?;
+            ensure_foreground_before_deadline(deadline, "普通设置最终提交", &operation)?;
             operation.enter_commit_barrier()?;
             state.apply_settings(request)
         };
@@ -2069,6 +2151,117 @@ mod tests {
         .expect_err("second step must consume only the remaining time");
         assert!(error.contains("总预算 10 秒"));
         assert!(started.elapsed() < Duration::from_millis(180));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn real_preview_and_apply_entries_cancel_routing_lock_contention_without_state_progress()
+    {
+        async fn cancel_when_registered(state: &AppState, operation_id: &str) -> bool {
+            for _ in 0..200 {
+                if state.foreground_operation_status(operation_id).is_some() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    return state.cancel_foreground_operation(operation_id);
+                }
+                tokio::task::yield_now().await;
+            }
+            false
+        }
+
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runtime_directory = directory.path().join("runtime");
+        std::fs::create_dir_all(&runtime_directory).expect("runtime directory");
+        let provider_runtime_path = runtime_directory.join("provider-runtime.json");
+        std::fs::write(
+            &provider_runtime_path,
+            br#"{"version":1,"config_generation":7,"states":{"sub-a":"available"}}"#,
+        )
+        .expect("seed provider runtime");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let settings_before = state.settings_view().expect("settings before contention");
+        let provider_before = std::fs::read(&provider_runtime_path).expect("provider before");
+        let generation_before = state.config_generation();
+        assert_eq!(generation_before, 7);
+
+        let mut draft = settings_before.draft.clone();
+        draft.retention_days = draft.retention_days.saturating_add(1);
+        let fingerprint = crate::runtime::settings_request_fingerprint(&draft, None, false, &[])
+            .expect("fingerprint");
+        let preview_request = SettingsPreviewRequest {
+            draft: draft.clone(),
+            credential_intents: Vec::new(),
+            active_outlet_replacement: None,
+            fail_closed_on_removed_active: false,
+            request_fingerprint: fingerprint.clone(),
+        };
+        let apply_request = SettingsApplyRequest {
+            draft,
+            credential_mutations: Vec::new(),
+            active_outlet_replacement: None,
+            fail_closed_on_removed_active: false,
+            preview_fingerprint: fingerprint,
+        };
+
+        // This is the same routing lock awaited by the real preview/apply
+        // command entry functions. Neither command may wait for its ten-second
+        // budget once cancellation is accepted.
+        let routing_guard = state.lock_routing_transaction().await;
+
+        let preview_started = tokio::time::Instant::now();
+        let (preview_result, preview_cancelled) = tokio::join!(
+            preview_settings_inner(
+                &state,
+                &preview_request,
+                "contended-preview",
+                preview_started + Duration::from_secs(10),
+            ),
+            cancel_when_registered(&state, "contended-preview"),
+        );
+        assert!(preview_cancelled, "preview cancellation must be accepted");
+        let Err(preview_error) = preview_result else {
+            panic!("contended preview must not reach authority preflight");
+        };
+        assert!(preview_error.contains("已取消"), "{preview_error}");
+        assert!(
+            preview_started.elapsed() < Duration::from_secs(1),
+            "preview cancellation took {:?}",
+            preview_started.elapsed()
+        );
+
+        let apply_started = tokio::time::Instant::now();
+        let (apply_result, apply_cancelled) = tokio::join!(
+            begin_settings_apply_entry(
+                &state,
+                &apply_request,
+                "contended-apply",
+                apply_started + Duration::from_secs(10),
+            ),
+            cancel_when_registered(&state, "contended-apply"),
+        );
+        assert!(apply_cancelled, "apply cancellation must be accepted");
+        let Err(apply_error) = apply_result else {
+            panic!("contended apply must not reach authority preflight");
+        };
+        assert!(apply_error.contains("已取消"), "{apply_error}");
+        assert!(
+            apply_started.elapsed() < Duration::from_secs(1),
+            "apply cancellation took {:?}",
+            apply_started.elapsed()
+        );
+        drop(routing_guard);
+
+        assert_eq!(state.config_generation(), generation_before);
+        assert_eq!(
+            std::fs::read(&provider_runtime_path).expect("provider after"),
+            provider_before,
+            "cancelled preflight must not clear or rewrite Provider runtime state"
+        );
+        assert_eq!(
+            state.settings_view().expect("settings after contention"),
+            settings_before,
+            "cancelled preflight must not persist candidate settings"
+        );
     }
 
     #[tokio::test]
