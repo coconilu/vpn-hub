@@ -12,8 +12,7 @@ use std::{
 };
 use vpn_hub_helper::{
     AuthorityFileGuard, Command as HelperCommand, InstallationReference, NamedPipeClient,
-    ProcessExclusionCapability, ProtocolKey, RuntimeReply, SupervisorAuthority, TunBackend,
-    WindowsPlanOnlyTunBackend,
+    ProtocolKey, RuntimeReply, SupervisorAuthority,
 };
 
 #[cfg(target_os = "windows")]
@@ -25,8 +24,8 @@ use vpn_hub_core::{
     MASTER_SELECTOR, OutletConfig, OutletConfigSummary, OutletKind, PrivateRoutingConfig,
     ResolvedSubscriptionUrls, RouteDecision, RouteMode, RoutingEngine, RoutingSession,
     RoutingStateError, SafeSettingsView, SecretStore, SelectorNodeSnapshot, SettingsDiff,
-    SettingsDraft, SettingsImpact, SettingsOutletDraft, SubscriptionCredentialStatus,
-    SubscriptionNode, SubscriptionSecrets, SystemDurableFileOps, SystemSecretStore, UDP_SELECTOR,
+    SettingsDraft, SettingsImpact, SubscriptionCredentialStatus, SubscriptionNode,
+    SubscriptionSecrets, SystemDurableFileOps, SystemSecretStore, UDP_SELECTOR,
     UdpCapabilityEvidence, UdpCapabilityMap, UdpProbeTarget, ValidationIssue,
     classify_subscription_udp, durable_atomic_save_with_backup, durable_remove_if_exists,
     durable_replace, durable_write_new, generate_controller_secret, generate_mihomo_config,
@@ -194,72 +193,6 @@ pub struct SettingsPreview {
     pub can_apply: bool,
     pub requires_managed_core_restart: bool,
     pub request_fingerprint: String,
-    pub tun_plan: SafeTunPlanPreview,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[allow(clippy::struct_excessive_bools)]
-pub struct SafeTunPlanPreview {
-    pub requested_enabled: bool,
-    pub active: bool,
-    pub supported: bool,
-    pub consent_required: bool,
-    pub reason_code: &'static str,
-    pub generation: String,
-    pub subscription_outlet_ids: Vec<String>,
-    pub local_outlet_ids: Vec<String>,
-    pub missing_executable_identity_outlet_ids: Vec<String>,
-    pub control_plane_policy: &'static str,
-    pub core_policy: &'static str,
-    pub local_outlet_policy: &'static str,
-    pub leak_matrix_disposition: &'static str,
-}
-
-fn safe_tun_plan_preview(draft: &SettingsDraft, generation: &str) -> SafeTunPlanPreview {
-    let capabilities = WindowsPlanOnlyTunBackend.capabilities();
-    let supported = capabilities.process_exclusion
-        == ProcessExclusionCapability::VerifiedApplicationIdentity
-        && capabilities.ipv4
-        && capabilities.ipv6
-        && capabilities.tcp
-        && capabilities.udp
-        && capabilities.dns_tcp
-        && capabilities.dns_udp
-        && capabilities.durable_snapshot_restore;
-    let mut subscription_outlet_ids = Vec::new();
-    let mut local_outlet_ids = Vec::new();
-    for outlet in &draft.outlets {
-        if !outlet.enabled() {
-            continue;
-        }
-        match outlet {
-            SettingsOutletDraft::Subscription { outlet_id, .. } => {
-                subscription_outlet_ids.push(outlet_id.clone());
-            }
-            SettingsOutletDraft::LocalProxy { outlet_id, .. } => {
-                local_outlet_ids.push(outlet_id.clone());
-            }
-        }
-    }
-    SafeTunPlanPreview {
-        requested_enabled: false,
-        active: false,
-        supported,
-        consent_required: true,
-        reason_code: if supported {
-            "local_executable_identity_registration_required"
-        } else {
-            "windows_verified_application_identity_exclusion_unavailable"
-        },
-        generation: generation.into(),
-        subscription_outlet_ids,
-        missing_executable_identity_outlet_ids: local_outlet_ids.clone(),
-        local_outlet_ids,
-        control_plane_policy: "deny_external_egress_loopback_ipc_only",
-        core_policy: "owned_upstream_only",
-        local_outlet_policy: "registered_executable_identity_only",
-        leak_matrix_disposition: "fail_closed_reject",
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1772,7 +1705,6 @@ impl AppState {
             issues,
             requires_managed_core_restart,
             request_fingerprint: options.request_fingerprint.into(),
-            tun_plan: safe_tun_plan_preview(draft, options.request_fingerprint),
         })
     }
 
@@ -7989,50 +7921,6 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
         assert!(!second.is_finished());
         drop(first);
         assert!(second.await.expect("second caller"));
-    }
-
-    #[test]
-    fn tun_preview_tracks_dynamic_outlets_but_remains_unsupported_and_inactive() {
-        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let directory = tempfile::tempdir().expect("tempdir");
-        let state = AppState::new_for_test(workspace_root, directory.path());
-        let mut draft = state.settings_view().expect("settings").draft;
-        draft.outlets = vec![
-            SettingsOutletDraft::Subscription {
-                outlet_id: "sub-a".into(),
-                label: "Subscription A".into(),
-                enabled: true,
-                provider_update_seconds: 180,
-            },
-            SettingsOutletDraft::LocalProxy {
-                outlet_id: "local-a".into(),
-                label: "Local A".into(),
-                enabled: true,
-                protocol: LocalProxyProtocol::Socks5h,
-                host: "127.0.0.1".into(),
-                port: 45_112,
-            },
-        ];
-        let first = safe_tun_plan_preview(&draft, "generation-a");
-        assert!(!first.supported);
-        assert!(!first.active);
-        assert!(!first.requested_enabled);
-        assert_eq!(first.local_outlet_ids, ["local-a"]);
-        assert_eq!(first.missing_executable_identity_outlet_ids, ["local-a"]);
-
-        draft.outlets.remove(1);
-        draft.outlets.push(SettingsOutletDraft::LocalProxy {
-            outlet_id: "local-b".into(),
-            label: "Local B".into(),
-            enabled: true,
-            protocol: LocalProxyProtocol::Http,
-            host: "::1".into(),
-            port: 45_113,
-        });
-        let second = safe_tun_plan_preview(&draft, "generation-b");
-        assert_eq!(second.local_outlet_ids, ["local-b"]);
-        assert_ne!(first.generation, second.generation);
-        assert_eq!(second.leak_matrix_disposition, "fail_closed_reject");
     }
 
     #[test]

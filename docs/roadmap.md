@@ -34,7 +34,7 @@
 | TUN 计划与恢复 | 计划层完成/真实 backend 阻断 | typed plan、generation/fencing、snapshot → stage → apply → verify → commit journal、失败/崩溃/卸载幂等恢复由 fake backend 验收 |
 | Windows 应用身份排除 | `unsupported` | 官方 Mihomo Windows TUN 字段不能证明按进程排除；在 WFP/ALE adapter 独立安全评审前保持默认关闭和 Fail Closed |
 | Windows release foundation | 安全前置完成/正式发布无条件阻断 | required PR jobs exact-head、双隔离 unsigned dev NSIS、same-run normalized consistency、官方 npm CycloneDX dependency graph、canonical migration contract 已自动化；机器生成的 Authenticode/update-signature/clean-VM attestation verifier、#14 executor 均未具备，Issue #15 保持 open |
-| 桌面入口 | 已接入安全预览 | 设置页显示默认关闭、风险确认禁用原因、动态 outlet 计划 generation 与缺失身份；不会误记为已启用 |
+| 桌面入口 | 已移除 | Issue #43 将不可完成的 TUN 预览从设置页移除；plan-only 基础仍保留，未来只有真实 backend 与隔离验收完成后才能重新进入产品界面 |
 | 真实系统验收 | 待隔离 Windows 环境 | 必须验证 IPv4/IPv6、TCP/UDP/DNS、睡眠/崩溃/断电/卸载恢复，不得在日常开发机执行 |
 
 ## Phase 0 检查表
