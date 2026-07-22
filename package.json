@@ -3,6 +3,8 @@
   "private": true,
   "packageManager": "npm@11.12.1",
   "scripts": {
-    "build": "npm --prefix apps/desktop run tauri -- build --bundles nsis"
+    "build": "npm --prefix apps/desktop run tauri -- build --bundles nsis",
+    "check:generic-client-names": "node scripts/check-generic-client-names.mjs",
+    "check:markdown-links": "node scripts/check-markdown-links.mjs"
   }
 }

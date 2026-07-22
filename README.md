@@ -46,7 +46,7 @@ flowchart LR
 | [Issue #29 订阅节点选择](docs/issue-29-subscription-node-selection.md) | Mihomo 订阅节点的运行时读取、搜索、手动选择与隐私边界 |
 | [Issue #5 动态多出口隔离故障验收](docs/issue-5-dynamic-fault-acceptance.md) | 随机端口、多订阅/本地出口故障、恢复阈值与 all-down 证据 |
 | [Issue #14 可选 TUN 与回滚](docs/issue-14-dynamic-tun.md) | Windows 能力门禁、进程身份策略、事务 journal、DNS/路由恢复与隔离验收缺口 |
-| [兼容性实测](docs/compatibility/2026-07-18-chaoshihui.md) | 本地客户端 A 使用 `16666` 的首轮验证证据 |
+| [兼容性实测](docs/compatibility/2026-07-18-local-client.md) | 本地客户端 A 使用 `16666` 的首轮验证证据 |
 | [Mihomo 链路实测](docs/compatibility/2026-07-18-mihomo-chain.md) | `36666 → Mihomo → 16666` 的隔离验证证据 |
 | [Issue #3 Controller 实测](docs/compatibility/2026-07-18-issue-3-local-controller.md) | 初始 REJECT、真实选择器和 `36666 → 16666` HTTPS 证据 |
 | [桌面 UI 设计系统](docs/desktop-design-system.md) | 视觉概念、正确端口值、组件和响应式约束 |

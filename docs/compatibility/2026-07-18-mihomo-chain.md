@@ -19,7 +19,7 @@
 ```text
 显式 curl → 127.0.0.1:36666 (Mihomo)
           → OUT-LOCAL-A
-          → 127.0.0.1:16666 (chaoshihuiCore)
+          → 127.0.0.1:16666 (Local client A core)
 ```
 
 | 验证 | 结果 |
@@ -28,7 +28,7 @@
 | 国内 HTTPS 目标 | HTTP 200，约 81ms |
 | 海外探测目标 | TLS 连接超时，与直接通过 `16666` 的结果一致 |
 | Windows 系统代理 | 全程保持 `127.0.0.1:6666` |
-| `6666` 所有者 | 测试前后均为原 `SpeedCatCore.exe` PID |
+| `6666` 所有者 | 测试前后均为原 Local client B core PID |
 | 开发实例停止 | Ctrl+C 正常关闭，`36666` 随后释放 |
 | 第三方客户端 | `16666` 与 `6666` 全程保持监听 |
 
@@ -38,8 +38,8 @@
 
 | 入口 | 进程 |
 |---|---|
-| `127.0.0.1:6666` | `SpeedCatCore.exe` |
-| `127.0.0.1:16666` | `chaoshihuiCore.exe` |
+| `127.0.0.1:6666` | Local client B core |
+| `127.0.0.1:16666` | Local client A core |
 | `127.0.0.1:36666` | 本应用启动的官方 Mihomo v1.19.28 |
 
 使用 `curl.exe --proxy socks5h://127.0.0.1:<port>` 对 `16666` 和 `36666` 进行同目标对照，结果如下：
