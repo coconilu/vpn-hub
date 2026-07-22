@@ -4,6 +4,9 @@ import { consumeSettingsPreviewTicket, settingsRequestFingerprint } from "./sett
 import type {
   CoreStatus,
   DashboardSnapshot,
+  EntrySwitchApplyRequest,
+  EntrySwitchApplyResult,
+  EntrySwitchPreview,
   HistoryExport,
   HistoryFilter,
   HistoryResponse,
@@ -69,6 +72,7 @@ let browserSettings: SafeSettingsView = {
 };
 let browserSettingsTerminalStatus: SettingsTerminalStatus = { active: false, state: null };
 let browserSettingsPreviewTicket: string | null = null;
+let browserEntrySwitchAuthorization: string | null = null;
 
 function browserSettingsDiff(
   draft: SettingsDraft,
@@ -259,6 +263,79 @@ export async function setHistoryRetention(days: number): Promise<number> {
 export async function getSettings(): Promise<SafeSettingsView> {
   if (!isTauriRuntime()) return structuredClone(browserSettings);
   return invoke<SafeSettingsView>("get_settings");
+}
+
+export async function previewEntrySwitch(
+  target: { host: string; port: number },
+  applySystemProxy: boolean,
+  confirmed: boolean,
+): Promise<EntrySwitchPreview> {
+  if (!isTauriRuntime()) {
+    const current = structuredClone(browserSettings.draft.entry);
+    const host = target.host.toLowerCase() === "localhost" ? "127.0.0.1" : target.host;
+    const parts = host.split(".").map(Number);
+    const loopback = host === "::1" || host === "[::1]"
+      || (/^127(?:\.\d{1,3}){3}$/.test(host)
+        && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255));
+    const issues: ValidationIssue[] = [];
+    if (!loopback || !Number.isInteger(target.port) || target.port < 1 || target.port > 65535) {
+      issues.push({ field: "entry", code: "invalid_entry_target", message: "入口只能使用合法的显式 loopback 地址与端口。" });
+    }
+    if (current.host === target.host && current.port === target.port) {
+      issues.push({ field: "entry", code: "entry_unchanged", message: "目标入口与当前入口相同。" });
+    }
+    if (!confirmed) {
+      issues.push({ field: "entry", code: "confirmation_required", message: "请确认理解切换顺序和回滚边界。" });
+    }
+    if (!browserSnapshot.mihomo.managed || browserSnapshot.mihomo.pid === null) {
+      issues.push({ field: "runtime", code: "owned_core_required", message: "请先启动 VPN Hub 自管核心。" });
+    }
+    browserEntrySwitchAuthorization = issues.length === 0
+      ? `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`
+      : null;
+    return {
+      current,
+      target: structuredClone(target),
+      apply_system_proxy: applySystemProxy,
+      can_execute: issues.length === 0,
+      issues,
+      authorization: browserEntrySwitchAuthorization,
+      expires_at_unix_ms: browserEntrySwitchAuthorization ? Date.now() + 120_000 : null,
+    };
+  }
+  return invoke<EntrySwitchPreview>("preview_entry_switch", {
+    target,
+    applySystemProxy,
+    confirmed,
+  });
+}
+
+export async function applyEntrySwitch(
+  request: EntrySwitchApplyRequest,
+): Promise<EntrySwitchApplyResult> {
+  if (!isTauriRuntime()) {
+    if (!browserEntrySwitchAuthorization
+      || request.authorization !== browserEntrySwitchAuthorization) {
+      throw new Error("入口切换授权不存在、已过期或已被使用，请重新预览。");
+    }
+    browserEntrySwitchAuthorization = null;
+    const previous = structuredClone(browserSettings.draft.entry);
+    browserSettings.draft.entry = structuredClone(request.target);
+    browserSnapshot.entry = {
+      host: request.target.host,
+      port: request.target.port,
+      reachable: true,
+      owner_pid: browserSnapshot.mihomo.pid,
+    };
+    return {
+      settings: structuredClone(browserSettings),
+      previous_entry: previous,
+      current_entry: structuredClone(request.target),
+      system_proxy_applied: request.apply_system_proxy,
+      managed_core_restarted: true,
+    };
+  }
+  return invoke<EntrySwitchApplyResult>("apply_entry_switch", { request });
 }
 
 export async function getSettingsTerminalStatus(): Promise<SettingsTerminalStatus> {

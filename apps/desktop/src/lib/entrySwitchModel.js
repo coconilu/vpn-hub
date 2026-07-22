@@ -14,13 +14,9 @@ export function buildEntrySwitchFoundationPreview(current, target, applySystemPr
     issues.push({ code: "entry_unchanged", message: "目标入口与当前入口相同。" });
   }
   if (!confirmed) issues.push({ code: "confirmation_required", message: "请确认理解切换顺序和回滚边界。" });
-  issues.push({
-    code: "isolated_acceptance_pending",
-    message: "真实端口 ownership 与 WinINet 系统代理尚待隔离 Windows 验收；当前版本不会执行切换。",
-  });
   return {
     apply_system_proxy: applySystemProxy,
-    executable: false,
+    executable: issues.length === 0,
     issues,
     steps: [
       "取得交互用户 authority，并校验一次性 consent、配置代际与快照指纹",
@@ -28,7 +24,7 @@ export function buildEntrySwitchFoundationPreview(current, target, applySystemPr
       "验证 Controller ownership、全部启用出口与 Fail Closed",
       "提交应用入口；旧入口在此之前保持不变",
       applySystemProxy
-        ? "使用非原子的 query → compare → WinINet apply 并回读验证；竞争窗口解决前不会开放真实执行"
+        ? "使用 query → compare → WinINet apply 并立即回读；检测到并发修改时回滚且不覆盖第三方新值"
         : "不调用任何系统代理 backend",
     ],
   };

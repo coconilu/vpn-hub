@@ -352,3 +352,27 @@ export interface SettingsApplyResult {
   removed_history_rows: number;
   managed_core_restarted: boolean;
 }
+
+export interface EntrySwitchPreview {
+  current: { host: string; port: number };
+  target: { host: string; port: number };
+  apply_system_proxy: boolean;
+  can_execute: boolean;
+  issues: ValidationIssue[];
+  authorization: string | null;
+  expires_at_unix_ms: number | null;
+}
+
+export interface EntrySwitchApplyRequest {
+  target: { host: string; port: number };
+  apply_system_proxy: boolean;
+  authorization: string;
+}
+
+export interface EntrySwitchApplyResult {
+  settings: SafeSettingsView;
+  previous_entry: { host: string; port: number };
+  current_entry: { host: string; port: number };
+  system_proxy_applied: boolean;
+  managed_core_restarted: boolean;
+}

@@ -16,6 +16,8 @@ use vpn_hub_helper::{
     WindowsPlanOnlyTunBackend,
 };
 
+#[cfg(target_os = "windows")]
+use crate::entry_switch_windows::ProtectedProxySnapshotWire;
 use serde::{Deserialize, Serialize};
 use vpn_hub_core::{
     ControllerClient, ControllerError, CredentialState, DurableFileOps, EntryConfig,
@@ -266,6 +268,101 @@ pub struct SettingsApplyResult {
     pub diff: SettingsDiff,
     pub removed_history_rows: u64,
     pub managed_core_restarted: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EntrySwitchPreview {
+    pub current: EntryConfig,
+    pub target: EntryConfig,
+    pub apply_system_proxy: bool,
+    pub can_execute: bool,
+    pub issues: Vec<ValidationIssue>,
+    pub authorization: Option<String>,
+    pub expires_at_unix_ms: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct EntrySwitchApplyRequest {
+    pub target: EntryConfig,
+    pub apply_system_proxy: bool,
+    pub authorization: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EntrySwitchApplyResult {
+    pub settings: SafeSettingsView,
+    pub previous_entry: EntryConfig,
+    pub current_entry: EntryConfig,
+    pub system_proxy_applied: bool,
+    pub managed_core_restarted: bool,
+}
+
+struct EntrySwitchTicket {
+    authorization: String,
+    current: EntryConfig,
+    target: EntryConfig,
+    apply_system_proxy: bool,
+    settings_fingerprint: String,
+    expires_at_unix_ms: i64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum EntrySwitchCheck {
+    Passed,
+    Failed,
+}
+
+impl EntrySwitchCheck {
+    fn failed(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
+impl From<bool> for EntrySwitchCheck {
+    fn from(value: bool) -> Self {
+        if value { Self::Passed } else { Self::Failed }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct EntrySwitchPreviewChecks {
+    pub(crate) confirmed: EntrySwitchCheck,
+    pub(crate) managed_core_ready: EntrySwitchCheck,
+    pub(crate) target_available: EntrySwitchCheck,
+    pub(crate) proxy_scope_supported: EntrySwitchCheck,
+}
+
+#[derive(Clone, Copy)]
+struct SettingsEvaluationOptions<'a> {
+    active_outlet_replacement: Option<&'a str>,
+    fail_closed_on_removed_active: bool,
+    request_fingerprint: &'a str,
+    managed_core_running: bool,
+    allow_entry_switch: bool,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum EntrySwitchRuntimePhase {
+    Prepared,
+    SettingsPending,
+    RuntimeVerified,
+    ProxyApplyPending,
+    ProxyApplied,
+    CommitDecided,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Serialize, Deserialize)]
+pub(crate) struct EntrySwitchRuntimeJournal {
+    pub(crate) version: u32,
+    pub(crate) transaction_id: String,
+    pub(crate) phase: EntrySwitchRuntimePhase,
+    pub(crate) original_entry: EntryConfig,
+    pub(crate) target_entry: EntryConfig,
+    pub(crate) original_proxy: Option<ProtectedProxySnapshotWire>,
+    pub(crate) desired_proxy: Option<ProtectedProxySnapshotWire>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -619,6 +716,7 @@ pub struct AppState {
     managed_core: Mutex<Option<ManagedCore>>,
     routing_engine: Mutex<RoutingEngine>,
     settings_preview_ticket: Mutex<Option<String>>,
+    entry_switch_ticket: Mutex<Option<EntrySwitchTicket>>,
     routing_transaction: RoutingTransaction,
     settings_apply_transaction: RoutingTransaction,
     settings_terminal: Mutex<Option<SettingsTerminalState>>,
@@ -972,6 +1070,41 @@ fn select_supervisor_route_with_program_data(
     }
 }
 
+fn load_settings_terminal_state(
+    runtime_directory: &Path,
+    initialization_error: &mut Option<String>,
+) -> Option<SettingsTerminalState> {
+    if let Ok(state) = read_settings_terminal_gate(runtime_directory) {
+        state
+    } else {
+        initialization_error.get_or_insert_with(|| {
+            "设置 terminal 安全门损坏；自动路由保持 Fail Closed，等待显式恢复".into()
+        });
+        Some(SettingsTerminalState::FailClosedUnconfirmed)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn recover_entry_switch_at_startup(
+    runtime_directory: &Path,
+    private_config_path: &Path,
+    initialization_error: &mut Option<String>,
+) {
+    if let Err(error) = recover_entry_switch_runtime_journal(runtime_directory, private_config_path)
+    {
+        initialization_error
+            .get_or_insert_with(|| format!("入口切换事务恢复失败；核心保持 Fail Closed：{error}"));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn recover_entry_switch_at_startup(
+    _runtime_directory: &Path,
+    _private_config_path: &Path,
+    _initialization_error: &mut Option<String>,
+) {
+}
+
 impl AppState {
     #[must_use]
     pub fn new() -> Self {
@@ -995,14 +1128,8 @@ impl AppState {
         if cleanup_stale_settings_validation_directories(&runtime_directory).is_err() {
             initialization_error.get_or_insert_with(|| "无法清理遗留的隔离设置验证目录".into());
         }
-        let settings_terminal = if let Ok(state) = read_settings_terminal_gate(&runtime_directory) {
-            state
-        } else {
-            initialization_error.get_or_insert_with(|| {
-                "设置 terminal 安全门损坏；自动路由保持 Fail Closed，等待显式恢复".into()
-            });
-            Some(SettingsTerminalState::FailClosedUnconfirmed)
-        };
+        let settings_terminal =
+            load_settings_terminal_state(&runtime_directory, &mut initialization_error);
         let guardian_config_path = guardian_override
             .unwrap_or_else(|| prepare_local_guardian_config(data_directory, &workspace_root));
         let private_config_path = data_directory.join("private-routing.toml");
@@ -1043,6 +1170,11 @@ impl AppState {
             None
         };
         let _ = harden_private_config_files(&private_config_path);
+        recover_entry_switch_at_startup(
+            &runtime_directory,
+            &private_config_path,
+            &mut initialization_error,
+        );
         let supervisor_route = select_supervisor_route(data_directory, secret_store.as_ref());
         if matches!(supervisor_route, SupervisorRoute::FailClosed) {
             initialization_error.get_or_insert_with(|| {
@@ -1068,6 +1200,7 @@ impl AppState {
             managed_core: Mutex::new(None),
             routing_engine: Mutex::new(routing_engine),
             settings_preview_ticket: Mutex::new(None),
+            entry_switch_ticket: Mutex::new(None),
             routing_transaction: RoutingTransaction::default(),
             settings_apply_transaction: RoutingTransaction::default(),
             settings_terminal: Mutex::new(settings_terminal),
@@ -1315,10 +1448,13 @@ impl AppState {
         let preview = self.evaluate_settings(
             &request.draft,
             &request.credential_intents,
-            request.active_outlet_replacement.as_deref(),
-            request.fail_closed_on_removed_active,
-            &fingerprint,
-            managed_core_running,
+            SettingsEvaluationOptions {
+                active_outlet_replacement: request.active_outlet_replacement.as_deref(),
+                fail_closed_on_removed_active: request.fail_closed_on_removed_active,
+                request_fingerprint: &fingerprint,
+                managed_core_running,
+                allow_entry_switch: false,
+            },
         )?;
         *self
             .settings_preview_ticket
@@ -1328,14 +1464,232 @@ impl AppState {
         Ok(preview)
     }
 
+    #[cfg(target_os = "windows")]
+    pub(crate) fn prepare_entry_switch_runtime_journal(
+        &self,
+        original_entry: EntryConfig,
+        target_entry: EntryConfig,
+        original_proxy: Option<ProtectedProxySnapshotWire>,
+        desired_proxy: Option<ProtectedProxySnapshotWire>,
+    ) -> Result<EntrySwitchRuntimeJournal, String> {
+        if original_proxy.is_some() != desired_proxy.is_some() {
+            return Err("入口切换系统代理快照不完整".into());
+        }
+        let journal = EntrySwitchRuntimeJournal {
+            version: 1,
+            transaction_id: generate_controller_secret()[..16].to_string(),
+            phase: EntrySwitchRuntimePhase::Prepared,
+            original_entry,
+            target_entry,
+            original_proxy,
+            desired_proxy,
+        };
+        write_entry_switch_runtime_journal(&self.runtime_directory, &journal)?;
+        Ok(journal)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn set_entry_switch_runtime_phase(
+        &self,
+        journal: &mut EntrySwitchRuntimeJournal,
+        phase: EntrySwitchRuntimePhase,
+    ) -> Result<(), String> {
+        journal.phase = phase;
+        write_entry_switch_runtime_journal(&self.runtime_directory, journal)
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn clear_entry_switch_runtime_journal(&self) -> Result<(), String> {
+        clear_entry_switch_runtime_journal(&self.runtime_directory)
+    }
+
+    fn entry_switch_preflight_issues(
+        &self,
+        current: &EntryConfig,
+        target: &EntryConfig,
+        apply_system_proxy: bool,
+        checks: EntrySwitchPreviewChecks,
+    ) -> Vec<ValidationIssue> {
+        let mut issues = Vec::new();
+        if normalize_loopback_host(&target.host).is_none() || target.port == 0 {
+            issues.push(ValidationIssue::new(
+                "entry",
+                "invalid_entry_target",
+                "入口只能使用合法的显式 loopback 地址与 1–65535 端口",
+            ));
+        }
+        if target == current {
+            issues.push(ValidationIssue::new(
+                "entry",
+                "entry_unchanged",
+                "目标入口与当前入口相同",
+            ));
+        }
+        if checks.confirmed.failed() {
+            issues.push(ValidationIssue::new(
+                "entry",
+                "confirmation_required",
+                "请确认只有 Controller、出口和 Fail Closed 全部通过后才提交入口",
+            ));
+        }
+        if checks.managed_core_ready.failed() {
+            issues.push(ValidationIssue::new(
+                "runtime",
+                "owned_core_required",
+                "安全入口切换要求当前 VPN Hub 自管核心及受鉴权 Controller 可验证",
+            ));
+        }
+        if checks.target_available.failed() {
+            issues.push(ValidationIssue::new(
+                "entry",
+                "target_port_occupied",
+                "目标端口已被占用；不会停止或接管未知及第三方进程",
+            ));
+        }
+        if self.uses_helper_authority() {
+            issues.push(ValidationIssue::new(
+                "runtime",
+                "desktop_authority_required",
+                "当前入口切换仅支持 desktop-owned 核心；不会绕过 Helper 部署权限",
+            ));
+        }
+        if apply_system_proxy && checks.proxy_scope_supported.failed() {
+            issues.push(ValidationIssue::new(
+                "system_proxy",
+                "unsupported_proxy_scope",
+                "当前 Windows 会话或 default-LAN 系统代理范围不支持安全切换",
+            ));
+        }
+        issues
+    }
+
+    pub fn prepare_entry_switch_preview(
+        &self,
+        target: EntryConfig,
+        apply_system_proxy: bool,
+        checks: EntrySwitchPreviewChecks,
+    ) -> Result<EntrySwitchPreview, String> {
+        let current = self.private_config()?.entry;
+        let mut issues =
+            self.entry_switch_preflight_issues(&current, &target, apply_system_proxy, checks);
+
+        let mut draft = self.settings_view()?.draft;
+        draft.entry = target.clone();
+        let fingerprint = settings_request_fingerprint(&draft, None, false, &[])?;
+        let settings_preview = self.evaluate_settings(
+            &draft,
+            &[],
+            SettingsEvaluationOptions {
+                active_outlet_replacement: None,
+                fail_closed_on_removed_active: false,
+                request_fingerprint: &fingerprint,
+                managed_core_running: !checks.managed_core_ready.failed(),
+                allow_entry_switch: true,
+            },
+        )?;
+        issues.extend(settings_preview.issues);
+        let can_execute = issues.is_empty()
+            && settings_preview
+                .diff
+                .changes
+                .iter()
+                .all(|change| change.code == "entry_changed");
+        let (authorization, expires_at_unix_ms) = if can_execute {
+            let authorization = generate_controller_secret();
+            let expires_at = chrono::Utc::now()
+                .timestamp_millis()
+                .checked_add(120_000)
+                .ok_or_else(|| "无法签发有界入口切换授权".to_string())?;
+            *self
+                .settings_preview_ticket
+                .lock()
+                .map_err(|_| "设置预览状态锁已损坏".to_string())? = Some(fingerprint.clone());
+            *self
+                .entry_switch_ticket
+                .lock()
+                .map_err(|_| "入口切换授权状态锁已损坏".to_string())? = Some(EntrySwitchTicket {
+                authorization: authorization.clone(),
+                current: current.clone(),
+                target: target.clone(),
+                apply_system_proxy,
+                settings_fingerprint: fingerprint,
+                expires_at_unix_ms: expires_at,
+            });
+            (Some(authorization), Some(expires_at))
+        } else {
+            if let Ok(mut ticket) = self.entry_switch_ticket.lock() {
+                *ticket = None;
+            }
+            (None, None)
+        };
+        Ok(EntrySwitchPreview {
+            current,
+            target,
+            apply_system_proxy,
+            can_execute,
+            issues,
+            authorization,
+            expires_at_unix_ms,
+        })
+    }
+
+    pub fn consume_entry_switch_ticket(
+        &self,
+        request: &EntrySwitchApplyRequest,
+    ) -> Result<String, String> {
+        let ticket = self
+            .entry_switch_ticket
+            .lock()
+            .map_err(|_| "入口切换授权状态锁已损坏".to_string())?
+            .take()
+            .ok_or_else(|| "入口切换授权不存在或已被使用，请重新预览".to_string())?;
+        let current = self.private_config()?.entry;
+        if chrono::Utc::now().timestamp_millis() > ticket.expires_at_unix_ms
+            || ticket.authorization != request.authorization
+            || ticket.current != current
+            || ticket.target != request.target
+            || ticket.apply_system_proxy != request.apply_system_proxy
+        {
+            return Err("入口切换授权已过期、失效或与请求不匹配，请重新预览".into());
+        }
+        Ok(ticket.settings_fingerprint)
+    }
+
+    pub fn apply_entry_switch_settings_deferred(
+        &self,
+        target: EntryConfig,
+        preview_fingerprint: String,
+    ) -> Result<DeferredSettingsApply, String> {
+        let mut draft = self.settings_view()?.draft;
+        draft.entry = target;
+        let request = SettingsApplyRequest {
+            draft,
+            credential_mutations: Vec::new(),
+            active_outlet_replacement: None,
+            fail_closed_on_removed_active: false,
+            preview_fingerprint,
+        };
+        let previous_routing = self
+            .routing_engine
+            .lock()
+            .map_err(|_| "路由策略状态锁已损坏".to_string())?
+            .clone();
+        let (result, pending) = self.apply_settings_inner(request, true, true)?;
+        let transaction_id = pending
+            .map(|journal| journal.transaction_id)
+            .ok_or_else(|| "入口切换设置事务未进入运行时验证阶段".to_string())?;
+        Ok(DeferredSettingsApply {
+            result,
+            transaction_id,
+            previous_routing,
+        })
+    }
+
     fn evaluate_settings(
         &self,
         draft: &SettingsDraft,
         credential_intents: &[CredentialMutationIntent],
-        active_outlet_replacement: Option<&str>,
-        fail_closed_on_removed_active: bool,
-        request_fingerprint: &str,
-        managed_core_running: bool,
+        options: SettingsEvaluationOptions<'_>,
     ) -> Result<SettingsPreview, String> {
         let current = self.private_config()?;
         let guardian = GuardianConfig::load(&self.guardian_config_path)
@@ -1363,7 +1717,7 @@ impl AppState {
             }
         };
         if let Some(candidate) = candidate.as_ref() {
-            if candidate.entry != current.entry {
+            if candidate.entry != current.entry && !options.allow_entry_switch {
                 issues.push(ValidationIssue::new(
                     "entry",
                     "dedicated_entry_switch_required",
@@ -1382,8 +1736,8 @@ impl AppState {
             let _ = settings_routing_action(
                 candidate,
                 current_active.as_deref(),
-                active_outlet_replacement,
-                fail_closed_on_removed_active,
+                options.active_outlet_replacement,
+                options.fail_closed_on_removed_active,
                 &mut issues,
             );
             validate_credential_intents(candidate, credential_intents, &mut issues);
@@ -1396,15 +1750,15 @@ impl AppState {
             }
         }
         let requires_managed_core_restart =
-            managed_core_running && diff.requires_managed_core_reload();
+            options.managed_core_running && diff.requires_managed_core_reload();
         Ok(SettingsPreview {
             can_apply: issues.is_empty()
                 && (!diff.changes.is_empty() || !credential_intents.is_empty()),
             diff,
             issues,
             requires_managed_core_restart,
-            request_fingerprint: request_fingerprint.into(),
-            tun_plan: safe_tun_plan_preview(draft, request_fingerprint),
+            request_fingerprint: options.request_fingerprint.into(),
+            tun_plan: safe_tun_plan_preview(draft, options.request_fingerprint),
         })
     }
 
@@ -1413,7 +1767,7 @@ impl AppState {
         &self,
         request: SettingsApplyRequest,
     ) -> Result<SettingsApplyResult, String> {
-        self.apply_settings_inner(request, false)
+        self.apply_settings_inner(request, false, false)
             .map(|(result, _)| result)
     }
 
@@ -1427,7 +1781,7 @@ impl AppState {
             .lock()
             .map_err(|_| "路由策略状态锁已损坏".to_string())?
             .clone();
-        let (result, pending) = self.apply_settings_inner(request, true)?;
+        let (result, pending) = self.apply_settings_inner(request, true, false)?;
         let transaction_id = pending
             .map(|journal| journal.transaction_id)
             .ok_or_else(|| "设置事务未进入运行时验证阶段".to_string())?;
@@ -1789,10 +2143,13 @@ impl AppState {
         let preview = self.evaluate_settings(
             &request.draft,
             &credential_intents,
-            request.active_outlet_replacement.as_deref(),
-            request.fail_closed_on_removed_active,
-            &fingerprint,
-            managed_core_running,
+            SettingsEvaluationOptions {
+                active_outlet_replacement: request.active_outlet_replacement.as_deref(),
+                fail_closed_on_removed_active: request.fail_closed_on_removed_active,
+                request_fingerprint: &fingerprint,
+                managed_core_running,
+                allow_entry_switch: false,
+            },
         )?;
         if !preview.issues.is_empty() {
             return Err(format!(
@@ -1858,6 +2215,7 @@ impl AppState {
         &self,
         request: SettingsApplyRequest,
         defer_runtime_validation: bool,
+        allow_entry_switch: bool,
     ) -> Result<(SettingsApplyResult, Option<SettingsTransactionJournal>), String> {
         let SettingsApplyRequest {
             draft,
@@ -1904,13 +2262,17 @@ impl AppState {
         let preview = self.evaluate_settings(
             &draft,
             &credential_intents,
-            active_outlet_replacement.as_deref(),
-            fail_closed_on_removed_active,
-            &fingerprint,
-            self.managed_core
-                .lock()
-                .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?
-                .is_some(),
+            SettingsEvaluationOptions {
+                active_outlet_replacement: active_outlet_replacement.as_deref(),
+                fail_closed_on_removed_active,
+                request_fingerprint: &fingerprint,
+                managed_core_running: self
+                    .managed_core
+                    .lock()
+                    .map_err(|_| "Mihomo 进程状态锁已损坏".to_string())?
+                    .is_some(),
+                allow_entry_switch,
+            },
         )?;
         if !preview.issues.is_empty() {
             return Err(format!(
@@ -1930,7 +2292,7 @@ impl AppState {
         let candidate = draft
             .private_candidate(&current)
             .map_err(|_| "设置候选在提交前校验失败".to_string())?;
-        if candidate.entry != current.entry {
+        if candidate.entry != current.entry && !allow_entry_switch {
             return Err("统一入口只能通过专用安全切换事务修改；普通设置已拒绝该变更".into());
         }
         let current_active = self
@@ -4116,6 +4478,138 @@ fn clear_settings_terminal_gate(runtime_directory: &Path) -> Result<(), String> 
 
 fn settings_transaction_directory(runtime_directory: &Path, transaction_id: &str) -> PathBuf {
     runtime_directory.join(format!("settings-transaction-{transaction_id}"))
+}
+
+#[cfg(target_os = "windows")]
+fn entry_switch_runtime_journal_path(runtime_directory: &Path) -> PathBuf {
+    runtime_directory.join("entry-switch-runtime.bin")
+}
+
+#[cfg(target_os = "windows")]
+fn entry_switch_runtime_journal_backup_path(runtime_directory: &Path) -> PathBuf {
+    runtime_directory.join("entry-switch-runtime.bin.bak")
+}
+
+#[cfg(target_os = "windows")]
+fn write_entry_switch_runtime_journal(
+    runtime_directory: &Path,
+    journal: &EntrySwitchRuntimeJournal,
+) -> Result<(), String> {
+    let plaintext =
+        serde_json::to_vec(journal).map_err(|_| "无法序列化入口切换事务日志".to_string())?;
+    let protected = vpn_hub_windows_security::protect_current_user_data(
+        &plaintext,
+        b"vpn-hub-entry-switch-runtime-v1",
+    )
+    .map_err(|_| "无法使用当前用户 DPAPI 保护入口切换事务日志".to_string())?;
+    let path = entry_switch_runtime_journal_path(runtime_directory);
+    durable_atomic_save_with_backup(&path, &protected, &SystemDurableFileOps)
+        .map_err(|_| "无法持久化入口切换事务日志".to_string())?;
+    harden_private_path(&path)?;
+    harden_private_path(&entry_switch_runtime_journal_backup_path(runtime_directory))
+}
+
+#[cfg(target_os = "windows")]
+fn read_entry_switch_runtime_journal(
+    runtime_directory: &Path,
+) -> Result<Option<EntrySwitchRuntimeJournal>, String> {
+    let primary = entry_switch_runtime_journal_path(runtime_directory);
+    let backup = entry_switch_runtime_journal_backup_path(runtime_directory);
+    if !primary.exists() && !backup.exists() {
+        return Ok(None);
+    }
+    for path in [primary, backup] {
+        let Ok(protected) = fs::read(&path) else {
+            continue;
+        };
+        if protected.len() > 1024 * 1024 {
+            continue;
+        }
+        let Ok(plaintext) = vpn_hub_windows_security::unprotect_current_user_data(
+            &protected,
+            b"vpn-hub-entry-switch-runtime-v1",
+        ) else {
+            continue;
+        };
+        let Ok(journal) = serde_json::from_slice::<EntrySwitchRuntimeJournal>(&plaintext) else {
+            continue;
+        };
+        let valid_id = journal.transaction_id.len() == 16
+            && journal
+                .transaction_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit());
+        let valid_entries = normalize_loopback_host(&journal.original_entry.host).is_some()
+            && journal.original_entry.port > 0
+            && normalize_loopback_host(&journal.target_entry.host).is_some()
+            && journal.target_entry.port > 0
+            && journal.original_entry != journal.target_entry
+            && journal.original_proxy.is_some() == journal.desired_proxy.is_some();
+        if journal.version == 1 && valid_id && valid_entries {
+            return Ok(Some(journal));
+        }
+    }
+    Err("入口切换事务日志不存在有效的 DPAPI 主副本".into())
+}
+
+#[cfg(target_os = "windows")]
+fn clear_entry_switch_runtime_journal(runtime_directory: &Path) -> Result<(), String> {
+    for path in [
+        entry_switch_runtime_journal_path(runtime_directory),
+        entry_switch_runtime_journal_backup_path(runtime_directory),
+        runtime_directory.join("entry-switch-runtime.bin.new"),
+        runtime_directory.join("entry-switch-runtime.bin.bak.new"),
+    ] {
+        durable_remove_if_exists(&path, &SystemDurableFileOps)
+            .map_err(|_| "无法持久化清除入口切换事务日志".to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn recover_entry_switch_runtime_journal(
+    runtime_directory: &Path,
+    private_config_path: &Path,
+) -> Result<(), String> {
+    let Some(journal) = read_entry_switch_runtime_journal(runtime_directory)? else {
+        return Ok(());
+    };
+    let current_entry = PrivateRoutingConfig::load(private_config_path)
+        .map_err(|_| "无法读取入口切换恢复后的私密配置".to_string())?
+        .entry;
+    if current_entry == journal.original_entry {
+        if let (Some(original), Some(desired)) = (&journal.original_proxy, &journal.desired_proxy) {
+            let observed = crate::entry_switch_windows::snapshot_current_user_proxy()?;
+            if observed == *desired
+                && !crate::entry_switch_windows::compare_then_apply_proxy(desired, original)?
+            {
+                return Err("系统代理仍属于未完成入口事务，但恢复回读失败".into());
+            }
+            // A third value belongs to a concurrent user/application change.
+            // The app-owned config is already rolled back, so never overwrite it.
+        }
+        return clear_entry_switch_runtime_journal(runtime_directory);
+    }
+    if current_entry == journal.target_entry {
+        if let Some(desired) = &journal.desired_proxy {
+            let observed = crate::entry_switch_windows::snapshot_current_user_proxy()?;
+            if observed != *desired {
+                return Err(
+                    "入口已提交，但 Windows 系统代理不是本事务的目标值；拒绝覆盖并保留恢复日志"
+                        .into(),
+                );
+            }
+        }
+        if !matches!(
+            journal.phase,
+            EntrySwitchRuntimePhase::ProxyApplied | EntrySwitchRuntimePhase::CommitDecided
+        ) && journal.desired_proxy.is_some()
+        {
+            return Err("入口提交与系统代理事务阶段不一致；拒绝自动前滚".into());
+        }
+        return clear_entry_switch_runtime_journal(runtime_directory);
+    }
+    Err("入口配置已被第三方或并发事务修改；拒绝自动覆盖并保留恢复日志".into())
 }
 
 fn settings_validation_directory(runtime_directory: &Path, transaction_id: &str) -> PathBuf {
@@ -8359,5 +8853,90 @@ probe_targets = ["https://example.com/a", "https://example.com/b"]
             .expect("process ownership check")
             .success();
         assert!(!still_running, "dropped pending child must not survive");
+    }
+
+    #[test]
+    fn entry_switch_authorization_is_exact_bounded_and_one_shot() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let mut config = state.private_config().expect("private config");
+        config.outlets.push(OutletConfig {
+            id: "local-test".into(),
+            label: "Local test".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "socks5h://127.0.0.1:26666".into(),
+            },
+        });
+        config
+            .save(state.private_config_path_for_test())
+            .expect("valid private config");
+        let current = config.entry;
+        let target = EntryConfig {
+            host: "127.0.0.1".into(),
+            port: current.port.saturating_add(101),
+        };
+        let preview = state
+            .prepare_entry_switch_preview(
+                target.clone(),
+                true,
+                EntrySwitchPreviewChecks {
+                    confirmed: EntrySwitchCheck::Passed,
+                    managed_core_ready: EntrySwitchCheck::Passed,
+                    target_available: EntrySwitchCheck::Passed,
+                    proxy_scope_supported: EntrySwitchCheck::Passed,
+                },
+            )
+            .expect("entry preview");
+        assert!(preview.can_execute, "issues: {:?}", preview.issues);
+        let authorization = preview.authorization.expect("authorization");
+        let request = EntrySwitchApplyRequest {
+            target: target.clone(),
+            apply_system_proxy: true,
+            authorization,
+        };
+        assert!(state.consume_entry_switch_ticket(&request).is_ok());
+        assert!(state.consume_entry_switch_ticket(&request).is_err());
+
+        let mismatch = state
+            .prepare_entry_switch_preview(
+                target.clone(),
+                false,
+                EntrySwitchPreviewChecks {
+                    confirmed: EntrySwitchCheck::Passed,
+                    managed_core_ready: EntrySwitchCheck::Passed,
+                    target_available: EntrySwitchCheck::Passed,
+                    proxy_scope_supported: EntrySwitchCheck::Passed,
+                },
+            )
+            .expect("second preview");
+        let request = EntrySwitchApplyRequest {
+            target,
+            apply_system_proxy: true,
+            authorization: mismatch.authorization.expect("second authorization"),
+        };
+        assert!(state.consume_entry_switch_ticket(&request).is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dpapi_entry_switch_journal_recovers_no_proxy_rollback_without_live_mutation() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let original = state.private_config().expect("private config").entry;
+        let target = EntryConfig {
+            host: "127.0.0.1".into(),
+            port: original.port.saturating_add(102),
+        };
+        state
+            .prepare_entry_switch_runtime_journal(original, target, None, None)
+            .expect("protected journal");
+        assert!(entry_switch_runtime_journal_path(&state.runtime_directory).exists());
+        recover_entry_switch_runtime_journal(&state.runtime_directory, &state.private_config_path)
+            .expect("rollback recovery");
+        assert!(!entry_switch_runtime_journal_path(&state.runtime_directory).exists());
+        assert!(!entry_switch_runtime_journal_backup_path(&state.runtime_directory).exists());
     }
 }

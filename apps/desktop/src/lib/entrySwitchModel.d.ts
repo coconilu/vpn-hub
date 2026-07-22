@@ -1,7 +1,7 @@
 export interface EntryAddress { host: string; port: number }
 export interface EntrySwitchFoundationPreview {
   apply_system_proxy: boolean;
-  executable: false;
+  executable: boolean;
   issues: Array<{ code: string; message: string }>;
   steps: string[];
 }

@@ -50,8 +50,11 @@ mod windows {
     }
     use windows_sys::Win32::{
         Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, FILETIME, LocalFree},
-        NetworkManagement::IpHelper::{
-            GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
+        NetworkManagement::{
+            IpHelper::{
+                GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
+            },
+            Rras::{ERROR_BUFFER_TOO_SMALL, RASCONNW, RasEnumConnectionsW},
         },
         Networking::WinInet::{
             INTERNET_OPTION_PER_CONNECTION_OPTION, INTERNET_OPTION_REFRESH,
@@ -72,8 +75,56 @@ mod windows {
             FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_READ,
             GetFileInformationByHandle, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
         },
-        System::Threading::GetProcessTimes,
+        System::{
+            RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId},
+            Threading::{GetCurrentProcessId, GetProcessTimes},
+        },
     };
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct InteractiveSessionScope {
+        pub interactive_console: bool,
+        pub has_ras_or_vpn: bool,
+    }
+
+    /// Classifies the current process session without exposing raw Windows
+    /// handles or RAS connection metadata to the caller.
+    ///
+    /// # Errors
+    /// Returns an OS error when the process session or RAS state cannot be
+    /// established authoritatively.
+    pub fn current_interactive_session_scope() -> io::Result<InteractiveSessionScope> {
+        let mut process_session = 0_u32;
+        // SAFETY: `process_session` is a valid writable u32 and the process id
+        // is obtained from the current process.
+        if unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &raw mut process_session) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: this function has no pointer arguments or ownership transfer.
+        let console_session = unsafe { WTSGetActiveConsoleSessionId() };
+
+        let mut connection = RASCONNW {
+            dwSize: u32::try_from(size_of::<RASCONNW>())
+                .map_err(|_| io::Error::other("RAS structure size overflow"))?,
+            ..RASCONNW::default()
+        };
+        let mut bytes = connection.dwSize;
+        let mut count = 0_u32;
+        // SAFETY: the buffer points to one initialized RASCONNW and `bytes`
+        // advertises that exact size. A larger result is treated as an active
+        // RAS context and the one-element buffer is never read.
+        let ras_result =
+            unsafe { RasEnumConnectionsW(&raw mut connection, &raw mut bytes, &raw mut count) };
+        let has_ras_or_vpn = match ras_result {
+            0 => count > 0,
+            ERROR_BUFFER_TOO_SMALL => true,
+            code => return Err(io::Error::from_raw_os_error(code.cast_signed())),
+        };
+        Ok(InteractiveSessionScope {
+            interactive_console: console_session != u32::MAX && process_session == console_session,
+            has_ras_or_vpn,
+        })
+    }
 
     #[derive(Clone, PartialEq, Eq)]
     pub struct WinInetLanProxySnapshot {
@@ -1334,10 +1385,11 @@ mod windows {
 
 #[cfg(target_os = "windows")]
 pub use windows::{
-    FileIdentity, ProtectedPathPolicy, WinInetLanProxySnapshot, create_restricted_named_pipe,
-    lookup_local_account_sid, network_state_records, open_current_user_mutable_directory,
-    open_current_user_mutable_file, open_shared_authority_file, open_verified_file,
-    process_creation_identity, protect_current_user_data, query_current_user_default_lan_proxy,
+    FileIdentity, InteractiveSessionScope, ProtectedPathPolicy, WinInetLanProxySnapshot,
+    create_restricted_named_pipe, current_interactive_session_scope, lookup_local_account_sid,
+    network_state_records, open_current_user_mutable_directory, open_current_user_mutable_file,
+    open_shared_authority_file, open_verified_file, process_creation_identity,
+    protect_current_user_data, query_current_user_default_lan_proxy,
     set_current_user_default_lan_proxy, unprotect_current_user_data,
     validate_protected_installation, verified_file_identity,
 };
