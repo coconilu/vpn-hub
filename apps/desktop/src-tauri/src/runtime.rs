@@ -58,6 +58,7 @@ pub enum FastPathStage {
     WarmReload,
     CoreStartup,
     FallbackRestart,
+    #[allow(dead_code)]
     GuardianCycle,
 }
 
@@ -1033,8 +1034,37 @@ struct OwnedSubscriptionProbeRuntime {
     core: OwnedProbeCore,
     fingerprint: u64,
     ready_outlets: Arc<Mutex<HashSet<String>>>,
+    readiness_notify: ProviderReadinessNotifier,
     readiness_cancel: Arc<AtomicBool>,
     readiness_watcher: tokio::task::JoinHandle<()>,
+}
+
+type ReadinessCallback = Arc<dyn Fn(String) + Send + Sync>;
+
+#[derive(Clone, Default)]
+struct ProviderReadinessNotifier {
+    current: Arc<Mutex<Option<ReadinessCallback>>>,
+}
+
+impl ProviderReadinessNotifier {
+    fn new(notify: Option<ReadinessCallback>) -> Self {
+        let notifier = Self::default();
+        notifier.replace(notify);
+        notifier
+    }
+
+    fn replace(&self, notify: Option<ReadinessCallback>) {
+        if let Ok(mut current) = self.current.lock() {
+            *current = notify;
+        }
+    }
+
+    fn notify(&self, outlet_id: String) {
+        let current = self.current.lock().ok().and_then(|current| current.clone());
+        if let Some(notify) = current {
+            notify(outlet_id);
+        }
+    }
 }
 
 pub struct SubscriptionProbeRuntimeHandle {
@@ -1177,7 +1207,7 @@ fn spawn_provider_readiness_watcher(
     outlets: Vec<OutletConfig>,
     ready_outlets: Arc<Mutex<HashSet<String>>>,
     cancel: Arc<AtomicBool>,
-    notify: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    notify: ProviderReadinessNotifier,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1194,8 +1224,8 @@ fn spawn_provider_readiness_watcher(
                 let inserted = ready_outlets
                     .lock()
                     .is_ok_and(|mut ready| ready.insert(outlet.id.clone()));
-                if inserted && let Some(notify) = &notify {
-                    notify(outlet.id.clone());
+                if inserted {
+                    notify.notify(outlet.id.clone());
                 }
             }
             if ready_outlets
@@ -4064,6 +4094,8 @@ impl AppState {
                 .is_none();
             if !alive || runtime.fingerprint != fingerprint {
                 *slot = None;
+            } else {
+                runtime.readiness_notify.replace(readiness_notify.clone());
             }
         }
         if slot.is_none() {
@@ -4124,18 +4156,20 @@ impl AppState {
             .map_err(|_| "probe_runtime_start_failed".to_string())?;
             let initial_ready = core.provider_catalog_snapshot(&configured).await;
             let ready_outlets = Arc::new(Mutex::new(initial_ready));
+            let readiness_notify = ProviderReadinessNotifier::new(readiness_notify);
             let readiness_cancel = Arc::new(AtomicBool::new(false));
             let readiness_watcher = spawn_provider_readiness_watcher(
                 core.controller.clone(),
                 configured.clone(),
                 Arc::clone(&ready_outlets),
                 Arc::clone(&readiness_cancel),
-                readiness_notify,
+                readiness_notify.clone(),
             );
             *slot = Some(OwnedSubscriptionProbeRuntime {
                 core,
                 fingerprint,
                 ready_outlets,
+                readiness_notify,
                 readiness_cancel,
                 readiness_watcher,
             });
@@ -6609,9 +6643,9 @@ mod tests {
             vec![outlet],
             Arc::clone(&ready_outlets),
             Arc::clone(&cancel),
-            Some(Arc::new(move |outlet_id| {
+            ProviderReadinessNotifier::new(Some(Arc::new(move |outlet_id| {
                 let _ = sender.send(outlet_id);
-            })),
+            }))),
         );
 
         let notified = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
@@ -6623,6 +6657,100 @@ mod tests {
             ready_outlets
                 .lock()
                 .is_ok_and(|ready| ready.contains("late-sub"))
+        );
+        watcher.await.expect("watcher completion");
+        server.join().expect("Controller server");
+    }
+
+    #[tokio::test]
+    async fn cancelled_probe_runtime_reuse_replaces_late_readiness_notifier() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("fake Controller");
+        let address = listener.local_addr().expect("Controller address");
+        let (first_checked_sender, first_checked_receiver) = tokio::sync::oneshot::channel();
+        let (allow_ready_sender, allow_ready_receiver) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut first_checked_sender = Some(first_checked_sender);
+            for ready in [false, true] {
+                let (mut stream, _) = listener.accept().expect("Controller request");
+                let mut request = [0_u8; 2_048];
+                let _ = stream.read(&mut request);
+                if ready {
+                    allow_ready_receiver.recv().expect("allow late readiness");
+                }
+                let member = if ready { "Synthetic Ready" } else { "REJECT" };
+                let body = serde_json::json!({
+                    "proxies": {
+                        "VPN-HUB-OUTLET-reused-sub": {
+                            "type": "URLTest",
+                            "now": member,
+                            "all": [member]
+                        },
+                        (member): {"type": "Vless", "alive": ready}
+                    }
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .expect("Controller response");
+                if let Some(sender) = first_checked_sender.take() {
+                    let _ = sender.send(());
+                }
+            }
+        });
+        let controller =
+            ControllerClient::new(&format!("http://{address}"), "fixture-secret".into(), 1_000)
+                .expect("Controller client");
+        let outlet = OutletConfig {
+            id: "reused-sub".into(),
+            label: "Reused subscription".into(),
+            enabled: true,
+            kind: OutletKind::Subscription {
+                secret_ref: "fixture.secret".into(),
+                provider_update_seconds: 180,
+            },
+        };
+        let ready_outlets = Arc::new(Mutex::new(HashSet::new()));
+        let cancel_watcher = Arc::new(AtomicBool::new(false));
+        let old_lease_cancelled = Arc::new(AtomicBool::new(false));
+        let (old_sender, mut old_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let old_guard = Arc::clone(&old_lease_cancelled);
+        let notifier = ProviderReadinessNotifier::new(Some(Arc::new(move |outlet_id| {
+            if !old_guard.load(Ordering::Acquire) {
+                let _ = old_sender.send(outlet_id);
+            }
+        })));
+        let watcher = spawn_provider_readiness_watcher(
+            controller,
+            vec![outlet],
+            Arc::clone(&ready_outlets),
+            Arc::clone(&cancel_watcher),
+            notifier.clone(),
+        );
+
+        first_checked_receiver
+            .await
+            .expect("initial unavailable snapshot");
+        old_lease_cancelled.store(true, Ordering::Release);
+        let (new_sender, mut new_receiver) = tokio::sync::mpsc::unbounded_channel();
+        notifier.replace(Some(Arc::new(move |outlet_id| {
+            let _ = new_sender.send(outlet_id);
+        })));
+        allow_ready_sender.send(()).expect("release ready response");
+
+        let ready_notification = tokio::time::timeout(Duration::from_secs(2), new_receiver.recv())
+            .await
+            .expect("replacement notifier deadline")
+            .expect("replacement notifier");
+        assert_eq!(ready_notification, "reused-sub");
+        assert!(old_receiver.try_recv().is_err());
+        assert!(
+            ready_outlets
+                .lock()
+                .is_ok_and(|ready| ready.contains("reused-sub"))
         );
         watcher.await.expect("watcher completion");
         server.join().expect("Controller server");

@@ -710,6 +710,17 @@ impl DesktopCoordinator {
         self.probe_generation.load(Ordering::Acquire)
     }
 
+    fn restart_probe_lease_current(
+        &self,
+        cancel: &AtomicBool,
+        expected_recovery_epoch: u64,
+        expected_probe_generation: u64,
+    ) -> bool {
+        !cancel.load(Ordering::Acquire)
+            && self.recovery_epoch() == expected_recovery_epoch
+            && self.probe_generation() == expected_probe_generation
+    }
+
     fn post_probe_runtime_ready(&self, generation: u64, outlet_id: String) {
         if self.probe_generation() == generation {
             self.mailbox.post_probe_runtime_ready(outlet_id, generation);
@@ -1154,6 +1165,10 @@ fn start_restart_work(
     epoch: u64,
     sender: mpsc::Sender<WorkMessage>,
 ) -> ActiveWork {
+    let lease = RestartProbeLease {
+        recovery_epoch: epoch,
+        probe_generation: app.state::<DesktopCoordinator>().probe_generation(),
+    };
     let cancel = Arc::new(AtomicBool::new(false));
     let owned_child_exited = Arc::new(AtomicBool::new(false));
     let published_pid = Arc::new(AtomicU32::new(0));
@@ -1164,7 +1179,7 @@ fn start_restart_work(
     let handle = tokio::spawn(run_restart_task(
         task_app,
         id,
-        epoch,
+        lease,
         sender,
         task_cancel,
         task_owned_child_exited,
@@ -1180,15 +1195,49 @@ fn start_restart_work(
     }
 }
 
+#[derive(Clone, Copy)]
+struct RestartProbeLease {
+    recovery_epoch: u64,
+    probe_generation: u64,
+}
+
+fn restart_probe_control(
+    app: &AppHandle,
+    cancel: &Arc<AtomicBool>,
+    lease: RestartProbeLease,
+) -> commands::ProbeCycleControl {
+    let guard_app = app.clone();
+    let guard_cancel = Arc::clone(cancel);
+    let update_app = app.clone();
+    let ready_app = app.clone();
+    commands::ProbeCycleControl::new(
+        lease.probe_generation,
+        move |expected| {
+            guard_app
+                .state::<DesktopCoordinator>()
+                .restart_probe_lease_current(&guard_cancel, lease.recovery_epoch, expected)
+        },
+        move |expected, outlet_id| {
+            emit_guardian_outlet_update(&update_app, expected, outlet_id);
+        },
+        move |expected, outlet_id| {
+            ready_app
+                .state::<DesktopCoordinator>()
+                .post_probe_runtime_ready(expected, outlet_id);
+        },
+    )
+}
+
 async fn run_restart_task(
     app: AppHandle,
     id: u64,
-    epoch: u64,
+    lease: RestartProbeLease,
     sender: mpsc::Sender<WorkMessage>,
     cancel: Arc<AtomicBool>,
     owned_child_exited: Arc<AtomicBool>,
     published_pid: Arc<AtomicU32>,
 ) {
+    let epoch = lease.recovery_epoch;
     let state = app.state::<AppState>();
     let _transaction = state.lock_routing_transaction().await;
     if cancel.load(Ordering::Acquire) || app.state::<DesktopCoordinator>().recovery_epoch() != epoch
@@ -1243,6 +1292,11 @@ async fn run_restart_task(
         send_restart_finished(&sender, id, Some(pid), outcome).await;
         return;
     }
+    let control = restart_probe_control(&app, &cancel, lease);
+    let guardian_succeeded = state.uses_helper_authority()
+        || commands::record_routing_cycle_locked_controlled(&state, &control)
+            .await
+            .is_ok();
     let child_alive = state
         .owned_core_controller_is_running_authoritative(pid)
         .await
@@ -1251,7 +1305,7 @@ async fn run_restart_task(
     let deliberately_cancelled = cancel.load(Ordering::Acquire)
         && !owned_child_exited.load(Ordering::Acquire)
         || !epoch_current;
-    let committed = !deliberately_cancelled && child_alive;
+    let committed = guardian_succeeded && !deliberately_cancelled && child_alive;
     if !committed {
         let _ = state.stop_supervised_core_if_pid(pid).await;
     }
@@ -2034,6 +2088,27 @@ mod tests {
         let summary = store.summaries().expect("summary").remove(0);
         assert_eq!(summary.samples, 1);
         assert_eq!(summary.last_status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn restart_probe_lease_requires_cancel_recovery_and_config_fences() {
+        let coordinator = DesktopCoordinator::new();
+        coordinator.publish_probe_generation(7);
+        let cancel = AtomicBool::new(false);
+        let recovery_epoch = coordinator.recovery_epoch();
+        assert!(coordinator.restart_probe_lease_current(&cancel, recovery_epoch, 7));
+
+        cancel.store(true, Ordering::Release);
+        assert!(!coordinator.restart_probe_lease_current(&cancel, recovery_epoch, 7));
+        cancel.store(false, Ordering::Release);
+
+        coordinator.invalidate_recovery();
+        assert!(!coordinator.restart_probe_lease_current(&cancel, recovery_epoch, 7));
+        let current_recovery = coordinator.recovery_epoch();
+        assert!(coordinator.restart_probe_lease_current(&cancel, current_recovery, 7));
+
+        coordinator.invalidate_probe_generation();
+        assert!(!coordinator.restart_probe_lease_current(&cancel, current_recovery, 7));
     }
 
     #[test]

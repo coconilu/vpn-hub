@@ -38,8 +38,8 @@ pub use entry_switch::{
 pub use guardian_cycle::{
     DEFAULT_GUARDIAN_CONCURRENCY, DEFAULT_GUARDIAN_CYCLE_BUDGET, GuardianCommitStatus,
     GuardianCycleError, GuardianCycleOutcome, RoutingSession, RoutingStateError,
-    run_controller_guardian_cycle, run_controller_guardian_cycle_controlled,
-    probe_controller_outlets, run_controller_guardian_cycle_selected,
+    probe_controller_outlets, run_controller_guardian_cycle,
+    run_controller_guardian_cycle_controlled, run_controller_guardian_cycle_selected,
     run_controller_guardian_cycle_selected_guarded,
 };
 pub use history::{

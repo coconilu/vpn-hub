@@ -1704,7 +1704,7 @@ mod tests {
         let targets = (0..target_count)
             .map(|index| format!("https://fixture-{index}.invalid/health"))
             .collect::<Vec<_>>();
-        let result = probe_controller_outlet(&controller, &outlet, &targets, 2_000).await;
+        let result = probe_controller_outlet_scheduled(&controller, &outlet, &targets, 2_000).await;
 
         server.join().expect("Controller server");
         for handler in handlers.lock().expect("handlers").drain(..) {
@@ -1715,5 +1715,142 @@ mod tests {
         let expected_targets = u32::try_from(target_count).expect("bounded fixture target count");
         assert_eq!(result.successful_targets, expected_targets);
         assert_eq!(result.total_targets, expected_targets);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::field_reassign_with_default, clippy::too_many_lines)]
+    async fn cancelled_restart_probe_lease_has_no_late_authoritative_side_effects() {
+        use std::{
+            io::{ErrorKind, Read, Write},
+            net::{Ipv4Addr, TcpListener},
+            sync::{
+                Arc, Mutex,
+                atomic::{AtomicBool, AtomicUsize, Ordering},
+            },
+            thread,
+        };
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("fake Controller");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("Controller address");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let stop_server = Arc::new(AtomicBool::new(false));
+        let selector_mutations = Arc::new(AtomicUsize::new(0));
+        let server_cancelled = Arc::clone(&cancelled);
+        let server_stop = Arc::clone(&stop_server);
+        let server_selector_mutations = Arc::clone(&selector_mutations);
+        let server = thread::spawn(move || {
+            while !server_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let mut request = [0_u8; 2_048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]);
+                if request.starts_with("PUT ") {
+                    server_selector_mutations.fetch_add(1, Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                } else if request.contains("/delay?") {
+                    server_cancelled.store(true, Ordering::Release);
+                    let body = br#"{"delay":42}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(body);
+                } else {
+                    let body = br#"{"proxies":{}}"#;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(body);
+                }
+            }
+        });
+        let controller =
+            ControllerClient::new(&format!("http://{address}"), "fixture-secret".into(), 1_000)
+                .expect("Controller client");
+        let outlet = OutletConfig {
+            id: "restart-local".into(),
+            label: "Restart local".into(),
+            enabled: true,
+            kind: OutletKind::LocalProxy {
+                endpoint: "http://127.0.0.1:45123".into(),
+            },
+        };
+        let mut private = PrivateRoutingConfig::default();
+        private.outlets = vec![outlet.clone()];
+        private.probe_targets = vec![
+            "https://fixture-a.invalid/health".into(),
+            "https://fixture-b.invalid/health".into(),
+        ];
+        let monitor = MonitorConfig {
+            interval_seconds: 15,
+            connect_timeout_ms: 500,
+            request_timeout_ms: 1_000,
+            failure_threshold: 2,
+            recovery_threshold: 3,
+        };
+        let directory = tempfile::tempdir().expect("store directory");
+        let mut store = GuardianStore::open(directory.path().join("guardian.db")).expect("store");
+        store
+            .ensure_udp_capability(
+                &outlet.id,
+                &outlet.label,
+                &unknown_udp_evidence(&outlet, "not_yet_validated"),
+            )
+            .expect("baseline UDP evidence");
+        let routing = Mutex::new(RoutingEngine::new(crate::RouteMode::Priority, None));
+        let notifications = AtomicUsize::new(0);
+
+        let result = run_controller_guardian_cycle_selected_guarded(
+            &controller,
+            &private,
+            &crate::ResolvedSubscriptionUrls::new(),
+            &monitor,
+            &mut store,
+            &routing,
+            1_000,
+            None::<&HashSet<String>>,
+            &|| !cancelled.load(Ordering::Acquire),
+            &|_, _| {
+                notifications.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await;
+        stop_server.store(true, Ordering::Release);
+        server.join().expect("Controller server");
+
+        assert!(matches!(
+            result,
+            Err(GuardianCycleError::Store(StoreError::StaleProbeGeneration)
+                | GuardianCycleError::StaleProbeGeneration)
+        ));
+        assert!(store.recent_samples(10).expect("samples").is_empty());
+        assert!(
+            store
+                .recent_route_switches(10)
+                .expect("route switches")
+                .is_empty()
+        );
+        assert_eq!(
+            routing.lock().expect("routing").current_outlet(),
+            None,
+            "cancelled restart must not apply a route"
+        );
+        assert_eq!(selector_mutations.load(Ordering::SeqCst), 0);
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
     }
 }

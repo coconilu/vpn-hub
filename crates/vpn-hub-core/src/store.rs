@@ -409,6 +409,7 @@ impl GuardianStore {
     {
         ensure_probe_current(&is_current)?;
         let transaction = self.connection.transaction()?;
+        ensure_probe_current(&is_current)?;
         let event = Self::record_probe_in_transaction(
             &transaction,
             outlet,

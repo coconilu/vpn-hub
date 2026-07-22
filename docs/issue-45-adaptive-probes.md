@@ -17,7 +17,7 @@ VPN Hub 在桌面协调器启动时立即为所有启用且可验证的出口签
 | 等待探测运行时 | 60 秒低频复核 | runtime、网络、恢复或配置事件立即唤醒 |
 | terminal gate | 无定时器 | 显式恢复事件唤醒 |
 
-每个出口同一时间至多有一个租约。租约携带 generation；配置重载会立即使旧 generation 失效。SQLite 目录同步、UDP 初始证据、探测样本和路由切换都在事务内再次校验 generation；Controller selector 和内存视图也在每次修改前校验。旧任务因此不能留下部分数据库写入、旧 selector 选择或旧 UI 状态。桌面协调器仍只保留一个 Guardian 工作任务，因此不会形成无界任务队列。
+每个出口同一时间至多有一个租约。租约携带 generation；配置重载会立即使旧 generation 失效。普通调度和核心重启后的 Guardian 都同时受 cancel、recovery epoch 与配置 generation 约束，并连接真实 per-outlet 通知。SQLite 目录同步、UDP 初始证据、探测样本和路由切换都在事务内再次校验 generation；Controller selector 和内存视图也在每次修改前校验。旧任务因此不能留下部分数据库写入、旧 selector 选择或旧 UI 状态。桌面协调器仍只保留一个 Guardian 工作任务，因此不会形成无界任务队列。
 
 ## 状态与证据边界
 
@@ -47,7 +47,7 @@ flowchart LR
 | Controller | 独立随机 loopback 端口和 32 字节随机 secret |
 | 默认路由 | `MASTER` 首项为 `REJECT`，无 `DIRECT` fallback |
 | 网络副作用 | `allow-lan=false`；不配置 TUN/DNS，不修改 WinINet/WinHTTP、路由、适配器或防火墙 |
-| provider 就绪 | 首次快照后由独立 watcher 每 250ms 只复核未就绪出口；首次发现成员时主动唤醒对应出口，60 秒仅作丢事件兜底 |
+| provider 就绪 | 首次快照后由独立 watcher 每 250ms 只复核未就绪出口；每次 runtime 复用会原子替换 notifier，避免继续绑定已取消租约；首次发现成员时主动唤醒对应出口，60 秒仅作丢事件兜底 |
 | 进程 | 只保存本次创建的 child；Drop/配置失效/APP 退出会取消 watcher 并仅终止该 PID |
 | 文件 | 配置位于 ACL 加固的临时目录，运行时销毁；URL 和 secret 不进入 SQLite、UI、事件或日志 |
 

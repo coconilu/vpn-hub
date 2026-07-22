@@ -171,8 +171,8 @@ use crate::{
     runtime::{
         AppState, CoreStatus, EntrySwitchApplyRequest, EntrySwitchApplyResult, EntrySwitchPreview,
         EntrySwitchPreviewChecks, FastPathPerformanceReport, FastPathResultCode, FastPathStage,
-        ForegroundOperationStage, NodeLatencyBatchResult, NodeLatencyResult, PortSnapshot,
-        OutletProbePhase, OutletProbeView, RoutingStatus, SettingsApplyRequest, SettingsApplyResult,
+        ForegroundOperationStage, NodeLatencyBatchResult, NodeLatencyResult, OutletProbePhase,
+        OutletProbeView, PortSnapshot, RoutingStatus, SettingsApplyRequest, SettingsApplyResult,
         SettingsPreview, SettingsPreviewRequest, SettingsTerminalStatus, SubscriptionNodeCatalog,
         SubscriptionNodeGroup, SubscriptionSourcePhase,
     },
@@ -1878,14 +1878,19 @@ async fn record_direct_guardian_cycle(
 }
 
 pub(crate) async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
+    record_routing_cycle_locked_controlled(state, &ProbeCycleControl::unfenced()).await
+}
+
+pub(crate) async fn record_routing_cycle_locked_controlled(
+    state: &AppState,
+    control: &ProbeCycleControl,
+) -> Result<u64, String> {
     let private = state.private_config()?;
     let selected = private
         .enabled_outlets()
         .map(|outlet| outlet.id.clone())
         .collect::<HashSet<_>>();
-    let report =
-        record_routing_cycle_selected_locked(state, &selected, &ProbeCycleControl::unfenced())
-            .await?;
+    let report = record_routing_cycle_selected_locked(state, &selected, control).await?;
     if report
         .outcomes
         .iter()
@@ -1899,6 +1904,7 @@ pub(crate) async fn record_routing_cycle_locked(state: &AppState) -> Result<u64,
     Ok(report.interval_seconds)
 }
 
+#[allow(dead_code)]
 pub(crate) async fn record_routing_cycle_controlled(
     state: &AppState,
     allow_direct_fallback: bool,
@@ -1969,6 +1975,7 @@ pub(crate) async fn record_routing_cycle_controlled(
     Ok(guardian.monitor.interval_seconds)
 }
 
+#[allow(dead_code)]
 async fn record_owned_controller_cycle_locked(state: &AppState) -> Result<u64, String> {
     record_routing_cycle_locked_with_mode(state, false, None, &ProbeCycleControl::unfenced())
         .await
