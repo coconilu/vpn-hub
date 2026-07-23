@@ -11,14 +11,18 @@ Rust derives the selector and provider names from the enabled subscription,
 requires its protected credential state to be configured, and reads the first
 validated HTTPS probe target plus `request_timeout_ms` from the active private
 and Guardian settings. The existing `ControllerClient` still accepts only a
-loopback address and authenticates with the random secret held by the owned
-core runtime.
+loopback address and authenticates with a random secret. When the main core is
+stopped, catalog and latency commands start or reuse the existing app-owned
+subscription probe runtime on random loopback ports. Its selectors default to
+`REJECT`, it never binds the product entry, and it does not change the Windows
+system proxy.
 
 ## Runtime flow
 
 ```text
 UI node id
   -> validate enabled configured subscription
+  -> choose the managed-core Controller, or an isolated probe Controller
   -> read authenticated selector snapshot
   -> require requested member in that snapshot
   -> provider-member healthcheck (validated URL and timeout)
@@ -32,6 +36,10 @@ most, preserves successes when another member fails, and stops queued work
 after cancellation. An in-flight request is allowed to finish its bounded
 healthcheck and mandatory selection readback.
 
+With the main core stopped, selection invariance applies to the isolated probe
+selector. The UI deliberately hides that temporary selector member and keeps
+real node selection disabled until the main core is running again.
+
 ## Result lifetime and error model
 
 Latency results, timestamps, node names, and batch state live only in React
@@ -40,8 +48,9 @@ logs. A catalog refresh marks displayed latency stale instead of treating
 Mihomo history as a new active test.
 
 The UI distinguishes waiting, running, success, failure, stale, and cancelled.
-Failures use sanitized codes for owned core unavailable, provider unavailable,
-node disappearance, timeout, Controller failure, and cancellation. If the
+Failures use sanitized codes for both managed and isolated runtime unavailable,
+provider unavailable, node disappearance, timeout, Controller failure, and
+cancellation. If the
 post-test selection cannot be read or differs from the pre-test selection, the
 latency is rejected rather than presented as trusted.
 

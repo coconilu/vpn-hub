@@ -235,6 +235,7 @@ pub struct SubscriptionNodeGroup {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubscriptionNodeCatalog {
     pub controller_ready: bool,
+    pub selection_ready: bool,
     pub subscriptions: Vec<SubscriptionNodeGroup>,
     pub message: String,
 }
@@ -3299,7 +3300,6 @@ impl AppState {
             .into_iter()
             .map(|status| (status.subscription_id, status.state))
             .collect::<HashMap<_, _>>();
-        let controller = self.controller_client()?;
         let eligible_outlets = config
             .enabled_outlets()
             .filter(|outlet| {
@@ -3318,6 +3318,17 @@ impl AppState {
             .iter()
             .map(|outlet| outlet_proxy_name(&outlet.id))
             .collect::<Vec<_>>();
+        let managed_controller = self.controller_client()?;
+        let mut selection_ready = managed_controller.is_some();
+        let controller = match managed_controller {
+            Some(controller) => Some(controller),
+            None if !selectors.is_empty() => self
+                .subscription_probe_runtime(&config, None)
+                .await
+                .ok()
+                .map(|runtime| runtime.controller),
+            None => None,
+        };
         let mut controller_ready = controller.is_some();
         let mut subscriptions = Vec::with_capacity(eligible_outlets.len());
 
@@ -3352,10 +3363,15 @@ impl AppState {
                             }
                             SubscriptionNodeGroupState::Available
                         };
-                        subscriptions.push(subscription_node_group(outlet, state, snapshot));
+                        let mut group = subscription_node_group(outlet, state, snapshot);
+                        if !selection_ready {
+                            group.current_node = None;
+                        }
+                        subscriptions.push(group);
                     }
                 } else {
                     controller_ready = false;
+                    selection_ready = false;
                     subscriptions.extend(eligible_outlets.iter().map(|outlet| {
                         subscription_node_group(
                             outlet,
@@ -3378,7 +3394,9 @@ impl AppState {
         let message = if subscriptions.is_empty() {
             "没有已启用且凭据可用的订阅出口；请先在设置中完成订阅配置".into()
         } else if !controller_ready {
-            "本应用自管 Mihomo Controller 当前不可用；请检查核心状态后刷新".into()
+            "无法启动隔离订阅探测；请检查 Mihomo 文件与订阅配置后重试".into()
+        } else if !selection_ready {
+            "主核心未运行；节点列表与测速使用随机回环端口的隔离探测，不接管系统代理，启动主核心后才可切换节点".into()
         } else if subscriptions.iter().any(|group| {
             matches!(
                 group.state,
@@ -3394,6 +3412,7 @@ impl AppState {
 
         Ok(SubscriptionNodeCatalog {
             controller_ready,
+            selection_ready,
             subscriptions,
             message,
         })
@@ -3459,9 +3478,15 @@ impl AppState {
         if !configured {
             return Err("订阅凭据未配置，无法重试 provider".into());
         }
-        let controller = self
-            .controller_client()?
-            .ok_or_else(|| "应用自管核心未启动，无法重试 provider".to_string())?;
+        let controller = match self.controller_client()? {
+            Some(controller) => controller,
+            None => {
+                self.subscription_probe_runtime(&config, None)
+                    .await
+                    .map_err(|_| "无法启动隔离订阅探测，Provider 重试未执行".to_string())?
+                    .controller
+            }
+        };
         if !self.set_provider_state_if_current(
             subscription_id,
             generation,
@@ -3509,19 +3534,26 @@ impl AppState {
         node_name: &str,
     ) -> Result<NodeLatencyResult, String> {
         let tested_at = chrono::Utc::now().to_rfc3339();
-        let Some(controller) = self.controller_client()? else {
-            return Ok(node_latency_failure(
-                node_name,
-                tested_at,
-                NodeLatencyErrorCode::CoreUnavailable,
-                true,
-            ));
-        };
         let context = match self.authorized_node_latency_context(subscription_id) {
             Ok(context) => context,
             Err(code) => {
                 return Ok(node_latency_failure(node_name, tested_at, code, true));
             }
+        };
+        let config = self.private_config()?;
+        let (controller, selection_ready) = match self.controller_client()? {
+            Some(controller) => (controller, true),
+            None => match self.subscription_probe_runtime(&config, None).await {
+                Ok(runtime) => (runtime.controller, false),
+                Err(_) => {
+                    return Ok(node_latency_failure(
+                        node_name,
+                        tested_at,
+                        NodeLatencyErrorCode::CoreUnavailable,
+                        true,
+                    ));
+                }
+            },
         };
 
         let result = match controller
@@ -3540,7 +3572,11 @@ impl AppState {
                 latency_ms: Some(latency_ms),
                 tested_at,
                 error_code: None,
-                message: "本次延迟测试成功；权威当前节点保持不变".into(),
+                message: if selection_ready {
+                    "本次延迟测试成功；权威当前节点保持不变".into()
+                } else {
+                    "本次延迟测试成功；使用隔离探测，未启动主核心或切换真实节点".into()
+                },
                 selection_unchanged: true,
             },
             Err(error) => node_latency_controller_failure(node_name, tested_at, &error),
@@ -3565,15 +3601,22 @@ impl AppState {
         if !valid_node_latency_operation_id(operation_id) {
             return Err("测速操作标识无效".into());
         }
-        let Some(controller) = self.controller_client()? else {
-            return Ok(node_latency_batch_failure(
-                subscription_id,
-                NodeLatencyErrorCode::CoreUnavailable,
-            ));
-        };
         let context = match self.authorized_node_latency_context(subscription_id) {
             Ok(context) => context,
             Err(code) => return Ok(node_latency_batch_failure(subscription_id, code)),
+        };
+        let config = self.private_config()?;
+        let (controller, selection_ready) = match self.controller_client()? {
+            Some(controller) => (controller, true),
+            None => match self.subscription_probe_runtime(&config, None).await {
+                Ok(runtime) => (runtime.controller, false),
+                Err(_) => {
+                    return Ok(node_latency_batch_failure(
+                        subscription_id,
+                        NodeLatencyErrorCode::CoreUnavailable,
+                    ));
+                }
+            },
         };
         let before = match controller.selector_nodes(&context.selector).await {
             Ok(snapshot) if !snapshot.nodes.is_empty() && snapshot.current_node.is_some() => {
@@ -3665,6 +3708,8 @@ impl AppState {
                 "批量测速已取消；已完成的结果仍保留在当前界面".into()
             } else if partial_failure {
                 "批量测速完成；部分节点失败，其他成功结果已保留".into()
+            } else if !selection_ready {
+                "批量测速完成；使用隔离探测，未启动主核心或切换真实节点".into()
             } else {
                 "批量测速完成；权威当前节点保持不变".into()
             },
@@ -5455,7 +5500,7 @@ fn node_latency_controller_failure(
 
 const fn node_latency_error_message(code: NodeLatencyErrorCode) -> &'static str {
     match code {
-        NodeLatencyErrorCode::CoreUnavailable => "本应用自管核心未启动",
+        NodeLatencyErrorCode::CoreUnavailable => "主核心与隔离订阅探测均不可用",
         NodeLatencyErrorCode::ProviderUnavailable => "订阅 provider 尚未就绪",
         NodeLatencyErrorCode::NodeDisappeared => "节点已从 provider 中消失，请刷新状态",
         NodeLatencyErrorCode::Timeout => "节点测速超时",
@@ -7390,6 +7435,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_catalog_keeps_selection_disabled_when_no_probe_runtime_can_start() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        configure_node_latency_subscription(&state);
+
+        let catalog = state
+            .subscription_node_catalog()
+            .await
+            .expect("unavailable catalog");
+
+        assert!(!catalog.controller_ready);
+        assert!(!catalog.selection_ready);
+        assert_eq!(
+            catalog.subscriptions[0].state,
+            SubscriptionNodeGroupState::CoreUnavailable
+        );
+        assert!(catalog.subscriptions[0].current_node.is_none());
+    }
+
+    #[tokio::test]
     async fn node_latency_batch_bounds_concurrency_and_keeps_partial_success() {
         let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let directory = tempfile::tempdir().expect("tempdir");
@@ -7568,6 +7634,8 @@ mod tests {
             .subscription_node_catalog()
             .await
             .expect("first catalog");
+        assert!(first.controller_ready);
+        assert!(first.selection_ready);
         assert_eq!(
             first.subscriptions[0].state,
             SubscriptionNodeGroupState::ProviderLoading

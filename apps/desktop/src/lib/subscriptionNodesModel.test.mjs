@@ -26,12 +26,13 @@ test("filters subscription nodes by name or proxy type", () => {
 test("replaces only the selected subscription group", () => {
   const first = { subscription_id: "sub-a", current_node: "Synthetic Alpha" };
   const second = { subscription_id: "sub-b", current_node: "Synthetic Beta" };
-  const catalog = { controller_ready: true, subscriptions: [first, second], message: "ready" };
+  const catalog = { controller_ready: true, selection_ready: false, subscriptions: [first, second], message: "ready" };
   const updated = { ...first, current_node: "Synthetic Gamma" };
 
   const result = replaceSubscriptionNodeGroup(catalog, updated);
   assert.equal(result.subscriptions[0], updated);
   assert.equal(result.subscriptions[1], second);
+  assert.equal(result.selection_ready, false);
 });
 
 test("uses collision-safe runtime-only keys and marks Controller history stale", () => {

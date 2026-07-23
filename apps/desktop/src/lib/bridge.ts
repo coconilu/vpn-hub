@@ -118,6 +118,7 @@ function browserSettingsDiff(
 }
 let browserNodeCatalog: SubscriptionNodeCatalog = {
   controller_ready: true,
+  selection_ready: true,
   subscriptions: [
     {
       subscription_id: "sub-a",
@@ -148,6 +149,10 @@ let browserNodeCatalog: SubscriptionNodeCatalog = {
 };
 const browserNodeLatencyActive = new Set<string>();
 const browserNodeLatencyCancelled = new Set<string>();
+const isIsolatedProbePreview = () => (
+  !isTauriRuntime()
+  && new URLSearchParams(window.location.search).get("runtime") === "isolated-probe"
+);
 
 const syntheticLatencyResult = (nodeName: string): NodeLatencyResult => {
   const testedAt = new Date().toISOString();
@@ -158,7 +163,17 @@ const syntheticLatencyResult = (nodeName: string): NodeLatencyResult => {
     return { node_name: nodeName, status: "failure", latency_ms: null, tested_at: testedAt, error_code: "timeout", message: "节点测速超时", selection_unchanged: true };
   }
   const latency = 38 + (Array.from(nodeName).reduce((sum, character) => sum + character.codePointAt(0)!, 0) % 92);
-  return { node_name: nodeName, status: "success", latency_ms: latency, tested_at: testedAt, error_code: null, message: "本次延迟测试成功；权威当前节点保持不变", selection_unchanged: true };
+  return {
+    node_name: nodeName,
+    status: "success",
+    latency_ms: latency,
+    tested_at: testedAt,
+    error_code: null,
+    message: isIsolatedProbePreview()
+      ? "本次延迟测试成功；使用隔离探测，未启动主核心或切换真实节点"
+      : "本次延迟测试成功；权威当前节点保持不变",
+    selection_unchanged: true,
+  };
 };
 
 export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
@@ -349,7 +364,15 @@ export async function recoverSettingsTerminal(): Promise<SettingsTerminalStatus>
 }
 
 export async function getSubscriptionNodeCatalog(): Promise<SubscriptionNodeCatalog> {
-  if (!isTauriRuntime()) return structuredClone(browserNodeCatalog);
+  if (!isTauriRuntime()) {
+    const preview = structuredClone(browserNodeCatalog);
+    if (isIsolatedProbePreview()) {
+      preview.selection_ready = false;
+      preview.message = "主核心未运行；节点列表与测速使用随机回环端口的隔离探测，不接管系统代理，启动主核心后才可切换节点";
+      for (const group of preview.subscriptions) group.current_node = null;
+    }
+    return preview;
+  }
   return invoke<SubscriptionNodeCatalog>("get_subscription_node_catalog");
 }
 
@@ -431,7 +454,11 @@ export async function testSubscriptionNodeLatencies(
       cancelled,
       selection_unchanged: true,
       error_code: null,
-      message: cancelled ? "批量测速已取消；已完成的结果仍保留在当前界面" : "批量测速完成；部分节点失败，其他成功结果已保留",
+      message: cancelled
+        ? "批量测速已取消；已完成的结果仍保留在当前界面"
+        : isIsolatedProbePreview()
+          ? "批量测速完成；使用隔离探测，未启动主核心或切换真实节点"
+          : "批量测速完成；部分节点失败，其他成功结果已保留",
     };
   }
   return invoke<NodeLatencyBatchResult>("test_subscription_node_latencies", {

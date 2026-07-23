@@ -37,7 +37,7 @@ import type {
 
 function groupStateMessage(group: SubscriptionNodeGroup) {
   if (group.state === "core_unavailable") {
-    return "请先在总览中启动本应用自管 Mihomo 核心。不会连接或控制其他代理客户端。";
+    return "无法启动隔离订阅探测。请检查 Mihomo 文件与订阅配置后重试。";
   }
   if (group.state === "provider_unavailable") {
     return "订阅 provider 尚未返回可选节点。可以立即重试；配置无需再次保存。";
@@ -52,7 +52,7 @@ function groupStateMessage(group: SubscriptionNodeGroup) {
 }
 
 const errorLabel: Record<NodeLatencyErrorCode, string> = {
-  core_unavailable: "核心未启动",
+  core_unavailable: "隔离探测不可用",
   provider_unavailable: "Provider 未就绪",
   node_disappeared: "节点已消失",
   timeout: "测速超时",
@@ -298,7 +298,10 @@ export function NodesPage() {
               <Search aria-hidden="true" /><span className="sr-only">搜索节点</span>
               <input onChange={(event) => setQuery(event.target.value)} placeholder="搜索节点名称或协议" type="search" value={query} />
             </label>
-            <div className="node-current-summary"><span>当前节点（测速不会改变）</span><strong>{activeGroup?.current_node ?? "尚未选择"}</strong></div>
+            <div className="node-current-summary">
+              <span>当前节点（测速不会改变）</span>
+              <strong>{catalog.selection_ready ? activeGroup?.current_node ?? "尚未选择" : "启动主核心后可查看"}</strong>
+            </div>
           </section>
 
           {stateMessage ? (
@@ -325,8 +328,8 @@ export function NodesPage() {
                       <button aria-label={`重测 ${node.name}`} className="secondary-button node-test-button" disabled={busy} onClick={() => void testOne(node.name)} type="button">
                         <Gauge aria-hidden="true" />{testingNode === node.name ? "测试中…" : "单节点重测"}
                       </button>
-                      <button aria-pressed={selected} className="node-select-button" disabled={busy || selected} onClick={() => void chooseNode(node.name)} type="button">
-                        {selectingThis ? "正在确认…" : selected ? "已选择" : "选择此节点"}
+                      <button aria-pressed={selected} className="node-select-button" disabled={busy || selected || !catalog.selection_ready} onClick={() => void chooseNode(node.name)} type="button">
+                        {selectingThis ? "正在确认…" : selected ? "已选择" : catalog.selection_ready ? "选择此节点" : "启动核心后可选"}
                       </button>
                     </div>
                   </article>

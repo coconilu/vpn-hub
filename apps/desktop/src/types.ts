@@ -188,6 +188,7 @@ export interface SubscriptionNodeGroup {
 
 export interface SubscriptionNodeCatalog {
   controller_ready: boolean;
+  selection_ready: boolean;
   subscriptions: SubscriptionNodeGroup[];
   message: string;
 }
