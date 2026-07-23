@@ -41,6 +41,8 @@ pub enum StoreError {
     UnsupportedDatabaseVersion(i64),
     #[error("Guardian durable batch exceeded its cycle deadline")]
     Deadline,
+    #[error("probe generation is no longer current")]
+    StaleProbeGeneration,
 }
 
 pub struct GuardianStore {
@@ -52,6 +54,12 @@ struct StoredState {
     status: HealthStatus,
     consecutive_successes: u32,
     consecutive_failures: u32,
+}
+
+#[derive(Debug)]
+pub struct ProbeCommitOutcome {
+    pub event: Option<StateEvent>,
+    pub status: HealthStatus,
 }
 
 impl GuardianStore {
@@ -272,13 +280,35 @@ impl GuardianStore {
         outlets: &[HistoryOutletSnapshot],
         observed_at: &str,
     ) -> Result<(), StoreError> {
+        self.sync_history_outlets_guarded(outlets, observed_at, || true)
+    }
+
+    /// Synchronizes the outlet catalogue only while a probe lease remains
+    /// current; a stale transaction is rolled back before commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StaleProbeGeneration`] for stale work, or a
+    /// storage/validation error.
+    pub fn sync_history_outlets_guarded<F>(
+        &mut self,
+        outlets: &[HistoryOutletSnapshot],
+        observed_at: &str,
+        is_current: F,
+    ) -> Result<(), StoreError>
+    where
+        F: Fn() -> bool,
+    {
+        ensure_probe_current(&is_current)?;
         let observed_at = canonical_timestamp(observed_at)?;
         let transaction = self.connection.transaction()?;
+        ensure_probe_current(&is_current)?;
         transaction.execute(
             "UPDATE outlets SET enabled=0, deleted_at=COALESCE(deleted_at, ?1)",
             [&observed_at],
         )?;
         for outlet in outlets {
+            ensure_probe_current(&is_current)?;
             let label = crate::history::sanitized_label(&outlet.label);
             transaction.execute(
                 r"INSERT INTO outlets(id, label, updated_at, kind, enabled, deleted_at)
@@ -294,6 +324,7 @@ impl GuardianStore {
                 ],
             )?;
         }
+        ensure_probe_current(&is_current)?;
         transaction.commit()?;
         Ok(())
     }
@@ -330,29 +361,6 @@ impl GuardianStore {
         Ok(())
     }
 
-    fn outlet_display(
-        &self,
-        outlet_id: &str,
-    ) -> Result<Option<(String, HistoryOutletKind)>, StoreError> {
-        let stored = self
-            .connection
-            .query_row(
-                "SELECT label, kind FROM outlets WHERE id=?1",
-                [outlet_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        stored
-            .map(|(label, kind)| {
-                Ok((
-                    crate::history::sanitized_label(&label),
-                    HistoryOutletKind::try_from(kind.as_str())
-                        .map_err(StoreError::InvalidOutletKind)?,
-                ))
-            })
-            .transpose()
-    }
-
     /// Persists one sanitized probe and emits a state transition when a
     /// configured failure or recovery threshold is reached.
     ///
@@ -374,9 +382,50 @@ impl GuardianStore {
             result,
             failure_threshold,
             recovery_threshold,
+            &|| true,
         )?;
         transaction.commit()?;
         Ok(event)
+    }
+
+    /// Persists one probe only while its cancellation/generation guard remains
+    /// current. A stale transaction is rolled back before it can publish old
+    /// evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StaleProbeGeneration`] when the lease is cancelled
+    /// or superseded, and otherwise returns storage/validation failures.
+    pub fn record_probe_guarded<F>(
+        &mut self,
+        outlet: &ProbeOutletConfig,
+        result: &ProbeResult,
+        failure_threshold: u32,
+        recovery_threshold: u32,
+        is_current: F,
+    ) -> Result<ProbeCommitOutcome, StoreError>
+    where
+        F: Fn() -> bool,
+    {
+        ensure_probe_current(&is_current)?;
+        let transaction = self.connection.transaction()?;
+        ensure_probe_current(&is_current)?;
+        let event = Self::record_probe_in_transaction(
+            &transaction,
+            outlet,
+            result,
+            failure_threshold,
+            recovery_threshold,
+            &is_current,
+        )?;
+        ensure_probe_current(&is_current)?;
+        transaction.commit()?;
+        let status = self
+            .summaries()?
+            .into_iter()
+            .find(|summary| summary.outlet_id == outlet.id)
+            .map_or(result.status, |summary| summary.last_status);
+        Ok(ProbeCommitOutcome { event, status })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -386,6 +435,7 @@ impl GuardianStore {
         result: &ProbeResult,
         failure_threshold: u32,
         recovery_threshold: u32,
+        is_current: &impl Fn() -> bool,
     ) -> Result<Option<StateEvent>, StoreError> {
         let observed_at = canonical_timestamp(&result.observed_at)?;
         transaction.execute(
@@ -403,6 +453,7 @@ impl GuardianStore {
             [&outlet.id],
             |row| row.get::<_, String>(0),
         )?;
+        ensure_probe_current(&is_current)?;
         transaction.execute(
             "INSERT INTO probe_samples(outlet_id, observed_at, port_reachable, status, http_status, latency_ms, error_code, successful_targets, total_targets, outlet_label, outlet_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
@@ -456,6 +507,7 @@ impl GuardianStore {
             failure_threshold,
             recovery_threshold,
         );
+        ensure_probe_current(&is_current)?;
         transaction.execute(
             r"INSERT INTO outlet_state(outlet_id, status, consecutive_successes, consecutive_failures, updated_at)
                VALUES (?1, ?2, ?3, ?4, ?5)
@@ -478,6 +530,7 @@ impl GuardianStore {
                 .map_or_else(|| "probe_result".into(), crate::history::sanitized_code),
         });
         if let Some(event) = &event {
+            ensure_probe_current(&is_current)?;
             transaction.execute(
                 "INSERT INTO state_events(outlet_id, occurred_at, from_status, to_status, reason, outlet_label, outlet_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
@@ -634,6 +687,7 @@ impl GuardianStore {
                     probe,
                     failure_threshold,
                     recovery_threshold,
+                    &|| true,
                 )?;
             }
             if let Some(event) = route_event {
@@ -865,27 +919,49 @@ impl GuardianStore {
     ///
     /// Returns an error when the event cannot be inserted.
     pub fn record_route_switch(&self, event: &RouteSwitchEvent) -> Result<(), StoreError> {
+        self.record_route_switch_guarded(event, || true)
+    }
+
+    /// Persists a selector change only while its probe lease remains current.
+    /// All writes share one transaction so stale work is rolled back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StaleProbeGeneration`] for stale work, or a
+    /// storage/validation error.
+    pub fn record_route_switch_guarded<F>(
+        &self,
+        event: &RouteSwitchEvent,
+        is_current: F,
+    ) -> Result<(), StoreError>
+    where
+        F: Fn() -> bool,
+    {
+        ensure_probe_current(&is_current)?;
         let occurred_at = canonical_timestamp(&event.occurred_at)?;
+        let transaction = self.connection.unchecked_transaction()?;
         for outlet_id in event
             .from_outlet
             .iter()
             .chain(std::iter::once(&event.to_outlet))
         {
-            self.connection.execute(
+            ensure_probe_current(&is_current)?;
+            transaction.execute(
                 "INSERT OR IGNORE INTO outlets(id, label, updated_at, kind, enabled) VALUES (?1, '已脱敏出口', ?2, 'unknown', 0)",
                 params![outlet_id, occurred_at],
             )?;
         }
+        ensure_probe_current(&is_current)?;
         let from_snapshot = event
             .from_outlet
             .as_ref()
-            .map(|outlet_id| self.outlet_display(outlet_id))
+            .map(|outlet_id| outlet_display_in_transaction(&transaction, outlet_id))
             .transpose()?
             .flatten();
-        let to_snapshot = self
-            .outlet_display(&event.to_outlet)?
+        let to_snapshot = outlet_display_in_transaction(&transaction, &event.to_outlet)?
             .unwrap_or_else(|| (event.to_outlet.clone(), HistoryOutletKind::Unknown));
-        self.connection.execute(
+        ensure_probe_current(&is_current)?;
+        transaction.execute(
             "INSERT INTO route_switches(occurred_at, from_outlet, to_outlet, mode, reason, duration_ms, from_label, from_kind, to_label, to_kind) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 occurred_at,
@@ -900,6 +976,8 @@ impl GuardianStore {
                 to_snapshot.1.as_str(),
             ],
         )?;
+        ensure_probe_current(&is_current)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -938,12 +1016,33 @@ impl GuardianStore {
         label: &str,
         evidence: &UdpCapabilityEvidence,
     ) -> Result<(), StoreError> {
+        self.record_udp_capability_guarded(outlet_id, label, evidence, || true)
+    }
+
+    /// Records UDP evidence only while its probe lease remains current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StaleProbeGeneration`] for stale work, or a
+    /// storage/validation error.
+    pub fn record_udp_capability_guarded<F>(
+        &mut self,
+        outlet_id: &str,
+        label: &str,
+        evidence: &UdpCapabilityEvidence,
+        is_current: F,
+    ) -> Result<(), StoreError>
+    where
+        F: Fn() -> bool,
+    {
+        ensure_probe_current(&is_current)?;
         let observed_at = canonical_timestamp(&evidence.observed_at)?;
         let configuration_generation = i64::try_from(evidence.configuration_generation)
             .ok()
             .filter(|generation| *generation != i64::MAX)
             .ok_or(StoreError::InvalidUdpGeneration)?;
         let transaction = self.connection.transaction()?;
+        ensure_probe_current(&is_current)?;
         transaction.execute(
             r"INSERT INTO outlets(id, label, updated_at) VALUES (?1, ?2, ?3)
                ON CONFLICT(id) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at",
@@ -953,6 +1052,7 @@ impl GuardianStore {
                 observed_at
             ],
         )?;
+        ensure_probe_current(&is_current)?;
         transaction.execute(
             "INSERT INTO udp_capability_history(outlet_id, status, observed_at, evidence_version, probe_version, model_version, configuration_fingerprint, configuration_generation, reason_code) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
@@ -968,11 +1068,13 @@ impl GuardianStore {
             ],
         )?;
         let history_id = transaction.last_insert_rowid();
+        ensure_probe_current(&is_current)?;
         transaction.execute(
             r"INSERT INTO udp_capability_current(outlet_id, history_id) VALUES (?1, ?2)
                ON CONFLICT(outlet_id) DO UPDATE SET history_id=excluded.history_id",
             params![outlet_id, history_id],
         )?;
+        ensure_probe_current(&is_current)?;
         transaction.commit()?;
         Ok(())
     }
@@ -989,13 +1091,33 @@ impl GuardianStore {
         label: &str,
         evidence: &UdpCapabilityEvidence,
     ) -> Result<(), StoreError> {
+        self.ensure_udp_capability_guarded(outlet_id, label, evidence, || true)
+    }
+
+    /// Creates initial UDP evidence only while its probe lease remains current.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::StaleProbeGeneration`] for stale work, or a
+    /// storage/validation error.
+    pub fn ensure_udp_capability_guarded<F>(
+        &mut self,
+        outlet_id: &str,
+        label: &str,
+        evidence: &UdpCapabilityEvidence,
+        is_current: F,
+    ) -> Result<(), StoreError>
+    where
+        F: Fn() -> bool,
+    {
+        ensure_probe_current(&is_current)?;
         let exists = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM udp_capability_current WHERE outlet_id=?1)",
             [outlet_id],
             |row| row.get::<_, bool>(0),
         )?;
         if !exists {
-            self.record_udp_capability(outlet_id, label, evidence)?;
+            self.record_udp_capability_guarded(outlet_id, label, evidence, is_current)?;
         }
         Ok(())
     }
@@ -1991,6 +2113,36 @@ fn ensure_column(
     Ok(())
 }
 
+fn ensure_probe_current(is_current: &impl Fn() -> bool) -> Result<(), StoreError> {
+    if is_current() {
+        Ok(())
+    } else {
+        Err(StoreError::StaleProbeGeneration)
+    }
+}
+
+fn outlet_display_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    outlet_id: &str,
+) -> Result<Option<(String, HistoryOutletKind)>, StoreError> {
+    let stored = transaction
+        .query_row(
+            "SELECT label, kind FROM outlets WHERE id=?1",
+            [outlet_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    stored
+        .map(|(label, kind)| {
+            Ok((
+                crate::history::sanitized_label(&label),
+                HistoryOutletKind::try_from(kind.as_str())
+                    .map_err(StoreError::InvalidOutletKind)?,
+            ))
+        })
+        .transpose()
+}
+
 fn next_state(
     previous: &StoredState,
     observed: HealthStatus,
@@ -2159,6 +2311,38 @@ mod tests {
         assert_eq!(summaries[0].failed_samples, 2);
         assert!((summaries[0].availability_percent - 66.666).abs() < 0.01);
         assert_eq!(summaries[0].last_status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn stale_generation_during_transaction_rolls_back_probe_and_state() {
+        let mut store = GuardianStore::open_in_memory().expect("store");
+        let outlet = outlet();
+        store
+            .record_probe(
+                &outlet,
+                &result(HealthStatus::Healthy, "2026-01-01T00:00:00Z"),
+                1,
+                1,
+            )
+            .expect("initial state");
+        let checks = std::cell::Cell::new(0_u32);
+        let error = store
+            .record_probe_guarded(
+                &outlet,
+                &result(HealthStatus::Down, "2026-01-01T00:00:01Z"),
+                1,
+                1,
+                || {
+                    let next = checks.get().saturating_add(1);
+                    checks.set(next);
+                    next < 6
+                },
+            )
+            .expect_err("stale commit must roll back");
+        assert!(matches!(error, StoreError::StaleProbeGeneration));
+        let summary = store.summaries().expect("summary").remove(0);
+        assert_eq!(summary.samples, 1);
+        assert_eq!(summary.last_status, HealthStatus::Healthy);
     }
 
     #[test]

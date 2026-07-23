@@ -1,4 +1,6 @@
 export type HealthStatus = "unknown" | "healthy" | "degraded" | "down";
+export type OutletProbePhase = "not_configured" | "waiting_for_probe_runtime" | "probing" | "healthy" | "degraded" | "down";
+export type SubscriptionSourcePhase = "not_applicable" | "not_configured" | "waiting" | "available" | "unavailable";
 export type UdpCapabilityStatus = "supported" | "tcp_only" | "unknown";
 export type HistoryWindow = "1h" | "24h" | "7d" | "30d";
 export type HistoryOutletKind = "subscription" | "local_proxy" | "unknown";
@@ -110,6 +112,15 @@ export interface OutletSummary {
   average_latency_ms: number | null;
   last_status: HealthStatus;
   last_observed_at: string | null;
+}
+
+export interface OutletProbeView {
+  outlet_id: string;
+  phase: OutletProbePhase;
+  source_phase: SubscriptionSourcePhase;
+  latency_ms: number | null;
+  observed_at: string | null;
+  reason_code: string | null;
 }
 
 export interface LatencySample {
@@ -229,6 +240,7 @@ export interface DashboardSnapshot {
   events: StateEvent[];
   route_switches: RouteSwitchEvent[];
   udp_capabilities: UdpCapabilityEvidence[];
+  probe_views: OutletProbeView[];
 }
 
 export type RouteMode = "priority" | "fastest" | "manual";

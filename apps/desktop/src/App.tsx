@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { Dashboard } from "./Dashboard";
 import { HistoryPage } from "./HistoryPage";
 import { NodesPage } from "./NodesPage";
@@ -32,6 +33,24 @@ export default function App() {
     void load();
     const timer = window.setInterval(() => void load(), 15_000);
     return () => window.clearInterval(timer);
+  }, [load]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ generation: number; outlet_ids: string[]; reason_code: string }>(
+      "guardian://updated",
+      () => void load(),
+    ).then((cleanup) => {
+      if (disposed) cleanup();
+      else unlisten = cleanup;
+    }).catch(() => {
+      // Browser preview and event-channel failures rely on the polling fallback.
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, [load]);
 
   useEffect(() => {

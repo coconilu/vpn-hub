@@ -84,10 +84,13 @@ mod tests {
 
     #[tokio::test]
     async fn closed_local_port_is_down() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("lease loopback port");
+        let port = listener.local_addr().expect("local address").port();
+        drop(listener);
         let outlet = ProbeOutletConfig {
             id: "closed".into(),
             label: "Closed".into(),
-            proxy_url: "socks5h://127.0.0.1:9".into(),
+            proxy_url: format!("socks5h://127.0.0.1:{port}"),
             probe_url: "https://example.com".into(),
             degraded_latency_ms: 2_500,
             enabled: true,
@@ -102,6 +105,12 @@ mod tests {
 
         let result = probe_outlet(&outlet, &monitor).await;
         assert_eq!(result.status, HealthStatus::Down);
-        assert!(result.error_code.is_some());
+        assert!(matches!(
+            result.error_code.as_deref(),
+            Some("port_unreachable" | "port_timeout")
+        ));
+        let serialized = serde_json::to_string(&result).expect("sanitized result");
+        assert!(!serialized.contains("socks5h://"));
+        assert!(!serialized.contains("https://"));
     }
 }

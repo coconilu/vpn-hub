@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     future::Future,
     net::{Ipv4Addr, SocketAddr, UdpSocket},
     sync::{
@@ -18,7 +19,8 @@ use vpn_hub_core::{
     HistoryResponse, LatencySample, OutletConfig, OutletKind, OutletSummary, ProbeOutletConfig,
     ProbeResult, RouteMode, RouteSwitchEvent, StateEvent, SubscriptionCredentialStatus,
     UdpCapabilityEvidence, UdpProbeTarget, ValidationIssue, is_current_udp_evidence,
-    probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle_controlled,
+    probe_controller_outlets, probe_local_proxy_udp, probe_outlet,
+    run_controller_guardian_cycle_controlled, run_controller_guardian_cycle_selected_guarded,
     unknown_udp_evidence,
 };
 
@@ -169,10 +171,10 @@ use crate::{
     runtime::{
         AppState, CoreStatus, EntrySwitchApplyRequest, EntrySwitchApplyResult, EntrySwitchPreview,
         EntrySwitchPreviewChecks, FastPathPerformanceReport, FastPathResultCode, FastPathStage,
-        ForegroundOperationStage, NodeLatencyBatchResult, NodeLatencyResult, PortSnapshot,
-        RoutingStatus, SettingsApplyRequest, SettingsApplyResult, SettingsPreview,
-        SettingsPreviewRequest, SettingsTerminalStatus, SubscriptionNodeCatalog,
-        SubscriptionNodeGroup,
+        ForegroundOperationStage, NodeLatencyBatchResult, NodeLatencyResult, OutletProbePhase,
+        OutletProbeView, PortSnapshot, RoutingStatus, SettingsApplyRequest, SettingsApplyResult,
+        SettingsPreview, SettingsPreviewRequest, SettingsTerminalStatus, SubscriptionNodeCatalog,
+        SubscriptionNodeGroup, SubscriptionSourcePhase,
     },
 };
 
@@ -187,6 +189,87 @@ pub struct DashboardSnapshot {
     events: Vec<StateEvent>,
     route_switches: Vec<RouteSwitchEvent>,
     udp_capabilities: Vec<UdpCapabilityEvidence>,
+    probe_views: Vec<OutletProbeView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeCycleCompletion {
+    Healthy,
+    Degraded,
+    RecoverableFailure,
+    RecoveryPending,
+    NotConfigured,
+    WaitingForRuntime,
+    TerminalGate,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeCycleOutletOutcome {
+    pub outlet_id: String,
+    pub completion: ProbeCycleCompletion,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeCycleReport {
+    pub interval_seconds: u64,
+    pub outcomes: Vec<ProbeCycleOutletOutcome>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProbeCycleControl {
+    expected_generation: u64,
+    is_current: ProbeGenerationGuard,
+    on_outlet_update: ProbeOutletUpdate,
+    on_runtime_ready: ProbeRuntimeReady,
+}
+
+type ProbeGenerationGuard = Arc<dyn Fn(u64) -> bool + Send + Sync>;
+type ProbeOutletUpdate = Arc<dyn Fn(u64, &str) + Send + Sync>;
+type ProbeRuntimeReady = Arc<dyn Fn(u64, String) + Send + Sync>;
+
+impl ProbeCycleControl {
+    pub(crate) fn new(
+        expected_generation: u64,
+        is_current: impl Fn(u64) -> bool + Send + Sync + 'static,
+        on_outlet_update: impl Fn(u64, &str) + Send + Sync + 'static,
+        on_runtime_ready: impl Fn(u64, String) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            expected_generation,
+            is_current: Arc::new(is_current),
+            on_outlet_update: Arc::new(on_outlet_update),
+            on_runtime_ready: Arc::new(on_runtime_ready),
+        }
+    }
+
+    fn unfenced() -> Self {
+        Self::new(0, |_| true, |_, _| {}, |_, _| {})
+    }
+
+    fn is_current(&self) -> bool {
+        (self.is_current)(self.expected_generation)
+    }
+
+    fn ensure_current(&self) -> Result<(), String> {
+        self.is_current()
+            .then_some(())
+            .ok_or_else(|| "probe_stale_generation".into())
+    }
+
+    fn publish_outlet_update(&self, outlet_id: &str) {
+        if self.is_current() {
+            (self.on_outlet_update)(self.expected_generation, outlet_id);
+        }
+    }
+
+    fn runtime_ready_notifier(&self) -> Arc<dyn Fn(String) + Send + Sync> {
+        let control = self.clone();
+        Arc::new(move |outlet_id| {
+            if control.is_current() {
+                (control.on_runtime_ready)(control.expected_generation, outlet_id);
+            }
+        })
+    }
 }
 
 async fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
@@ -227,14 +310,16 @@ async fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
             evidence.reason_code = "evidence_requires_revalidation".into();
         }
     }
+    let summaries = store
+        .summaries()
+        .map_err(|error| format!("无法读取出口汇总：{error}"))?;
+    let probe_views = dashboard_probe_views(state, &private, &summaries);
     Ok(DashboardSnapshot {
         updated_at: Utc::now().to_rfc3339(),
         entry: AppState::port_snapshot(&private.entry.host, private.entry.port),
         mihomo: state.core_status_authoritative().await?,
         routing: state.routing_status()?,
-        summaries: store
-            .summaries()
-            .map_err(|error| format!("无法读取出口汇总：{error}"))?,
+        summaries,
         samples: store
             .recent_samples(180)
             .map_err(|error| format!("无法读取延迟样本：{error}"))?,
@@ -245,7 +330,83 @@ async fn load_dashboard(state: &AppState) -> Result<DashboardSnapshot, String> {
             .recent_route_switches(12)
             .map_err(|error| format!("无法读取路由切换事件：{error}"))?,
         udp_capabilities,
+        probe_views,
     })
+}
+
+fn dashboard_probe_views(
+    state: &AppState,
+    private: &vpn_hub_core::PrivateRoutingConfig,
+    summaries: &[OutletSummary],
+) -> Vec<OutletProbeView> {
+    let existing = state
+        .outlet_probe_views()
+        .into_iter()
+        .map(|view| (view.outlet_id.clone(), view))
+        .collect::<std::collections::HashMap<_, _>>();
+    let resolved = state
+        .resolved_subscription_urls(private)
+        .unwrap_or_default();
+    private
+        .enabled_outlets()
+        .map(|outlet| {
+            let summary = summaries
+                .iter()
+                .find(|summary| summary.outlet_id == outlet.id);
+            if let OutletKind::Subscription { secret_ref, .. } = &outlet.kind
+                && !resolved.contains_key(secret_ref)
+            {
+                return OutletProbeView {
+                    outlet_id: outlet.id.clone(),
+                    phase: OutletProbePhase::NotConfigured,
+                    source_phase: SubscriptionSourcePhase::NotConfigured,
+                    latency_ms: None,
+                    observed_at: None,
+                    reason_code: Some("subscription_not_configured".into()),
+                };
+            }
+            if let Some(view) = existing.get(&outlet.id) {
+                return view.clone();
+            }
+            match &outlet.kind {
+                OutletKind::LocalProxy { .. } => OutletProbeView {
+                    outlet_id: outlet.id.clone(),
+                    phase: summary.map_or(OutletProbePhase::Probing, |summary| {
+                        probe_phase(summary.last_status)
+                    }),
+                    source_phase: SubscriptionSourcePhase::NotApplicable,
+                    latency_ms: None,
+                    observed_at: summary.and_then(|summary| summary.last_observed_at.clone()),
+                    reason_code: None,
+                },
+                OutletKind::Subscription { .. } => OutletProbeView {
+                    outlet_id: outlet.id.clone(),
+                    phase: summary.map_or(OutletProbePhase::WaitingForProbeRuntime, |summary| {
+                        probe_phase(summary.last_status)
+                    }),
+                    source_phase: if summary.is_some() {
+                        SubscriptionSourcePhase::Available
+                    } else {
+                        SubscriptionSourcePhase::Waiting
+                    },
+                    latency_ms: None,
+                    observed_at: summary.and_then(|summary| summary.last_observed_at.clone()),
+                    reason_code: summary
+                        .is_none()
+                        .then(|| "waiting_for_probe_runtime".into()),
+                },
+            }
+        })
+        .collect()
+}
+
+const fn probe_phase(status: HealthStatus) -> OutletProbePhase {
+    match status {
+        HealthStatus::Unknown => OutletProbePhase::Probing,
+        HealthStatus::Healthy => OutletProbePhase::Healthy,
+        HealthStatus::Degraded => OutletProbePhase::Degraded,
+        HealthStatus::Down => OutletProbePhase::Down,
+    }
 }
 
 fn history_outlets(private: &vpn_hub_core::PrivateRoutingConfig) -> Vec<HistoryOutletSnapshot> {
@@ -1541,7 +1702,12 @@ async fn recover_active_settings_terminal(
     after_successful_terminal_recovery(recovery.await, dispatch_reload)
 }
 
-async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
+#[allow(clippy::too_many_lines)]
+async fn record_direct_guardian_cycle(
+    state: &AppState,
+    selected: &HashSet<String>,
+    control: &ProbeCycleControl,
+) -> Result<ProbeCycleReport, String> {
     let guardian = GuardianConfig::load(state.guardian_config_path())
         .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
     let private = state.private_config()?;
@@ -1549,56 +1715,196 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
     let mut store = GuardianStore::open(&guardian.database_path)
         .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
     store
-        .sync_history_outlets(&history_outlets(&private), &Utc::now().to_rfc3339())
+        .sync_history_outlets_guarded(&history_outlets(&private), &Utc::now().to_rfc3339(), || {
+            control.is_current()
+        })
         .map_err(|error| format!("无法同步脱敏历史出口目录：{error}"))?;
 
-    for outlet in private.enabled_outlets() {
+    let mut outcomes = Vec::new();
+    let mut configured_subscriptions = HashSet::new();
+    for outlet in private
+        .enabled_outlets()
+        .filter(|outlet| selected.contains(&outlet.id))
+    {
+        control.ensure_current()?;
         store
-            .ensure_udp_capability(
+            .ensure_udp_capability_guarded(
                 &outlet.id,
                 &outlet.label,
                 &unknown_udp_evidence(outlet, "not_yet_validated"),
+                || control.is_current(),
             )
             .map_err(|error| format!("无法初始化 UDP 能力状态：{error}"))?;
-        let probe_outlet_config = virtual_outlet(outlet, &private.entry);
-        let result = match &outlet.kind {
+        control.ensure_current()?;
+        state.set_outlet_probe_view(OutletProbeView {
+            outlet_id: outlet.id.clone(),
+            phase: OutletProbePhase::Probing,
+            source_phase: match outlet.kind {
+                OutletKind::Subscription { .. } => SubscriptionSourcePhase::Waiting,
+                OutletKind::LocalProxy { .. } => SubscriptionSourcePhase::NotApplicable,
+            },
+            latency_ms: None,
+            observed_at: None,
+            reason_code: None,
+        });
+        control.publish_outlet_update(&outlet.id);
+        match &outlet.kind {
             OutletKind::LocalProxy { endpoint } => {
+                let probe_outlet_config = virtual_outlet(outlet, &private.entry);
                 let mut direct = probe_outlet_config.clone();
                 direct.proxy_url.clone_from(endpoint);
                 direct.probe_url.clone_from(&private.probe_targets[0]);
-                probe_outlet(&direct, &guardian.monitor).await
+                let result = probe_outlet(&direct, &guardian.monitor).await;
+                let commit = store
+                    .record_probe_guarded(
+                        &probe_outlet_config,
+                        &result,
+                        guardian.monitor.failure_threshold,
+                        guardian.monitor.recovery_threshold,
+                        || control.is_current(),
+                    )
+                    .map_err(|error| format!("无法写入检测结果：{error}"))?;
+                control.ensure_current()?;
+                outcomes.push(publish_probe_commit(
+                    state,
+                    &result,
+                    SubscriptionSourcePhase::NotApplicable,
+                    commit.status,
+                    control,
+                ));
             }
-            OutletKind::Subscription { secret_ref, .. } => unavailable_result(
-                outlet,
+            OutletKind::Subscription { secret_ref, .. } => {
                 if resolved.contains_key(secret_ref) {
-                    ProbeFailureCode::ControllerNotRunning
+                    configured_subscriptions.insert(outlet.id.clone());
                 } else {
-                    ProbeFailureCode::SubscriptionNotConfigured
-                },
-                private.probe_targets.len(),
-            ),
-        };
-        store
-            .record_probe(
-                &probe_outlet_config,
-                &result,
-                guardian.monitor.failure_threshold,
-                guardian.monitor.recovery_threshold,
-            )
-            .map_err(|error| format!("无法写入检测结果：{error}"))?;
+                    control.ensure_current()?;
+                    state.set_outlet_probe_view(OutletProbeView {
+                        outlet_id: outlet.id.clone(),
+                        phase: OutletProbePhase::NotConfigured,
+                        source_phase: SubscriptionSourcePhase::NotConfigured,
+                        latency_ms: None,
+                        observed_at: None,
+                        reason_code: Some("subscription_not_configured".into()),
+                    });
+                    control.publish_outlet_update(&outlet.id);
+                    outcomes.push(ProbeCycleOutletOutcome {
+                        outlet_id: outlet.id.clone(),
+                        completion: ProbeCycleCompletion::NotConfigured,
+                    });
+                }
+            }
+        }
     }
-    Ok(guardian.monitor.interval_seconds)
+    if !configured_subscriptions.is_empty() {
+        control.ensure_current()?;
+        match state
+            .subscription_probe_runtime(&private, Some(control.runtime_ready_notifier()))
+            .await
+        {
+            Ok(runtime) => {
+                control.ensure_current()?;
+                let ready = configured_subscriptions
+                    .intersection(&runtime.ready_outlets)
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                for outlet_id in configured_subscriptions.difference(&ready) {
+                    control.ensure_current()?;
+                    state.set_outlet_probe_view(OutletProbeView {
+                        outlet_id: outlet_id.clone(),
+                        phase: OutletProbePhase::WaitingForProbeRuntime,
+                        source_phase: SubscriptionSourcePhase::Unavailable,
+                        latency_ms: None,
+                        observed_at: None,
+                        reason_code: Some("subscription_source_unavailable".into()),
+                    });
+                    control.publish_outlet_update(outlet_id);
+                    outcomes.push(ProbeCycleOutletOutcome {
+                        outlet_id: outlet_id.clone(),
+                        completion: ProbeCycleCompletion::WaitingForRuntime,
+                    });
+                }
+                let observed = probe_controller_outlets(
+                    &runtime.controller,
+                    &private,
+                    &resolved,
+                    guardian.monitor.request_timeout_ms,
+                    Some(&ready),
+                )
+                .await;
+                for (outlet, result) in observed {
+                    let commit = store
+                        .record_probe_guarded(
+                            &outlet,
+                            &result,
+                            guardian.monitor.failure_threshold,
+                            guardian.monitor.recovery_threshold,
+                            || control.is_current(),
+                        )
+                        .map_err(|error| format!("无法写入检测结果：{error}"))?;
+                    control.ensure_current()?;
+                    outcomes.push(publish_probe_commit(
+                        state,
+                        &result,
+                        SubscriptionSourcePhase::Available,
+                        commit.status,
+                        control,
+                    ));
+                }
+            }
+            Err(_) => {
+                for outlet_id in configured_subscriptions {
+                    control.ensure_current()?;
+                    state.set_outlet_probe_view(OutletProbeView {
+                        outlet_id: outlet_id.clone(),
+                        phase: OutletProbePhase::WaitingForProbeRuntime,
+                        source_phase: SubscriptionSourcePhase::Waiting,
+                        latency_ms: None,
+                        observed_at: None,
+                        reason_code: Some("probe_runtime_unavailable".into()),
+                    });
+                    control.publish_outlet_update(&outlet_id);
+                    outcomes.push(ProbeCycleOutletOutcome {
+                        outlet_id,
+                        completion: ProbeCycleCompletion::WaitingForRuntime,
+                    });
+                }
+            }
+        }
+    }
+    Ok(ProbeCycleReport {
+        interval_seconds: guardian.monitor.interval_seconds,
+        outcomes,
+    })
 }
 
 pub(crate) async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
-    record_routing_cycle_controlled(state, true, Arc::new(AtomicBool::new(false))).await
+    record_routing_cycle_locked_controlled(state, &ProbeCycleControl::unfenced()).await
 }
 
-#[cfg(test)]
-async fn record_owned_controller_cycle_locked(state: &AppState) -> Result<u64, String> {
-    record_routing_cycle_controlled(state, false, Arc::new(AtomicBool::new(false))).await
+pub(crate) async fn record_routing_cycle_locked_controlled(
+    state: &AppState,
+    control: &ProbeCycleControl,
+) -> Result<u64, String> {
+    let private = state.private_config()?;
+    let selected = private
+        .enabled_outlets()
+        .map(|outlet| outlet.id.clone())
+        .collect::<HashSet<_>>();
+    let report = record_routing_cycle_selected_locked(state, &selected, control).await?;
+    if report
+        .outcomes
+        .iter()
+        .any(|outcome| outcome.completion == ProbeCycleCompletion::TerminalGate)
+    {
+        return Err(
+            "terminal_recovery_active：自动 Guardian/ConfigReload 探测已阻断，MASTER/UDP 保持 Fail Closed"
+                .into(),
+        );
+    }
+    Ok(report.interval_seconds)
 }
 
+#[allow(dead_code)]
 pub(crate) async fn record_routing_cycle_controlled(
     state: &AppState,
     allow_direct_fallback: bool,
@@ -1622,7 +1928,13 @@ pub(crate) async fn record_routing_cycle_controlled(
             if cancel.load(Ordering::Acquire) {
                 return Err("Guardian 路由周期已取消".into());
             }
-            record_direct_guardian_cycle(state).await
+            let selected = private
+                .enabled_outlets()
+                .map(|outlet| outlet.id.clone())
+                .collect::<HashSet<_>>();
+            record_direct_guardian_cycle(state, &selected, &ProbeCycleControl::unfenced())
+                .await
+                .map(|report| report.interval_seconds)
         } else {
             Err("应用自管核心未提供可验证 Controller；不会把直连探测降级当作启动成功".into())
         };
@@ -1661,6 +1973,234 @@ pub(crate) async fn record_routing_cycle_controlled(
     );
     guardian_result?;
     Ok(guardian.monitor.interval_seconds)
+}
+
+#[allow(dead_code)]
+async fn record_owned_controller_cycle_locked(state: &AppState) -> Result<u64, String> {
+    record_routing_cycle_locked_with_mode(state, false, None, &ProbeCycleControl::unfenced())
+        .await
+        .map(|report| report.interval_seconds)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn record_routing_cycle_locked_with_mode(
+    state: &AppState,
+    allow_direct_fallback: bool,
+    selected: Option<&HashSet<String>>,
+    control: &ProbeCycleControl,
+) -> Result<ProbeCycleReport, String> {
+    control.ensure_current()?;
+    let private = state.private_config()?;
+    let selected_owned = selected.map_or_else(
+        || {
+            private
+                .enabled_outlets()
+                .map(|outlet| outlet.id.clone())
+                .collect::<HashSet<_>>()
+        },
+        Clone::clone,
+    );
+    if state.settings_terminal_active() {
+        control.ensure_current()?;
+        state.enforce_settings_terminal_fail_closed().await?;
+        return Ok(ProbeCycleReport {
+            interval_seconds: 180,
+            outcomes: selected_owned
+                .into_iter()
+                .map(|outlet_id| ProbeCycleOutletOutcome {
+                    outlet_id,
+                    completion: ProbeCycleCompletion::TerminalGate,
+                })
+                .collect(),
+        });
+    }
+    let guardian = GuardianConfig::load(state.guardian_config_path())
+        .map_err(|error| format!("无法加载 Guardian 开发配置：{error}"))?;
+    let Some(controller) = state.controller_client()? else {
+        return if allow_direct_fallback {
+            record_direct_guardian_cycle(state, &selected_owned, control).await
+        } else {
+            Err("应用自管核心未提供可验证 Controller；不会把直连探测降级当作启动成功".into())
+        };
+    };
+    let resolved = state.resolved_subscription_urls(&private)?;
+    let mut store = GuardianStore::open(&guardian.database_path)
+        .map_err(|error| format!("无法打开 Guardian 数据库：{error}"))?;
+    store
+        .sync_history_outlets_guarded(&history_outlets(&private), &Utc::now().to_rfc3339(), || {
+            control.is_current()
+        })
+        .map_err(|error| format!("无法同步脱敏历史出口目录：{error}"))?;
+
+    let mut probe_selected = HashSet::new();
+    let mut structural_outcomes = Vec::new();
+    let mut configured_subscriptions = Vec::new();
+    for outlet in private
+        .enabled_outlets()
+        .filter(|outlet| selected_owned.contains(&outlet.id))
+    {
+        match &outlet.kind {
+            OutletKind::LocalProxy { .. } => {
+                probe_selected.insert(outlet.id.clone());
+            }
+            OutletKind::Subscription { secret_ref, .. } if !resolved.contains_key(secret_ref) => {
+                control.ensure_current()?;
+                state.set_outlet_probe_view(OutletProbeView {
+                    outlet_id: outlet.id.clone(),
+                    phase: OutletProbePhase::NotConfigured,
+                    source_phase: SubscriptionSourcePhase::NotConfigured,
+                    latency_ms: None,
+                    observed_at: None,
+                    reason_code: Some("subscription_not_configured".into()),
+                });
+                control.publish_outlet_update(&outlet.id);
+                structural_outcomes.push(ProbeCycleOutletOutcome {
+                    outlet_id: outlet.id.clone(),
+                    completion: ProbeCycleCompletion::NotConfigured,
+                });
+            }
+            OutletKind::Subscription { .. } => configured_subscriptions.push((
+                outlet.id.clone(),
+                vpn_hub_core::outlet_proxy_name(&outlet.id),
+            )),
+        }
+    }
+    let selectors = configured_subscriptions
+        .iter()
+        .map(|(_, selector)| selector.clone())
+        .collect::<Vec<_>>();
+    let snapshots = if selectors.is_empty() {
+        Some(std::collections::BTreeMap::new())
+    } else {
+        controller.selector_nodes_for(&selectors).await.ok()
+    };
+    for (outlet_id, selector) in configured_subscriptions {
+        let source_ready = snapshots
+            .as_ref()
+            .and_then(|items| items.get(&selector))
+            .is_some_and(|snapshot| {
+                snapshot
+                    .nodes
+                    .iter()
+                    .any(|node| node.name != vpn_hub_core::FAIL_CLOSED_PROXY)
+            });
+        if source_ready {
+            probe_selected.insert(outlet_id);
+        } else {
+            control.ensure_current()?;
+            state.set_outlet_probe_view(OutletProbeView {
+                outlet_id: outlet_id.clone(),
+                phase: OutletProbePhase::WaitingForProbeRuntime,
+                source_phase: SubscriptionSourcePhase::Waiting,
+                latency_ms: None,
+                observed_at: None,
+                reason_code: Some("waiting_for_probe_runtime".into()),
+            });
+            control.publish_outlet_update(&outlet_id);
+            structural_outcomes.push(ProbeCycleOutletOutcome {
+                outlet_id,
+                completion: ProbeCycleCompletion::WaitingForRuntime,
+            });
+        }
+    }
+
+    let on_probe_committed = |result: &ProbeResult, stable_status: HealthStatus| {
+        let source_phase = private
+            .outlets
+            .iter()
+            .find(|outlet| outlet.id == result.outlet_id)
+            .map_or(
+                SubscriptionSourcePhase::NotApplicable,
+                |outlet| match outlet.kind {
+                    OutletKind::Subscription { .. } => SubscriptionSourcePhase::Available,
+                    OutletKind::LocalProxy { .. } => SubscriptionSourcePhase::NotApplicable,
+                },
+            );
+        let _ = publish_probe_commit(state, result, source_phase, stable_status, control);
+    };
+    let outcome = run_controller_guardian_cycle_selected_guarded(
+        &controller,
+        &private,
+        &resolved,
+        &guardian.monitor,
+        &mut store,
+        state,
+        unix_time_ms(),
+        Some(&probe_selected),
+        &|| control.is_current(),
+        &on_probe_committed,
+    )
+    .await
+    .map_err(|error| format!("Guardian 路由周期失败：{error}"))?;
+    let mut outcomes = outcome
+        .observed
+        .iter()
+        .map(|result| {
+            let stable_status = outcome.stable_statuses.get(&result.outlet_id).copied();
+            cycle_outcome(result, stable_status)
+        })
+        .collect::<Vec<_>>();
+    outcomes.extend(structural_outcomes);
+    Ok(ProbeCycleReport {
+        interval_seconds: guardian.monitor.interval_seconds,
+        outcomes,
+    })
+}
+
+pub(crate) async fn record_routing_cycle_selected_locked(
+    state: &AppState,
+    selected: &HashSet<String>,
+    control: &ProbeCycleControl,
+) -> Result<ProbeCycleReport, String> {
+    record_routing_cycle_locked_with_mode(state, true, Some(selected), control).await
+}
+
+fn view_from_result(
+    result: &ProbeResult,
+    source_phase: SubscriptionSourcePhase,
+    stable_status: Option<HealthStatus>,
+) -> OutletProbeView {
+    OutletProbeView {
+        outlet_id: result.outlet_id.clone(),
+        phase: probe_phase(stable_status.unwrap_or(result.status)),
+        source_phase,
+        latency_ms: result.latency_ms,
+        observed_at: Some(result.observed_at.clone()),
+        reason_code: result.error_code.clone(),
+    }
+}
+
+fn publish_probe_commit(
+    state: &AppState,
+    result: &ProbeResult,
+    source_phase: SubscriptionSourcePhase,
+    stable_status: HealthStatus,
+    control: &ProbeCycleControl,
+) -> ProbeCycleOutletOutcome {
+    if control.is_current() {
+        state.set_outlet_probe_view(view_from_result(result, source_phase, Some(stable_status)));
+        control.publish_outlet_update(&result.outlet_id);
+    }
+    cycle_outcome(result, Some(stable_status))
+}
+
+fn cycle_outcome(
+    result: &ProbeResult,
+    stable_status: Option<HealthStatus>,
+) -> ProbeCycleOutletOutcome {
+    ProbeCycleOutletOutcome {
+        outlet_id: result.outlet_id.clone(),
+        completion: match result.status {
+            HealthStatus::Healthy | HealthStatus::Degraded
+                if stable_status == Some(HealthStatus::Down) =>
+            {
+                ProbeCycleCompletion::RecoveryPending
+            }
+            HealthStatus::Healthy => ProbeCycleCompletion::Healthy,
+            HealthStatus::Degraded => ProbeCycleCompletion::Degraded,
+            HealthStatus::Down | HealthStatus::Unknown => ProbeCycleCompletion::RecoverableFailure,
+        },
+    }
 }
 
 #[tauri::command]
@@ -1702,6 +2242,7 @@ pub async fn recover_settings_terminal(
     .await
 }
 
+#[cfg(test)]
 fn unavailable_result(
     outlet: &OutletConfig,
     error_code: ProbeFailureCode,
@@ -1721,20 +2262,16 @@ fn unavailable_result(
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 enum ProbeFailureCode {
-    SubscriptionNotConfigured,
-    ControllerNotRunning,
-    #[cfg(test)]
     ProviderFailed,
 }
 
+#[cfg(test)]
 impl ProbeFailureCode {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::SubscriptionNotConfigured => "subscription_not_configured",
-            Self::ControllerNotRunning => "controller_not_running",
-            #[cfg(test)]
             Self::ProviderFailed => "provider_failed",
         }
     }
@@ -1769,7 +2306,6 @@ fn unix_time_ms() -> u64 {
 pub async fn get_dashboard_snapshot(
     state: State<'_, AppState>,
 ) -> Result<DashboardSnapshot, String> {
-    let _transaction = state.lock_routing_transaction().await;
     load_dashboard(&state).await
 }
 
@@ -2943,6 +3479,110 @@ mod tests {
             assert!(!serialized.contains(sensitive_part));
         }
         assert_eq!(result.total_targets, 3);
+    }
+
+    #[test]
+    fn subscription_source_availability_never_promotes_egress_health() {
+        let result = ProbeResult {
+            outlet_id: "subscription-a".into(),
+            label: "Subscription A".into(),
+            observed_at: "2026-07-22T00:00:00.000Z".into(),
+            port_reachable: true,
+            status: HealthStatus::Down,
+            http_status: None,
+            latency_ms: None,
+            error_code: Some("multi_target_quorum_failed".into()),
+            successful_targets: 1,
+            total_targets: 3,
+        };
+        let view = view_from_result(
+            &result,
+            SubscriptionSourcePhase::Available,
+            Some(HealthStatus::Down),
+        );
+        assert_eq!(view.source_phase, SubscriptionSourcePhase::Available);
+        assert_eq!(view.phase, OutletProbePhase::Down);
+        assert_eq!(
+            cycle_outcome(&result, Some(HealthStatus::Down)).completion,
+            ProbeCycleCompletion::RecoverableFailure
+        );
+    }
+
+    #[test]
+    fn successful_probe_stays_rapid_while_sqlite_recovery_is_pending() {
+        let result = ProbeResult {
+            outlet_id: "subscription-a".into(),
+            label: "Subscription A".into(),
+            observed_at: "2026-07-22T00:00:00.000Z".into(),
+            port_reachable: true,
+            status: HealthStatus::Healthy,
+            http_status: None,
+            latency_ms: Some(42),
+            error_code: None,
+            successful_targets: 3,
+            total_targets: 3,
+        };
+        let view = view_from_result(
+            &result,
+            SubscriptionSourcePhase::Available,
+            Some(HealthStatus::Down),
+        );
+        assert_eq!(view.phase, OutletProbePhase::Down);
+        assert_eq!(
+            cycle_outcome(&result, Some(HealthStatus::Down)).completion,
+            ProbeCycleCompletion::RecoveryPending
+        );
+        assert_eq!(
+            cycle_outcome(&result, Some(HealthStatus::Healthy)).completion,
+            ProbeCycleCompletion::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_local_outlet_notifies_before_delayed_sibling_finishes() {
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("isolated data directory");
+        let state = Arc::new(AppState::new_for_test(workspace_root, directory.path()));
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let control = ProbeCycleControl::new(
+            9,
+            |_| true,
+            move |generation, outlet_id| {
+                let _ = sender.send((generation, outlet_id.to_owned()));
+            },
+            |_, _| {},
+        );
+        let result = ProbeResult {
+            outlet_id: "local-fast".into(),
+            label: "Local fast".into(),
+            observed_at: "2026-07-22T00:00:00.000Z".into(),
+            port_reachable: true,
+            status: HealthStatus::Healthy,
+            http_status: Some(204),
+            latency_ms: Some(21),
+            error_code: None,
+            successful_targets: 1,
+            total_targets: 1,
+        };
+        let task_state = Arc::clone(&state);
+        let task_control = control.clone();
+        let task = tokio::spawn(async move {
+            let _ = publish_probe_commit(
+                &task_state,
+                &result,
+                SubscriptionSourcePhase::NotApplicable,
+                HealthStatus::Healthy,
+                &task_control,
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let notification = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("per-outlet update must beat delayed sibling")
+            .expect("per-outlet update");
+        assert_eq!(notification, (9, "local-fast".into()));
+        task.abort();
     }
 
     #[tokio::test]

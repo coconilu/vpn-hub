@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque, hash_map::DefaultHasher},
+    collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     hash::Hasher,
     sync::{
         Arc, Mutex,
@@ -17,14 +17,15 @@ use std::{
 use chrono::Utc;
 use serde::Serialize;
 use tauri::{
-    App, AppHandle, Manager,
+    App, AppHandle, Emitter, Manager,
     menu::{MenuBuilder, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{Notify, mpsc, oneshot};
 use vpn_hub_core::{
-    FAIL_CLOSED_OUTLET, GuardianConfig, GuardianStore, HealthStatus, RouteSwitchEvent, StateEvent,
+    FAIL_CLOSED_OUTLET, GuardianConfig, GuardianStore, HealthStatus, ImmediateProbeReason,
+    ProbeCompletion, ProbeReadiness, ProbeScheduler, RouteSwitchEvent, ScheduledProbe, StateEvent,
 };
 
 use crate::{commands, runtime::AppState};
@@ -525,6 +526,7 @@ const SIGNAL_PORT_CONFLICT: u32 = 1 << 8;
 const SIGNAL_MANUAL_START: u32 = 1 << 9;
 const SIGNAL_ROUTE_CHANGED: u32 = 1 << 10;
 const SIGNAL_MANUAL_FAILED: u32 = 1 << 11;
+const SIGNAL_PROBE_RUNTIME_READY: u32 = 1 << 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopRequestResult {
@@ -539,6 +541,7 @@ struct ControlMailbox {
     core_epoch: AtomicU64,
     core_stop_epoch: AtomicU64,
     manual_epoch: AtomicU64,
+    probe_runtime_ready: Mutex<HashMap<String, u64>>,
     notify: Notify,
 }
 
@@ -564,13 +567,32 @@ impl ControlMailbox {
         self.post(SIGNAL_MANUAL_FAILED);
     }
 
-    fn take(&self) -> (u32, u32, u64, u64, u64) {
+    fn post_probe_runtime_ready(&self, outlet_id: String, generation: u64) {
+        if let Ok(mut ready) = self.probe_runtime_ready.lock() {
+            ready.insert(outlet_id, generation);
+        }
+        self.post(SIGNAL_PROBE_RUNTIME_READY);
+    }
+
+    fn take(&self) -> (u32, u32, u64, u64, u64, Vec<(String, u64)>) {
         let signals = self.signals.swap(0, Ordering::AcqRel);
         let pid = self.core_pid.load(Ordering::Acquire);
         let epoch = self.core_epoch.load(Ordering::Acquire);
         let stop_epoch = self.core_stop_epoch.load(Ordering::Acquire);
         let manual_epoch = self.manual_epoch.load(Ordering::Acquire);
-        (signals, pid, epoch, stop_epoch, manual_epoch)
+        let probe_runtime_ready = self
+            .probe_runtime_ready
+            .lock()
+            .map(|mut ready| ready.drain().collect())
+            .unwrap_or_default();
+        (
+            signals,
+            pid,
+            epoch,
+            stop_epoch,
+            manual_epoch,
+            probe_runtime_ready,
+        )
     }
 }
 
@@ -579,6 +601,7 @@ pub struct DesktopCoordinator {
     started: AtomicBool,
     exit_permitted: AtomicBool,
     recovery_epoch: AtomicU64,
+    probe_generation: AtomicU64,
     active_cancel: Mutex<Option<Arc<AtomicBool>>>,
     manual_cancel: Mutex<Option<(u64, Arc<AtomicBool>)>>,
     pending_stop: AtomicBool,
@@ -595,6 +618,7 @@ impl DesktopCoordinator {
             started: AtomicBool::new(false),
             exit_permitted: AtomicBool::new(false),
             recovery_epoch: AtomicU64::new(0),
+            probe_generation: AtomicU64::new(0),
             active_cancel: Mutex::new(None),
             manual_cancel: Mutex::new(None),
             pending_stop: AtomicBool::new(false),
@@ -614,7 +638,10 @@ impl DesktopCoordinator {
             LifecycleEvent::StopCore => {
                 self.begin_stop(None);
             }
-            LifecycleEvent::ConfigReload { .. } => self.mailbox.post(SIGNAL_CONFIG_RELOAD),
+            LifecycleEvent::ConfigReload { .. } => {
+                self.invalidate_probe_generation();
+                self.mailbox.post(SIGNAL_CONFIG_RELOAD);
+            }
             LifecycleEvent::RecoverySignal { .. } => self.mailbox.post(SIGNAL_RECOVERY),
             LifecycleEvent::OpenWindow => self.mailbox.post(SIGNAL_OPEN),
             LifecycleEvent::WindowClose => self.mailbox.post(SIGNAL_HIDE),
@@ -667,6 +694,36 @@ impl DesktopCoordinator {
             && let Some((_, cancel)) = manual.as_ref()
         {
             cancel.store(true, Ordering::Release);
+        }
+    }
+
+    fn publish_probe_generation(&self, generation: u64) {
+        self.probe_generation
+            .fetch_max(generation, Ordering::AcqRel);
+    }
+
+    fn invalidate_probe_generation(&self) {
+        self.probe_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn probe_generation(&self) -> u64 {
+        self.probe_generation.load(Ordering::Acquire)
+    }
+
+    fn restart_probe_lease_current(
+        &self,
+        cancel: &AtomicBool,
+        expected_recovery_epoch: u64,
+        expected_probe_generation: u64,
+    ) -> bool {
+        !cancel.load(Ordering::Acquire)
+            && self.recovery_epoch() == expected_recovery_epoch
+            && self.probe_generation() == expected_probe_generation
+    }
+
+    fn post_probe_runtime_ready(&self, generation: u64, outlet_id: String) {
+        if self.probe_generation() == generation {
+            self.mailbox.post_probe_runtime_ready(outlet_id, generation);
         }
     }
 
@@ -928,8 +985,8 @@ enum WorkKind {
 enum WorkMessage {
     ProbeFinished {
         id: u64,
-        interval_seconds: u64,
-        succeeded: bool,
+        probes: Vec<ScheduledProbe>,
+        report: Result<commands::ProbeCycleReport, String>,
     },
     RestartPublished {
         id: u64,
@@ -1016,32 +1073,79 @@ fn start_stop_work(
     })
 }
 
-fn start_probe_work(app: &AppHandle, id: u64, sender: mpsc::Sender<WorkMessage>) -> ActiveWork {
+fn start_probe_work(
+    app: &AppHandle,
+    id: u64,
+    probes: &[ScheduledProbe],
+    sender: mpsc::Sender<WorkMessage>,
+) -> ActiveWork {
     let cancel = Arc::new(AtomicBool::new(false));
     let owned_child_exited = Arc::new(AtomicBool::new(false));
     let published_pid = Arc::new(AtomicU32::new(0));
     let task_cancel = Arc::clone(&cancel);
     let task_app = app.clone();
+    let task_probes = probes.to_owned();
+    let generation = probes
+        .iter()
+        .map(|probe| probe.generation)
+        .max()
+        .unwrap_or(0);
+    app.state::<DesktopCoordinator>()
+        .publish_probe_generation(generation);
+    let guard_app = app.clone();
+    let guard_cancel = Arc::clone(&cancel);
+    let update_app = app.clone();
+    let ready_app = app.clone();
+    let control = commands::ProbeCycleControl::new(
+        generation,
+        move |expected| {
+            !guard_cancel.load(Ordering::Acquire)
+                && guard_app.state::<DesktopCoordinator>().probe_generation() == expected
+        },
+        move |expected, outlet_id| {
+            emit_guardian_outlet_update(&update_app, expected, outlet_id);
+        },
+        move |expected, outlet_id| {
+            ready_app
+                .state::<DesktopCoordinator>()
+                .post_probe_runtime_ready(expected, outlet_id);
+        },
+    );
     let handle = tokio::spawn(async move {
+        task_app.state::<AppState>().mark_outlets_probing(
+            &task_probes
+                .iter()
+                .map(|probe| probe.outlet_id.clone())
+                .collect::<Vec<_>>(),
+        );
+        emit_guardian_update(&task_app, &task_probes);
         let state = task_app.state::<AppState>();
         if task_cancel.load(Ordering::Acquire) {
             let _ = sender
                 .send(WorkMessage::ProbeFinished {
                     id,
-                    interval_seconds: 180,
-                    succeeded: false,
+                    probes: task_probes,
+                    report: Err("probe_cancelled".into()),
                 })
                 .await;
             return;
         }
+        let selected = task_probes
+            .iter()
+            .map(|probe| probe.outlet_id.clone())
+            .collect::<std::collections::HashSet<_>>();
         let result =
-            commands::record_routing_cycle_controlled(&state, true, Arc::clone(&task_cancel)).await;
-        let succeeded = result.is_ok() && !task_cancel.load(Ordering::Acquire);
+            commands::record_routing_cycle_selected_locked(&state, &selected, &control).await;
+        let report = if task_cancel.load(Ordering::Acquire) {
+            Err("probe_cancelled".into())
+        } else {
+            result
+        };
         let _ = sender
             .send(WorkMessage::ProbeFinished {
                 id,
-                interval_seconds: result.unwrap_or(180),
-                succeeded,
+                probes: task_probes,
+                report,
             })
             .await;
     });
@@ -1061,6 +1165,10 @@ fn start_restart_work(
     epoch: u64,
     sender: mpsc::Sender<WorkMessage>,
 ) -> ActiveWork {
+    let lease = RestartProbeLease {
+        recovery_epoch: epoch,
+        probe_generation: app.state::<DesktopCoordinator>().probe_generation(),
+    };
     let cancel = Arc::new(AtomicBool::new(false));
     let owned_child_exited = Arc::new(AtomicBool::new(false));
     let published_pid = Arc::new(AtomicU32::new(0));
@@ -1071,7 +1179,7 @@ fn start_restart_work(
     let handle = tokio::spawn(run_restart_task(
         task_app,
         id,
-        epoch,
+        lease,
         sender,
         task_cancel,
         task_owned_child_exited,
@@ -1087,15 +1195,49 @@ fn start_restart_work(
     }
 }
 
+#[derive(Clone, Copy)]
+struct RestartProbeLease {
+    recovery_epoch: u64,
+    probe_generation: u64,
+}
+
+fn restart_probe_control(
+    app: &AppHandle,
+    cancel: &Arc<AtomicBool>,
+    lease: RestartProbeLease,
+) -> commands::ProbeCycleControl {
+    let guard_app = app.clone();
+    let guard_cancel = Arc::clone(cancel);
+    let update_app = app.clone();
+    let ready_app = app.clone();
+    commands::ProbeCycleControl::new(
+        lease.probe_generation,
+        move |expected| {
+            guard_app
+                .state::<DesktopCoordinator>()
+                .restart_probe_lease_current(&guard_cancel, lease.recovery_epoch, expected)
+        },
+        move |expected, outlet_id| {
+            emit_guardian_outlet_update(&update_app, expected, outlet_id);
+        },
+        move |expected, outlet_id| {
+            ready_app
+                .state::<DesktopCoordinator>()
+                .post_probe_runtime_ready(expected, outlet_id);
+        },
+    )
+}
+
 async fn run_restart_task(
     app: AppHandle,
     id: u64,
-    epoch: u64,
+    lease: RestartProbeLease,
     sender: mpsc::Sender<WorkMessage>,
     cancel: Arc<AtomicBool>,
     owned_child_exited: Arc<AtomicBool>,
     published_pid: Arc<AtomicU32>,
 ) {
+    let epoch = lease.recovery_epoch;
     let state = app.state::<AppState>();
     let _transaction = state.lock_routing_transaction().await;
     if cancel.load(Ordering::Acquire) || app.state::<DesktopCoordinator>().recovery_epoch() != epoch
@@ -1150,6 +1292,11 @@ async fn run_restart_task(
         send_restart_finished(&sender, id, Some(pid), outcome).await;
         return;
     }
+    let control = restart_probe_control(&app, &cancel, lease);
+    let guardian_succeeded = state.uses_helper_authority()
+        || commands::record_routing_cycle_locked_controlled(&state, &control)
+            .await
+            .is_ok();
     let child_alive = state
         .owned_core_controller_is_running_authoritative(pid)
         .await
@@ -1158,7 +1305,7 @@ async fn run_restart_task(
     let deliberately_cancelled = cancel.load(Ordering::Acquire)
         && !owned_child_exited.load(Ordering::Acquire)
         || !epoch_current;
-    let committed = !deliberately_cancelled && child_alive;
+    let committed = guardian_succeeded && !deliberately_cancelled && child_alive;
     if !committed {
         let _ = state.stop_supervised_core_if_pid(pid).await;
     }
@@ -1201,9 +1348,12 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
     let mut network_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut stop_handle: Option<tokio::task::JoinHandle<()>> = None;
     let mut stop_retry_at: Option<Instant> = None;
-    let mut pending_probe = true;
+    let schedule_origin = Instant::now();
+    let mut scheduler = ProbeScheduler::new();
+    scheduler.reconcile(probe_schedule_inputs(&app), 0);
+    let mut pending_runtime_ready = HashSet::new();
+    let mut pending_probe = false;
     let mut next_work_id = 1_u64;
-    let mut next_guardian = Instant::now();
     let mut next_network_sample = Instant::now();
     let mut last_network_fingerprint: Option<u64> = None;
     let mut last_network_sample = Instant::now();
@@ -1212,6 +1362,11 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
 
     loop {
         let coordinator = app.state::<DesktopCoordinator>();
+        let schedule_now_ms = monotonic_ms(schedule_origin);
+        if pending_probe {
+            scheduler.trigger_all(ImmediateProbeReason::Manual, schedule_now_ms);
+            pending_probe = false;
+        }
         if coordinator.pending_stop()
             && stop_handle.is_none()
             && stop_retry_at.is_none_or(|deadline| deadline <= Instant::now())
@@ -1236,22 +1391,48 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                         active = Some(work);
                     }
                 }
-            } else if pending_probe {
-                let work = start_probe_work(&app, next_work_id, work_sender.clone());
-                next_work_id = next_work_id.saturating_add(1);
-                app.state::<DesktopCoordinator>()
-                    .set_active_cancel(Some(Arc::clone(&work.cancel)));
-                active = Some(work);
-                pending_probe = false;
+            } else {
+                let due = scheduler.take_due(schedule_now_ms);
+                if !due.is_empty() {
+                    let work = start_probe_work(&app, next_work_id, &due, work_sender.clone());
+                    next_work_id = next_work_id.saturating_add(1);
+                    app.state::<DesktopCoordinator>()
+                        .set_active_cancel(Some(Arc::clone(&work.cancel)));
+                    active = Some(work);
+                }
             }
         }
         let restart_deadline =
             restart_at.map_or_else(|| Instant::now() + Duration::from_hours(24), |item| item.0);
         let stop_retry_deadline =
             stop_retry_at.unwrap_or_else(|| Instant::now() + Duration::from_hours(24));
+        let next_probe_deadline = scheduler.next_due_ms().map_or_else(
+            || Instant::now() + Duration::from_hours(24),
+            |due_ms| schedule_origin + Duration::from_millis(due_ms),
+        );
         tokio::select! {
             () = mailbox.notify.notified() => {
-                let (signals, core_pid, core_epoch, core_stop_epoch, manual_epoch) = mailbox.take();
+                let (
+                    signals,
+                    core_pid,
+                    core_epoch,
+                    core_stop_epoch,
+                    manual_epoch,
+                    runtime_ready,
+                ) = mailbox.take();
+                if signals & SIGNAL_PROBE_RUNTIME_READY != 0 {
+                    let current_generation = app.state::<DesktopCoordinator>().probe_generation();
+                    for (outlet_id, generation) in runtime_ready {
+                        if generation == current_generation {
+                            pending_runtime_ready.insert((outlet_id.clone(), generation));
+                            scheduler.mark_ready(
+                                &outlet_id,
+                                ImmediateProbeReason::RuntimeReady,
+                                monotonic_ms(schedule_origin),
+                            );
+                        }
+                    }
+                }
                 if signals & SIGNAL_EXIT != 0
                     && let Some(mut handle) = network_handle.take()
                     && tokio::time::timeout(CONTROL_JOIN_TIMEOUT, &mut handle).await.is_err()
@@ -1295,6 +1476,7 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                     owns_started_pid,
                 ) {
                     consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::CoreStarted { pid: core_pid }), &mut pending_probe, &mut restart_at);
+                    scheduler.trigger_all(ImmediateProbeReason::RuntimeReady, monotonic_ms(schedule_origin));
                 }
                 if signals & SIGNAL_PORT_CONFLICT != 0 {
                     consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::PortConflictObserved), &mut pending_probe, &mut restart_at);
@@ -1302,9 +1484,12 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                 if signals & SIGNAL_CONFIG_RELOAD != 0
                     && !app.state::<DesktopCoordinator>().pending_stop()
                 {
+                    pending_runtime_ready.clear();
                     if let Some(work) = active.take() {
                         work.cancel_and_join(&app, true).await;
                     }
+                    app.state::<AppState>().invalidate_subscription_probe_runtime().await;
+                    scheduler.reconcile(probe_schedule_inputs(&app), monotonic_ms(schedule_origin));
                     let effects = machine.reduce(LifecycleEvent::ConfigReload { now_ms: unix_time_ms() });
                     if effects.iter().any(|effect| matches!(effect, LifecycleEffect::ScheduleRestart(_))) {
                         app.state::<DesktopCoordinator>().stop_available.store(true, Ordering::Release);
@@ -1316,6 +1501,7 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                 {
                     let effects = machine.reduce(LifecycleEvent::RecoverySignal { now_ms: unix_time_ms() });
                     consume_effects(&app, &mut deduper, effects, &mut pending_probe, &mut restart_at);
+                    scheduler.trigger_all(ImmediateProbeReason::NetworkChanged, monotonic_ms(schedule_origin));
                 }
                 if signals & SIGNAL_ROUTE_CHANGED != 0 {
                     let effects = machine.reduce(LifecycleEvent::RouteChanged);
@@ -1344,6 +1530,7 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                                 if let Some(pid) = pid {
                                     pending_probe = true;
                                     consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::RecoverySucceeded { pid }), &mut pending_probe, &mut restart_at);
+                                    scheduler.trigger_all(ImmediateProbeReason::RuntimeReady, monotonic_ms(schedule_origin));
                                     publish_transition_notifications(&app, &mut transitions, &mut deduper);
                                 }
                             }
@@ -1353,16 +1540,38 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                             RestartOutcome::Cancelled => {}
                         }
                     }
-                    WorkMessage::ProbeFinished { id, interval_seconds, succeeded } if active.as_ref().is_some_and(|work| work.id == id) => {
+                    WorkMessage::ProbeFinished { id, probes, report } if active.as_ref().is_some_and(|work| work.id == id) => {
                         if let Some(mut work) = active.take() {
                             let _ = (&mut work.handle).await;
                         }
                         app.state::<DesktopCoordinator>().set_active_cancel(None);
-                        next_guardian = Instant::now() + Duration::from_secs(interval_seconds.max(1));
-                        if succeeded {
+                        let active_outlet = app.state::<AppState>().routing_status().ok().and_then(|status| status.current_outlet);
+                        let outcomes = report.as_ref().map(|report| &report.outcomes).ok();
+                        for probe in &probes {
+                            let completion = outcomes
+                                .and_then(|items| items.iter().find(|item| item.outlet_id == probe.outlet_id))
+                                .map_or(ProbeCompletion::RecoverableFailure, |item| probe_completion(item.completion));
+                            let _ = scheduler.complete(
+                                probe,
+                                completion,
+                                active_outlet.as_deref() == Some(probe.outlet_id.as_str()),
+                                monotonic_ms(schedule_origin),
+                            );
+                            if pending_runtime_ready
+                                .remove(&(probe.outlet_id.clone(), probe.generation))
+                            {
+                                scheduler.mark_ready(
+                                    &probe.outlet_id,
+                                    ImmediateProbeReason::RuntimeReady,
+                                    monotonic_ms(schedule_origin),
+                                );
+                            }
+                        }
+                        if report.is_ok() {
                             publish_transition_notifications(&app, &mut transitions, &mut deduper);
                             refresh_tray(&app);
                         }
+                        emit_guardian_update(&app, &probes);
                     }
                     WorkMessage::StopFinished { confirmed } => {
                         if let Some(mut handle) = stop_handle.take() {
@@ -1378,6 +1587,7 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                             stop_retry_at = None;
                             consume_effects(&app, &mut deduper, machine.reduce(LifecycleEvent::StopCore), &mut pending_probe, &mut restart_at);
                             app.state::<DesktopCoordinator>().resolve_stop();
+                            scheduler.reconcile(probe_schedule_inputs(&app), monotonic_ms(schedule_origin));
                             refresh_tray(&app);
                             if app.state::<DesktopCoordinator>().exit_requested.swap(false, Ordering::AcqRel) {
                                 app.state::<DesktopCoordinator>().permit_exit();
@@ -1411,10 +1621,7 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
                     }
                 }
             }
-            () = tokio::time::sleep_until(next_guardian.into()) => {
-                next_guardian = Instant::now() + Duration::from_mins(3);
-                pending_probe = true;
-            }
+            () = tokio::time::sleep_until(next_probe_deadline.into()), if active.is_none() && !app.state::<DesktopCoordinator>().pending_stop() => {}
             () = tokio::time::sleep_until(next_network_sample.into()) => {
                 let now = Instant::now();
                 let resumed = now.duration_since(last_network_sample) >= RESUME_GAP;
@@ -1456,6 +1663,91 @@ async fn run_coordinator(app: AppHandle, mailbox: Arc<ControlMailbox>) {
             }
         }
     }
+}
+
+fn monotonic_ms(origin: Instant) -> u64 {
+    u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn probe_schedule_inputs(app: &AppHandle) -> Vec<(String, ProbeReadiness)> {
+    let state = app.state::<AppState>();
+    let Ok(private) = state.private_config() else {
+        return Vec::new();
+    };
+    if state.settings_terminal_active() {
+        return private
+            .enabled_outlets()
+            .map(|outlet| (outlet.id.clone(), ProbeReadiness::TerminalGate))
+            .collect();
+    }
+    let resolved = state
+        .resolved_subscription_urls(&private)
+        .unwrap_or_default();
+    private
+        .enabled_outlets()
+        .map(|outlet| {
+            let readiness = match &outlet.kind {
+                vpn_hub_core::OutletKind::LocalProxy { .. } => ProbeReadiness::Ready,
+                vpn_hub_core::OutletKind::Subscription { secret_ref, .. }
+                    if resolved.contains_key(secret_ref) =>
+                {
+                    ProbeReadiness::Ready
+                }
+                vpn_hub_core::OutletKind::Subscription { .. } => ProbeReadiness::NotConfigured,
+            };
+            (outlet.id.clone(), readiness)
+        })
+        .collect()
+}
+
+const fn probe_completion(completion: commands::ProbeCycleCompletion) -> ProbeCompletion {
+    match completion {
+        commands::ProbeCycleCompletion::Healthy => ProbeCompletion::Healthy,
+        commands::ProbeCycleCompletion::Degraded => ProbeCompletion::Degraded,
+        commands::ProbeCycleCompletion::RecoverableFailure => ProbeCompletion::RecoverableFailure,
+        commands::ProbeCycleCompletion::RecoveryPending => ProbeCompletion::RecoveryPending,
+        commands::ProbeCycleCompletion::NotConfigured => ProbeCompletion::NotConfigured,
+        commands::ProbeCycleCompletion::WaitingForRuntime => ProbeCompletion::WaitingForRuntime,
+        commands::ProbeCycleCompletion::TerminalGate => ProbeCompletion::TerminalGate,
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct GuardianUpdateEvent {
+    generation: u64,
+    outlet_ids: Vec<String>,
+    reason_code: &'static str,
+}
+
+fn emit_guardian_update(app: &AppHandle, probes: &[ScheduledProbe]) {
+    let generation = probes
+        .iter()
+        .map(|probe| probe.generation)
+        .max()
+        .unwrap_or(0);
+    let outlet_ids = probes
+        .iter()
+        .map(|probe| safe_id(&probe.outlet_id))
+        .collect();
+    let _ = app.emit(
+        "guardian://updated",
+        GuardianUpdateEvent {
+            generation,
+            outlet_ids,
+            reason_code: "guardian_state_updated",
+        },
+    );
+}
+
+fn emit_guardian_outlet_update(app: &AppHandle, generation: u64, outlet_id: &str) {
+    let _ = app.emit(
+        "guardian://updated",
+        GuardianUpdateEvent {
+            generation,
+            outlet_ids: vec![safe_id(outlet_id)],
+            reason_code: "guardian_state_updated",
+        },
+    );
 }
 
 fn should_accept_core_started(
@@ -1725,6 +2017,133 @@ mod tests {
     use super::*;
 
     #[test]
+    fn desktop_startup_fake_clock_leases_every_ready_outlet_immediately() {
+        let now_ms = 81_000;
+        let mut scheduler = ProbeScheduler::new();
+        scheduler.reconcile(
+            [
+                ("active".into(), ProbeReadiness::Ready),
+                ("backup".into(), ProbeReadiness::Ready),
+                ("missing".into(), ProbeReadiness::NotConfigured),
+            ],
+            now_ms,
+        );
+        let due = scheduler.take_due(now_ms);
+        assert_eq!(
+            due.iter()
+                .map(|probe| probe.outlet_id.as_str())
+                .collect::<Vec<_>>(),
+            ["active", "backup"]
+        );
+        assert!(scheduler.take_due(now_ms + 180_000).is_empty());
+    }
+
+    #[test]
+    fn config_generation_change_rejects_inflight_probe_commit() {
+        let directory = tempfile::tempdir().expect("database directory");
+        let mut store =
+            GuardianStore::open(directory.path().join("guardian.sqlite3")).expect("Guardian store");
+        let outlet = vpn_hub_core::ProbeOutletConfig {
+            id: "fixture-outlet".into(),
+            label: "Fixture".into(),
+            proxy_url: "http://127.0.0.1:45123".into(),
+            probe_url: "https://fixture.invalid/health".into(),
+            degraded_latency_ms: 2_500,
+            enabled: true,
+        };
+        let healthy = vpn_hub_core::ProbeResult {
+            outlet_id: outlet.id.clone(),
+            label: outlet.label.clone(),
+            observed_at: "2026-07-22T00:00:00.000Z".into(),
+            port_reachable: true,
+            status: HealthStatus::Healthy,
+            http_status: None,
+            latency_ms: Some(42),
+            error_code: None,
+            successful_targets: 3,
+            total_targets: 3,
+        };
+        store
+            .record_probe(&outlet, &healthy, 1, 1)
+            .expect("initial state");
+        let coordinator = DesktopCoordinator::new();
+        coordinator.publish_probe_generation(7);
+        let expected_generation = coordinator.probe_generation();
+
+        coordinator.dispatch(LifecycleEvent::ConfigReload { now_ms: 1 });
+        let mut stale = healthy.clone();
+        stale.observed_at = "2026-07-22T00:00:01.000Z".into();
+        stale.status = HealthStatus::Down;
+        stale.latency_ms = None;
+        stale.error_code = Some("request_timeout".into());
+        let error = store
+            .record_probe_guarded(&outlet, &stale, 1, 1, || {
+                coordinator.probe_generation() == expected_generation
+            })
+            .expect_err("stale generation must not commit");
+        assert!(matches!(
+            error,
+            vpn_hub_core::StoreError::StaleProbeGeneration
+        ));
+        let summary = store.summaries().expect("summary").remove(0);
+        assert_eq!(summary.samples, 1);
+        assert_eq!(summary.last_status, HealthStatus::Healthy);
+    }
+
+    #[test]
+    fn restart_probe_lease_requires_cancel_recovery_and_config_fences() {
+        let coordinator = DesktopCoordinator::new();
+        coordinator.publish_probe_generation(7);
+        let cancel = AtomicBool::new(false);
+        let recovery_epoch = coordinator.recovery_epoch();
+        assert!(coordinator.restart_probe_lease_current(&cancel, recovery_epoch, 7));
+
+        cancel.store(true, Ordering::Release);
+        assert!(!coordinator.restart_probe_lease_current(&cancel, recovery_epoch, 7));
+        cancel.store(false, Ordering::Release);
+
+        coordinator.invalidate_recovery();
+        assert!(!coordinator.restart_probe_lease_current(&cancel, recovery_epoch, 7));
+        let current_recovery = coordinator.recovery_epoch();
+        assert!(coordinator.restart_probe_lease_current(&cancel, current_recovery, 7));
+
+        coordinator.invalidate_probe_generation();
+        assert!(!coordinator.restart_probe_lease_current(&cancel, current_recovery, 7));
+    }
+
+    #[test]
+    fn late_probe_runtime_readiness_wakes_waiting_outlet_immediately() {
+        let coordinator = DesktopCoordinator::new();
+        coordinator.publish_probe_generation(4);
+        coordinator.post_probe_runtime_ready(4, "late-sub".into());
+        let (signals, _, _, _, _, ready) = coordinator.mailbox.take();
+        assert_ne!(signals & SIGNAL_PROBE_RUNTIME_READY, 0);
+        assert_eq!(ready, vec![("late-sub".into(), 4)]);
+
+        let mut scheduler = ProbeScheduler::new();
+        scheduler.reconcile([("late-sub".into(), ProbeReadiness::WaitingForRuntime)], 0);
+        assert_eq!(scheduler.next_due_ms(), Some(60_000));
+        scheduler.mark_ready("late-sub", ImmediateProbeReason::RuntimeReady, 4_000);
+        let due = scheduler.take_due(4_000);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].outlet_id, "late-sub");
+    }
+
+    #[test]
+    fn guardian_update_payload_contains_only_stable_ids_and_codes() {
+        let payload = GuardianUpdateEvent {
+            generation: 7,
+            outlet_ids: vec![safe_id("fixture-outlet")],
+            reason_code: "guardian_state_updated",
+        };
+        let serialized = serde_json::to_string(&payload).expect("event payload");
+        assert!(serialized.contains("fixture-outlet"));
+        for forbidden in ["https://", "socks5://", "Bearer ", "secret", "node="] {
+            assert!(!serialized.contains(forbidden));
+        }
+    }
+
+    #[test]
     fn close_hides_but_explicit_exit_stops_owned_core_once() {
         let mut machine = LifecycleMachine {
             core_expected: true,
@@ -1874,7 +2293,7 @@ mod tests {
         }
         mailbox.post(SIGNAL_STOP);
         mailbox.post(SIGNAL_EXIT);
-        let (signals, _, _, _, _) = mailbox.take();
+        let (signals, _, _, _, _, _) = mailbox.take();
         assert_ne!(signals & SIGNAL_EXIT, 0);
         assert_ne!(signals & SIGNAL_STOP, 0);
         assert_ne!(signals & SIGNAL_CONFIG_RELOAD, 0);
@@ -1891,7 +2310,7 @@ mod tests {
         coordinator.begin_stop(None);
         assert!(!coordinator.complete_manual_start(4_242, stale_epoch));
 
-        let (signals, pid, _, _, _) = coordinator.mailbox.take();
+        let (signals, pid, _, _, _, _) = coordinator.mailbox.take();
         assert_ne!(signals & SIGNAL_MANUAL_START, 0);
         assert_eq!(signals & SIGNAL_CORE_STARTED, 0);
         assert_eq!(pid, 0);
@@ -1904,7 +2323,7 @@ mod tests {
         let start = coordinator.prepare_manual_start(&Arc::new(AtomicBool::new(false)));
 
         assert!(start.is_err());
-        let (signals, pid, _, _, _) = coordinator.mailbox.take();
+        let (signals, pid, _, _, _, _) = coordinator.mailbox.take();
         assert_ne!(signals & SIGNAL_STOP, 0);
         assert_eq!(signals & (SIGNAL_MANUAL_START | SIGNAL_CORE_STARTED), 0);
         assert_eq!(pid, 0);
@@ -1920,7 +2339,7 @@ mod tests {
         coordinator.complete_manual_start_failure(epoch);
 
         assert!(coordinator.stop_available());
-        let (signals, _, _, _, manual_epoch) = coordinator.mailbox.take();
+        let (signals, _, _, _, manual_epoch, _) = coordinator.mailbox.take();
         assert_ne!(signals & SIGNAL_MANUAL_FAILED, 0);
         assert_eq!(manual_epoch, epoch);
     }
@@ -2110,7 +2529,7 @@ mod tests {
         let coordinator = DesktopCoordinator::new();
         coordinator.dispatch(LifecycleEvent::RouteChanged);
         coordinator.dispatch(LifecycleEvent::RouteChanged);
-        let (signals, _, _, _, _) = coordinator.mailbox.take();
+        let (signals, _, _, _, _, _) = coordinator.mailbox.take();
         assert_ne!(signals & SIGNAL_ROUTE_CHANGED, 0);
         assert_eq!(signals & (SIGNAL_CONFIG_RELOAD | SIGNAL_RECOVERY), 0);
     }

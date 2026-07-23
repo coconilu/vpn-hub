@@ -12,6 +12,7 @@ pub const CURRENT_CONFIG_VERSION: u32 = 1;
 pub const MASTER_SELECTOR: &str = "VPN-HUB-MASTER";
 pub const UDP_SELECTOR: &str = "VPN-HUB-UDP";
 pub const FAIL_CLOSED_PROXY: &str = "REJECT";
+pub const MAX_PROBE_TARGETS: usize = 8;
 const DEFAULT_ENTRY_PORT: u16 = 3_666;
 const LEGACY_SUBSCRIPTION_ID: &str = "subscription-a";
 const DEFAULT_LOCAL_ID: &str = "local-client";
@@ -371,6 +372,11 @@ impl PrivateRoutingConfig {
             return Err(PrivateConfigError::Invalid(
                 "at least two probe_targets are required".into(),
             ));
+        }
+        if self.probe_targets.len() > MAX_PROBE_TARGETS {
+            return Err(PrivateConfigError::Invalid(format!(
+                "at most {MAX_PROBE_TARGETS} probe_targets are allowed"
+            )));
         }
         for target in &self.probe_targets {
             let url = Url::parse(target)
@@ -1610,5 +1616,17 @@ probe_targets = ["https://a.invalid/", "https://b.invalid/"]
             Some(true)
         );
         assert_eq!(startup_summary.entry.port, 4_568);
+    }
+
+    #[test]
+    fn rejects_probe_target_count_above_request_bound() {
+        let config = PrivateRoutingConfig {
+            probe_targets: (0..=MAX_PROBE_TARGETS)
+                .map(|index| format!("https://fixture-{index}.invalid/health"))
+                .collect(),
+            ..PrivateRoutingConfig::default()
+        };
+        let error = config.validate().expect_err("target count must be bounded");
+        assert!(error.to_string().contains("at most 8 probe_targets"));
     }
 }
