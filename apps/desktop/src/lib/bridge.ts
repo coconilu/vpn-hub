@@ -149,9 +149,11 @@ let browserNodeCatalog: SubscriptionNodeCatalog = {
 };
 const browserNodeLatencyActive = new Set<string>();
 const browserNodeLatencyCancelled = new Set<string>();
+const browserNodeRuntimePreview = () => (
+  isTauriRuntime() ? null : new URLSearchParams(window.location.search).get("runtime")
+);
 const isIsolatedProbePreview = () => (
-  !isTauriRuntime()
-  && new URLSearchParams(window.location.search).get("runtime") === "isolated-probe"
+  browserNodeRuntimePreview() === "isolated-probe"
 );
 
 const syntheticLatencyResult = (nodeName: string): NodeLatencyResult => {
@@ -366,7 +368,16 @@ export async function recoverSettingsTerminal(): Promise<SettingsTerminalStatus>
 export async function getSubscriptionNodeCatalog(): Promise<SubscriptionNodeCatalog> {
   if (!isTauriRuntime()) {
     const preview = structuredClone(browserNodeCatalog);
-    if (isIsolatedProbePreview()) {
+    if (browserNodeRuntimePreview() === "controller-error") {
+      preview.controller_ready = false;
+      preview.selection_ready = false;
+      preview.message = "主核心正在运行，但 Mihomo Controller 查询失败；请检查核心状态后刷新";
+      for (const group of preview.subscriptions) {
+        group.state = "controller_error";
+        group.current_node = null;
+        group.nodes = [];
+      }
+    } else if (isIsolatedProbePreview()) {
       preview.selection_ready = false;
       preview.message = "主核心未运行；节点列表与测速使用随机回环端口的隔离探测，不接管系统代理，启动主核心后才可切换节点";
       for (const group of preview.subscriptions) group.current_node = null;

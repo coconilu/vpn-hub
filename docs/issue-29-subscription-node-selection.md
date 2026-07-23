@@ -45,6 +45,7 @@ sequenceDiagram
 |---|---|
 | `available` | 展示节点、搜索并允许选择 |
 | `core_unavailable` | 主核心与隔离探测运行时都不可用时，提示检查 Mihomo 文件与订阅配置；不探测其他进程 |
+| `controller_error` | 主核心存在但 Controller 查询失败时，提示检查主核心状态；不误导为隔离运行时启动失败 |
 | `provider_unavailable` | 提示等待 provider；原选择保持不变 |
 | 无可管理订阅 | 引导到设置页启用订阅并保存凭据 |
 

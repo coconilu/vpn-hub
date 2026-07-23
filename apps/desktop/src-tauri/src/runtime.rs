@@ -165,6 +165,7 @@ pub struct RoutingStatus {
 pub enum SubscriptionNodeGroupState {
     Available,
     CoreUnavailable,
+    ControllerError,
     ProviderUnavailable,
     ProviderLoading,
     ProviderFailed,
@@ -1057,6 +1058,12 @@ impl ProviderReadinessNotifier {
     fn replace(&self, notify: Option<ReadinessCallback>) {
         if let Ok(mut current) = self.current.lock() {
             *current = notify;
+        }
+    }
+
+    fn replace_if_present(&self, notify: Option<ReadinessCallback>) {
+        if notify.is_some() {
+            self.replace(notify);
         }
     }
 
@@ -3319,7 +3326,8 @@ impl AppState {
             .map(|outlet| outlet_proxy_name(&outlet.id))
             .collect::<Vec<_>>();
         let managed_controller = self.controller_client()?;
-        let mut selection_ready = managed_controller.is_some();
+        let managed_controller_available = managed_controller.is_some();
+        let mut selection_ready = managed_controller_available;
         let controller = match managed_controller {
             Some(controller) => Some(controller),
             None if !selectors.is_empty() => self
@@ -3372,12 +3380,13 @@ impl AppState {
                 } else {
                     controller_ready = false;
                     selection_ready = false;
+                    let state = if managed_controller_available {
+                        SubscriptionNodeGroupState::ControllerError
+                    } else {
+                        SubscriptionNodeGroupState::CoreUnavailable
+                    };
                     subscriptions.extend(eligible_outlets.iter().map(|outlet| {
-                        subscription_node_group(
-                            outlet,
-                            SubscriptionNodeGroupState::CoreUnavailable,
-                            empty_selector_node_snapshot(),
-                        )
+                        subscription_node_group(outlet, state, empty_selector_node_snapshot())
                     }));
                 }
             }
@@ -3394,7 +3403,11 @@ impl AppState {
         let message = if subscriptions.is_empty() {
             "没有已启用且凭据可用的订阅出口；请先在设置中完成订阅配置".into()
         } else if !controller_ready {
-            "无法启动隔离订阅探测；请检查 Mihomo 文件与订阅配置后重试".into()
+            if managed_controller_available {
+                "主核心正在运行，但 Mihomo Controller 查询失败；请检查核心状态后刷新".into()
+            } else {
+                "无法启动隔离订阅探测；请检查 Mihomo 文件与订阅配置后重试".into()
+            }
         } else if !selection_ready {
             "主核心未运行；节点列表与测速使用随机回环端口的隔离探测，不接管系统代理，启动主核心后才可切换节点".into()
         } else if subscriptions.iter().any(|group| {
@@ -4140,7 +4153,9 @@ impl AppState {
             if !alive || runtime.fingerprint != fingerprint {
                 *slot = None;
             } else {
-                runtime.readiness_notify.replace(readiness_notify.clone());
+                runtime
+                    .readiness_notify
+                    .replace_if_present(readiness_notify.clone());
             }
         }
         if slot.is_none() {
@@ -6707,6 +6722,22 @@ mod tests {
         server.join().expect("Controller server");
     }
 
+    #[test]
+    fn absent_probe_runtime_caller_preserves_existing_readiness_notifier() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let notifier = ProviderReadinessNotifier::new(Some(Arc::new(move |outlet_id| {
+            let _ = sender.send(outlet_id);
+        })));
+
+        notifier.replace_if_present(None);
+        notifier.notify("preserved-sub".into());
+
+        assert_eq!(
+            receiver.try_recv().expect("preserved notification"),
+            "preserved-sub"
+        );
+    }
+
     #[tokio::test]
     async fn cancelled_probe_runtime_reuse_replaces_late_readiness_notifier() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("fake Controller");
@@ -6781,7 +6812,7 @@ mod tests {
             .expect("initial unavailable snapshot");
         old_lease_cancelled.store(true, Ordering::Release);
         let (new_sender, mut new_receiver) = tokio::sync::mpsc::unbounded_channel();
-        notifier.replace(Some(Arc::new(move |outlet_id| {
+        notifier.replace_if_present(Some(Arc::new(move |outlet_id| {
             let _ = new_sender.send(outlet_id);
         })));
         allow_ready_sender.send(()).expect("release ready response");
@@ -7453,6 +7484,35 @@ mod tests {
             SubscriptionNodeGroupState::CoreUnavailable
         );
         assert!(catalog.subscriptions[0].current_node.is_none());
+    }
+
+    #[tokio::test]
+    async fn node_catalog_distinguishes_managed_controller_query_failure() {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        configure_node_latency_subscription(&state);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("port lease");
+        let address = listener.local_addr().expect("unused address");
+        drop(listener);
+        let controller =
+            ControllerClient::new(&format!("http://{address}"), "fixture-secret".into(), 100)
+                .expect("Controller client");
+        state.set_controller_client_for_test(controller);
+
+        let catalog = state
+            .subscription_node_catalog()
+            .await
+            .expect("managed Controller error catalog");
+
+        assert!(!catalog.controller_ready);
+        assert!(!catalog.selection_ready);
+        assert_eq!(
+            catalog.subscriptions[0].state,
+            SubscriptionNodeGroupState::ControllerError
+        );
+        assert!(catalog.message.contains("主核心正在运行"));
+        assert!(!catalog.message.contains("无法启动隔离"));
     }
 
     #[tokio::test]
