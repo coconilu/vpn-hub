@@ -6,18 +6,19 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 use vpn_hub_core::{
-    GuardianConfig, GuardianStore, HealthStatus, HistoryExport, HistoryFilter, HistoryOutletKind,
-    HistoryOutletSnapshot, HistoryResponse, LatencySample, OutletConfig, OutletKind, OutletSummary,
-    ProbeOutletConfig, ProbeResult, RouteMode, RouteSwitchEvent, StateEvent,
-    SubscriptionCredentialStatus, UdpCapabilityEvidence, UdpProbeTarget, ValidationIssue,
-    is_current_udp_evidence, probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle,
+    DEFAULT_GUARDIAN_CONCURRENCY, DEFAULT_GUARDIAN_CYCLE_BUDGET, GuardianConfig, GuardianStore,
+    HealthStatus, HistoryExport, HistoryFilter, HistoryOutletKind, HistoryOutletSnapshot,
+    HistoryResponse, LatencySample, OutletConfig, OutletKind, OutletSummary, ProbeOutletConfig,
+    ProbeResult, RouteMode, RouteSwitchEvent, StateEvent, SubscriptionCredentialStatus,
+    UdpCapabilityEvidence, UdpProbeTarget, ValidationIssue, is_current_udp_evidence,
+    probe_local_proxy_udp, probe_outlet, run_controller_guardian_cycle_controlled,
     unknown_udp_evidence,
 };
 
@@ -28,11 +29,147 @@ use crate::{
     },
     runtime::{DeferredSettingsApply, EntrySwitchRuntimeJournal, EntrySwitchRuntimePhase},
 };
+
+const FOREGROUND_FALLBACK_BUDGET: Duration = Duration::from_secs(10);
+const FOREGROUND_LIVE_POLICY_RECOVERY_RESERVE: Duration = Duration::from_secs(2);
+
+async fn await_foreground_step<T>(
+    deadline: tokio::time::Instant,
+    label: &str,
+    future: impl Future<Output = T>,
+) -> Result<T, String> {
+    tokio::time::timeout_at(deadline, future)
+        .await
+        .map_err(|_| format!("{label} 超过前台回退总预算 10 秒"))
+}
+
+async fn wait_for_foreground_cancel(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn ensure_foreground_before_deadline(
+    deadline: tokio::time::Instant,
+    label: &str,
+    operation: &crate::runtime::ForegroundOperation<'_>,
+) -> Result<(), String> {
+    operation.ensure_active()?;
+    if tokio::time::Instant::now() >= deadline {
+        Err(format!("{label} 超过前台策略事务总预算"))
+    } else {
+        Ok(())
+    }
+}
+
+async fn await_foreground_active<T>(
+    deadline: tokio::time::Instant,
+    label: &str,
+    operation: &crate::runtime::ForegroundOperation<'_>,
+    future: impl Future<Output = T>,
+) -> Result<T, String> {
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        () = wait_for_foreground_cancel(operation.cancel_flag()) => {
+            Err(format!("{label} 已取消；正在执行事务补偿"))
+        }
+        result = &mut future => {
+            operation.ensure_active()?;
+            Ok(result)
+        }
+        () = tokio::time::sleep_until(deadline) => {
+            Err(format!("{label} 超过前台策略事务总预算"))
+        }
+    }
+}
+
+async fn apply_live_policy_settings_transaction(
+    state: &AppState,
+    request: SettingsApplyRequest,
+    operation: &crate::runtime::ForegroundOperation<'_>,
+    deadline: tokio::time::Instant,
+) -> Result<SettingsApplyResult, String> {
+    let active_deadline = deadline
+        .checked_sub(FOREGROUND_LIVE_POLICY_RECOVERY_RESERVE)
+        .unwrap_or(deadline);
+    ensure_foreground_before_deadline(active_deadline, "在线策略 preflight", operation)?;
+    let _transaction = await_foreground_active(
+        active_deadline,
+        "等待路由事务锁",
+        operation,
+        state.lock_routing_transaction(),
+    )
+    .await?;
+    let selector_snapshot = await_foreground_active(
+        active_deadline,
+        "读取 Controller selector 快照",
+        operation,
+        state.capture_controller_selector_snapshot(),
+    )
+    .await??;
+    ensure_foreground_before_deadline(active_deadline, "在线策略候选提交", operation)?;
+    let mut pending = state.apply_settings_deferred(request)?;
+    let validation = await_foreground_active(
+        active_deadline,
+        "Controller 在线策略应用与权威回读",
+        operation,
+        state.apply_runtime_policy_verified(),
+    )
+    .await
+    .and_then(std::convert::identity);
+    if let Err(error) = validation {
+        operation.set_stage(ForegroundOperationStage::Rollback);
+        return Err(state
+            .compensate_failed_live_settings_before(
+                &pending,
+                &selector_snapshot,
+                &format!("Controller 在线应用未确认：{error}"),
+                deadline,
+            )
+            .await);
+    }
+    if tokio::time::Instant::now() >= active_deadline {
+        operation.set_stage(ForegroundOperationStage::Rollback);
+        return Err(state
+            .compensate_failed_live_settings_before(
+                &pending,
+                &selector_snapshot,
+                "Controller 在线应用完成时已耗尽可提交预算",
+                deadline,
+            )
+            .await);
+    }
+    if let Err(error) = operation.enter_commit_barrier() {
+        operation.set_stage(ForegroundOperationStage::Rollback);
+        return Err(state
+            .compensate_failed_live_settings_before(&pending, &selector_snapshot, &error, deadline)
+            .await);
+    }
+    match state.finalize_deferred_settings(&mut pending, false) {
+        Ok(result) => Ok(result),
+        Err(error) if state.deferred_settings_commit_decided(&pending) => Err(format!(
+            "settings_commit_recovery_pending：提交决定已持久化；后续收尾失败，只会幂等前滚且不会伪装回滚：{error}"
+        )),
+        Err(error) => {
+            operation.set_stage(ForegroundOperationStage::Rollback);
+            Err(state
+                .compensate_failed_live_settings_before(
+                    &pending,
+                    &selector_snapshot,
+                    &format!("设置最终提交失败：{error}"),
+                    deadline,
+                )
+                .await)
+        }
+    }
+}
 use crate::{
     lifecycle::{self, LifecycleEvent},
     runtime::{
         AppState, CoreStatus, EntrySwitchApplyRequest, EntrySwitchApplyResult, EntrySwitchPreview,
-        EntrySwitchPreviewChecks, NodeLatencyBatchResult, NodeLatencyResult, PortSnapshot,
+        EntrySwitchPreviewChecks, FastPathPerformanceReport, FastPathResultCode, FastPathStage,
+        ForegroundOperationStage, NodeLatencyBatchResult, NodeLatencyResult, PortSnapshot,
         RoutingStatus, SettingsApplyRequest, SettingsApplyResult, SettingsPreview,
         SettingsPreviewRequest, SettingsTerminalStatus, SubscriptionNodeCatalog,
         SubscriptionNodeGroup,
@@ -295,16 +432,28 @@ fn owned_core_stop_confirmed(
 async fn compensate_failed_entry_switch(
     app: &AppHandle,
     state: &AppState,
+    operation: &crate::runtime::ForegroundOperation<'_>,
+    deadline: tokio::time::Instant,
     pending: Option<&DeferredSettingsApply>,
     journal: &EntrySwitchRuntimeJournal,
     failure: &str,
 ) -> String {
+    operation.set_stage(ForegroundOperationStage::Rollback);
     if pending.is_some_and(|value| state.deferred_settings_commit_decided(value)) {
         return format!(
             "entry_switch_recovery_pending：{failure}；入口提交决定已持久化，系统代理与配置只允许幂等前滚"
         );
     }
-    let stop_result = lifecycle::dispatch_stop_and_wait(app).await;
+    let stop_result = match await_foreground_step(
+        deadline,
+        "入口回滚停止核心",
+        lifecycle::dispatch_stop_and_wait(app),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return format!("entry_switch_recovery_pending：{failure}；{error}"),
+    };
     let authoritative_pid = match state.owned_core_pid_authoritative().await {
         Ok(pid) => pid,
         Err(error) => {
@@ -355,9 +504,16 @@ async fn compensate_failed_entry_switch(
     {
         notes.push("停止请求优先，原入口配置已恢复且核心保持停止");
     } else {
+        operation.set_stage(ForegroundOperationStage::Recovery);
         let restart = {
             let _transaction = state.lock_routing_transaction().await;
-            start_owned_core_verified(app, state).await
+            await_foreground_step(
+                deadline,
+                "入口回滚恢复旧核心",
+                start_owned_core_verified(app, state),
+            )
+            .await
+            .and_then(std::convert::identity)
         };
         if let Err(error) = restart {
             return format!(
@@ -426,9 +582,12 @@ async fn prepare_entry_switch_transaction(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_arguments)]
 async fn finalize_entry_switch_transaction(
     app: &AppHandle,
     state: &AppState,
+    operation: &crate::runtime::ForegroundOperation<'_>,
+    deadline: tokio::time::Instant,
     request: &EntrySwitchApplyRequest,
     previous_entry: vpn_hub_core::EntryConfig,
     mut pending: DeferredSettingsApply,
@@ -446,6 +605,8 @@ async fn finalize_entry_switch_transaction(
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 &error,
@@ -462,6 +623,8 @@ async fn finalize_entry_switch_transaction(
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 &error,
@@ -474,6 +637,8 @@ async fn finalize_entry_switch_transaction(
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 &error,
@@ -487,6 +652,8 @@ async fn finalize_entry_switch_transaction(
             return Err(compensate_failed_entry_switch(
                 app,
                 state,
+                operation,
+                deadline,
                 Some(&pending),
                 &journal,
                 &error,
@@ -494,6 +661,7 @@ async fn finalize_entry_switch_transaction(
             .await);
         }
     };
+    operation.set_stage(ForegroundOperationStage::Committed);
     if let Err(error) =
         state.set_entry_switch_runtime_phase(&mut journal, EntrySwitchRuntimePhase::CommitDecided)
     {
@@ -516,61 +684,159 @@ async fn finalize_entry_switch_transaction(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_lines)]
 async fn run_entry_switch_transaction(
     app: &AppHandle,
     state: &AppState,
     request: &EntrySwitchApplyRequest,
     prepared: PreparedEntrySwitch,
+    operation: &crate::runtime::ForegroundOperation<'_>,
 ) -> Result<EntrySwitchApplyResult, String> {
     let PreparedEntrySwitch {
         settings_fingerprint,
         previous_entry,
         mut journal,
     } = prepared;
-    let stop_result = lifecycle::dispatch_stop_and_wait(app).await;
-    let authoritative_pid = state.owned_core_pid_authoritative().await?;
-    if !owned_core_stop_confirmed(stop_result, authoritative_pid) {
-        return Err(
-            "entry_switch_recovery_pending：已请求停止当前核心，但尚未确认精确 owned core 消失；入口与系统代理尚未提交并保留恢复日志"
-                .into(),
-        );
-    }
-    if AppState::port_snapshot(&request.target.host, request.target.port).reachable {
-        let error = "停止旧核心后目标端口被并发占用；拒绝接管";
-        return Err(compensate_failed_entry_switch(app, state, None, &journal, error).await);
-    }
+    let deadline = tokio::time::Instant::now() + FOREGROUND_FALLBACK_BUDGET;
+    operation.set_stage(ForegroundOperationStage::Applying);
+    let owned_pid = state
+        .owned_core_pid_authoritative()
+        .await?
+        .ok_or_else(|| "入口切换前 exact-owned core 已停止".to_string())?;
     let pending = match state
         .apply_entry_switch_settings_deferred(request.target.clone(), settings_fingerprint)
     {
         Ok(pending) => pending,
         Err(error) => {
-            return Err(compensate_failed_entry_switch(app, state, None, &journal, &error).await);
+            let _ = state.clear_entry_switch_runtime_journal();
+            return Err(format!("入口候选未提交，owned 核心保持原状态：{error}"));
         }
     };
     if let Err(error) =
         state.set_entry_switch_runtime_phase(&mut journal, EntrySwitchRuntimePhase::SettingsPending)
     {
-        return Err(
-            compensate_failed_entry_switch(app, state, Some(&pending), &journal, &error).await,
-        );
+        return Err(compensate_failed_entry_switch(
+            app,
+            state,
+            operation,
+            deadline,
+            Some(&pending),
+            &journal,
+            &error,
+        )
+        .await);
     }
-    let runtime_start = {
+    operation.set_stage(ForegroundOperationStage::HotReload);
+    let hot_reload = {
         let _transaction = state.lock_routing_transaction().await;
-        start_owned_core_verified(app, state).await
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            state.reload_owned_core_config_verified(owned_pid, operation.cancel_flag()),
+        )
+        .await
+        .map_err(|_| "入口同 PID 热重载超过 4 秒预算".to_string())
+        .and_then(std::convert::identity)
     };
-    if let Err(error) = runtime_start {
-        return Err(
-            compensate_failed_entry_switch(app, state, Some(&pending), &journal, &error).await,
-        );
-    }
+    let managed_core_restarted = if hot_reload.is_ok() {
+        false
+    } else {
+        if let Err(error) = operation.ensure_active() {
+            return Err(compensate_failed_entry_switch(
+                app,
+                state,
+                operation,
+                deadline,
+                Some(&pending),
+                &journal,
+                &error,
+            )
+            .await);
+        }
+        operation.set_stage(ForegroundOperationStage::FallbackRestart);
+        let stop_result = await_foreground_step(
+            deadline,
+            "入口回退停止旧核心",
+            lifecycle::dispatch_stop_and_wait(app),
+        )
+        .await?;
+        let authoritative_pid = state.owned_core_pid_authoritative().await?;
+        if !owned_core_stop_confirmed(stop_result, authoritative_pid) {
+            return Err(compensate_failed_entry_switch(
+                app,
+                state,
+                operation,
+                deadline,
+                Some(&pending),
+                &journal,
+                "入口热重载失败，且未能确认 exact-owned core 已停止",
+            )
+            .await);
+        }
+        if AppState::port_snapshot(&request.target.host, request.target.port).reachable {
+            let error = "停止旧核心后目标端口被并发占用；拒绝接管";
+            return Err(compensate_failed_entry_switch(
+                app,
+                state,
+                operation,
+                deadline,
+                Some(&pending),
+                &journal,
+                error,
+            )
+            .await);
+        }
+        let runtime_start = {
+            let _transaction = state.lock_routing_transaction().await;
+            await_foreground_step(
+                deadline,
+                "入口回退启动候选核心",
+                start_owned_core_verified(app, state),
+            )
+            .await
+            .and_then(std::convert::identity)
+        };
+        if let Err(error) = runtime_start {
+            return Err(compensate_failed_entry_switch(
+                app,
+                state,
+                operation,
+                deadline,
+                Some(&pending),
+                &journal,
+                &error,
+            )
+            .await);
+        }
+        true
+    };
     if let Err(error) =
         state.set_entry_switch_runtime_phase(&mut journal, EntrySwitchRuntimePhase::RuntimeVerified)
     {
-        return Err(
-            compensate_failed_entry_switch(app, state, Some(&pending), &journal, &error).await,
-        );
+        return Err(compensate_failed_entry_switch(
+            app,
+            state,
+            operation,
+            deadline,
+            Some(&pending),
+            &journal,
+            &error,
+        )
+        .await);
     }
-    finalize_entry_switch_transaction(app, state, request, previous_entry, pending, journal).await
+    operation.enter_commit_barrier()?;
+    let mut result = finalize_entry_switch_transaction(
+        app,
+        state,
+        operation,
+        deadline,
+        request,
+        previous_entry,
+        pending,
+        journal,
+    )
+    .await?;
+    result.managed_core_restarted = managed_core_restarted;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -579,23 +845,28 @@ pub async fn apply_entry_switch(
     app: AppHandle,
     state: State<'_, AppState>,
     request: EntrySwitchApplyRequest,
+    operation_id: String,
 ) -> Result<EntrySwitchApplyResult, String> {
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (app, state, request);
+        let _ = (app, state, request, operation_id);
         Err("安全入口切换只支持 Windows 当前用户 default-LAN 系统代理".into())
     }
     #[cfg(target_os = "windows")]
     {
         let _settings_apply = state.lock_settings_apply().await;
+        let operation = state.begin_foreground_operation(&operation_id)?;
         if state.settings_terminal_active() {
             return Err("terminal_recovery_active：设置安全门未解除，拒绝入口切换".into());
         }
         if state.uses_helper_authority() {
             return Err("当前入口切换仅支持 desktop-owned 核心，不会绕过 Helper authority".into());
         }
+        app.state::<lifecycle::DesktopCoordinator>()
+            .cancel_background_work();
+        state.advance_config_generation()?;
         let prepared = prepare_entry_switch_transaction(&state, &request).await?;
-        run_entry_switch_transaction(&app, &state, &request, prepared).await
+        run_entry_switch_transaction(&app, &state, &request, prepared, &operation).await
     }
 }
 
@@ -606,6 +877,28 @@ pub async fn get_subscription_node_catalog(
 ) -> Result<SubscriptionNodeCatalog, String> {
     let _transaction = state.lock_routing_transaction().await;
     state.subscription_node_catalog().await
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn retry_subscription_provider(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    subscription_id: String,
+) -> Result<SubscriptionNodeGroup, String> {
+    let group = {
+        let _transaction = state.lock_routing_transaction().await;
+        state.retry_subscription_provider(&subscription_id).await?
+    };
+    if group.state == crate::runtime::SubscriptionNodeGroupState::ProviderLoading {
+        lifecycle::dispatch(
+            &app,
+            LifecycleEvent::ConfigReload {
+                now_ms: unix_time_ms(),
+            },
+        );
+    }
+    Ok(group)
 }
 
 #[tauri::command]
@@ -628,7 +921,6 @@ pub async fn test_subscription_node_latency(
     subscription_id: String,
     node_name: String,
 ) -> Result<NodeLatencyResult, String> {
-    let _transaction = state.lock_routing_transaction().await;
     state
         .test_subscription_node_latency(&subscription_id, &node_name)
         .await
@@ -641,7 +933,6 @@ pub async fn test_subscription_node_latencies(
     subscription_id: String,
     operation_id: String,
 ) -> Result<NodeLatencyBatchResult, String> {
-    let _transaction = state.lock_routing_transaction().await;
     state
         .test_subscription_node_latencies(&subscription_id, &operation_id)
         .await
@@ -661,11 +952,36 @@ pub fn cancel_subscription_node_latency_batch(
 pub async fn preview_settings(
     state: State<'_, AppState>,
     request: SettingsPreviewRequest,
+    operation_id: String,
 ) -> Result<SettingsPreview, String> {
-    let _transaction = state.lock_routing_transaction().await;
-    let core_status = state.core_status_authoritative().await?;
+    let deadline = tokio::time::Instant::now() + FOREGROUND_FALLBACK_BUDGET;
+    preview_settings_inner(&state, &request, &operation_id, deadline).await
+}
+
+async fn preview_settings_inner(
+    state: &AppState,
+    request: &SettingsPreviewRequest,
+    operation_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<SettingsPreview, String> {
+    let operation = state.begin_foreground_operation(operation_id)?;
+    let _transaction = await_foreground_active(
+        deadline,
+        "等待设置预览路由事务锁",
+        &operation,
+        state.lock_routing_transaction(),
+    )
+    .await?;
+    let core_status = await_foreground_active(
+        deadline,
+        "读取设置预览核心 authority",
+        &operation,
+        state.core_status_authoritative(),
+    )
+    .await??;
+    ensure_foreground_before_deadline(deadline, "设置预览 authority preflight", &operation)?;
     let managed_core_running = core_status.managed && core_status.pid.is_some();
-    let mut preview = state.preview_settings_with_core_state(&request, managed_core_running)?;
+    let mut preview = state.preview_settings_with_core_state(request, managed_core_running)?;
     if core_status.state == "external"
         && (preview.diff.affects_private_routing() || !request.credential_intents.is_empty())
     {
@@ -702,6 +1018,75 @@ pub async fn preview_settings(
     Ok(preview)
 }
 
+struct SettingsApplyEntry<'a> {
+    _settings_apply: tokio::sync::MutexGuard<'a, ()>,
+    operation: crate::runtime::ForegroundOperation<'a>,
+    preflight: SettingsPreview,
+    managed_core_running: bool,
+}
+
+async fn begin_settings_apply_entry<'a>(
+    state: &'a AppState,
+    request: &SettingsApplyRequest,
+    operation_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<SettingsApplyEntry<'a>, String> {
+    let operation = state.begin_foreground_operation(operation_id)?;
+    let settings_apply = await_foreground_active(
+        deadline,
+        "等待设置应用串行事务锁",
+        &operation,
+        state.lock_settings_apply(),
+    )
+    .await?;
+    if state.settings_terminal_active() {
+        return Err(
+            "terminal_recovery_active：设置安全门仍处于 Fail Closed；请先执行显式受鉴权恢复".into(),
+        );
+    }
+    let _transaction = await_foreground_active(
+        deadline,
+        "等待设置应用 preflight 路由事务锁",
+        &operation,
+        state.lock_routing_transaction(),
+    )
+    .await?;
+    let core_status = await_foreground_active(
+        deadline,
+        "读取设置应用核心 authority",
+        &operation,
+        state.core_status_authoritative(),
+    )
+    .await??;
+    ensure_foreground_before_deadline(deadline, "设置应用 authority preflight", &operation)?;
+    let managed_core_running = core_status.managed && core_status.pid.is_some();
+    let preflight = state.preflight_settings_apply(request, managed_core_running)?;
+    if helper_settings_deployment_required(
+        state.uses_helper_authority(),
+        preflight.diff.affects_private_routing(),
+        !request.credential_mutations.is_empty(),
+    ) {
+        return Err("Helper 核心使用受保护的 ProgramData 配置；拒绝把用户设置误报为已应用".into());
+    }
+    if core_status.state == "external"
+        && (preflight.diff.affects_private_routing() || !request.credential_mutations.is_empty())
+    {
+        return Err("入口或 Controller ownership 不可证明；不会停止、重启或改写未知核心".into());
+    }
+    if managed_core_running
+        && preflight.diff.requires_authenticated_controller_apply()
+        && state.controller_client()?.is_none()
+    {
+        return Err("自管核心未提供受鉴权 Controller；不会把路由策略误报为在线应用".into());
+    }
+    Ok(SettingsApplyEntry {
+        _settings_apply: settings_apply,
+        operation,
+        preflight,
+        managed_core_running,
+    })
+}
+
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_lines)]
@@ -709,58 +1094,57 @@ pub async fn apply_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     request: SettingsApplyRequest,
+    operation_id: String,
 ) -> Result<SettingsApplyResult, String> {
-    let _settings_apply = state.lock_settings_apply().await;
-    if state.settings_terminal_active() {
-        return Err(
-            "terminal_recovery_active：设置安全门仍处于 Fail Closed；请先执行显式受鉴权恢复".into(),
-        );
-    }
-    let (preflight, managed_core_running) = {
-        let _transaction = state.lock_routing_transaction().await;
-        let core_status = state.core_status_authoritative().await?;
-        let managed_core_running = core_status.managed && core_status.pid.is_some();
-        let preview = state.preflight_settings_apply(&request, managed_core_running)?;
-        if helper_settings_deployment_required(
-            state.uses_helper_authority(),
-            preview.diff.affects_private_routing(),
-            !request.credential_mutations.is_empty(),
-        ) {
-            return Err(
-                "Helper 核心使用受保护的 ProgramData 配置；拒绝把用户设置误报为已应用".into(),
-            );
-        }
-        if core_status.state == "external"
-            && (preview.diff.affects_private_routing() || !request.credential_mutations.is_empty())
-        {
-            return Err(
-                "入口或 Controller ownership 不可证明；不会停止、重启或改写未知核心".into(),
-            );
-        }
-        if managed_core_running
-            && preview.diff.requires_authenticated_controller_apply()
-            && state.controller_client()?.is_none()
-        {
-            return Err("自管核心未提供受鉴权 Controller；不会把路由策略误报为在线应用".into());
-        }
-        (preview, managed_core_running)
+    let started_at = Instant::now();
+    let deadline = tokio::time::Instant::now() + FOREGROUND_FALLBACK_BUDGET;
+    let result = apply_settings_inner(app, &state, request, &operation_id, deadline).await;
+    let result_code = if result.is_ok() {
+        FastPathResultCode::Ok
+    } else {
+        FastPathResultCode::Error
     };
+    state.record_fast_path(FastPathStage::SettingsApply, started_at, result_code);
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+async fn apply_settings_inner(
+    app: AppHandle,
+    state: &AppState,
+    request: SettingsApplyRequest,
+    operation_id: &str,
+    deadline: tokio::time::Instant,
+) -> Result<SettingsApplyResult, String> {
+    let SettingsApplyEntry {
+        _settings_apply,
+        operation,
+        preflight,
+        managed_core_running,
+    } = begin_settings_apply_entry(state, &request, operation_id, deadline).await?;
+    let coordinator = app.state::<lifecycle::DesktopCoordinator>();
+    ensure_foreground_before_deadline(deadline, "设置应用 preflight", &operation)?;
+    coordinator.cancel_background_work();
+    state.advance_config_generation()?;
+    operation.ensure_active()?;
     if !preflight.requires_managed_core_restart {
-        let _transaction = state.lock_routing_transaction().await;
+        operation.set_stage(ForegroundOperationStage::Applying);
         let requires_controller_confirmation =
             managed_core_running && preflight.diff.requires_authenticated_controller_apply();
         let apply_result = if requires_controller_confirmation {
-            state
-                .apply_settings_with_runtime_validation(request, || async {
-                    record_owned_controller_cycle_locked(&state)
-                        .await
-                        .map(|_| ())
-                })
-                .await
+            apply_live_policy_settings_transaction(state, request, &operation, deadline).await
         } else {
+            let _transaction = await_foreground_active(
+                deadline,
+                "等待普通设置事务锁",
+                &operation,
+                state.lock_routing_transaction(),
+            )
+            .await?;
+            ensure_foreground_before_deadline(deadline, "普通设置最终提交", &operation)?;
+            operation.enter_commit_barrier()?;
             state.apply_settings(request)
         };
-        let coordinator = app.state::<lifecycle::DesktopCoordinator>();
         let result = match after_successful_settings_commit(apply_result, || {
             coordinator.prepare_config_reload();
         }) {
@@ -777,6 +1161,7 @@ pub async fn apply_settings(
                 return Err(error);
             }
         };
+        operation.set_stage(ForegroundOperationStage::Committed);
         lifecycle::dispatch(
             &app,
             LifecycleEvent::ConfigReload {
@@ -796,12 +1181,8 @@ pub async fn apply_settings(
     {
         return Err("无法同时证明 PID 与 Controller ownership；不会停止或改写未知核心".into());
     }
-    if lifecycle::dispatch_stop_and_wait(&app).await != lifecycle::StopRequestResult::Stopped
-        || state.owned_core_pid_authoritative().await?.is_some()
-    {
-        return Err("未能确认精确 owned core 已停止；当前配置保持不变".into());
-    }
-
+    operation.ensure_active()?;
+    operation.set_stage(ForegroundOperationStage::Applying);
     let pending_result = {
         let _transaction = state.lock_routing_transaction().await;
         state.apply_settings_deferred(request)
@@ -811,37 +1192,191 @@ pub async fn apply_settings(
         Err(error) => {
             if state.settings_recovery_pending() {
                 return Err(format!(
-                    "设置提交失败且最后有效配置回滚未完成；核心保持停止并等待下次恢复：{error}"
+                    "设置提交失败且最后有效配置回滚未完成；核心保持原状态并等待下次恢复：{error}"
                 ));
             }
-            let coordinator = app.state::<lifecycle::DesktopCoordinator>();
-            if coordinator.stop_requested() {
-                return Err(format!(
-                    "停止请求优先于设置应用；当前核心保持停止且配置未变更：{error}"
-                ));
-            }
-            let recovery = {
-                let _transaction = state.lock_routing_transaction().await;
-                start_owned_core_verified(&app, &state).await
-            };
-            return match recovery {
-                Ok(_) => Err(format!(
-                    "核心停止后设置预检失效；配置未变更且旧核心已恢复：{error}"
-                )),
-                Err(recovery_error) => Err(format!(
-                    "核心停止后设置预检失效；配置未变更，但旧核心恢复失败并进入 terminal Fail Closed：{error}；{recovery_error}"
-                )),
-            };
+            return Err(format!(
+                "设置候选提交失败；配置与 owned 核心保持原状态：{error}"
+            ));
         }
     };
+    let fallback_deadline = tokio::time::Instant::now() + FOREGROUND_FALLBACK_BUDGET;
+
+    operation.set_stage(ForegroundOperationStage::HotReload);
+    let hot_reload = {
+        let _transaction = state.lock_routing_transaction().await;
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            state.reload_owned_core_config_verified(owned_pid, operation.cancel_flag()),
+        )
+        .await
+        .map_err(|_| "同 PID 热重载超过 4 秒预算".to_string())
+        .and_then(std::convert::identity)
+    };
+    if hot_reload.is_ok() {
+        operation.enter_commit_barrier()?;
+        let finalized = {
+            let _transaction = state.lock_routing_transaction().await;
+            state.finalize_deferred_settings(&mut pending, false)
+        };
+        match finalized {
+            Ok(result) => {
+                operation.set_stage(ForegroundOperationStage::Committed);
+                coordinator.prepare_config_reload();
+                lifecycle::dispatch(
+                    &app,
+                    LifecycleEvent::ConfigReload {
+                        now_ms: unix_time_ms(),
+                    },
+                );
+                return Ok(result);
+            }
+            Err(error) if state.deferred_settings_commit_decided(&pending) => {
+                return Err(format!(
+                    "settings_commit_recovery_pending：热重载已生效且提交决定已持久化，收尾将幂等前滚：{error}"
+                ));
+            }
+            Err(error) => {
+                operation.set_stage(ForegroundOperationStage::Rollback);
+                let _ = await_foreground_step(
+                    fallback_deadline,
+                    "设置收尾回滚停止核心",
+                    lifecycle::dispatch_stop_and_wait(&app),
+                )
+                .await;
+                let rollback = {
+                    let _transaction = state.lock_routing_transaction().await;
+                    state.rollback_deferred_settings(&pending)
+                };
+                if let Err(rollback_error) = rollback {
+                    return Err(format!(
+                        "热重载已通过但事务收尾和回滚均失败；核心已停止并保持 Fail Closed：{error}；{rollback_error}"
+                    ));
+                }
+                operation.set_stage(ForegroundOperationStage::Recovery);
+                let recovery = {
+                    let _transaction = state.lock_routing_transaction().await;
+                    await_foreground_step(
+                        fallback_deadline,
+                        "设置收尾恢复旧核心",
+                        start_owned_core_verified(&app, state),
+                    )
+                    .await
+                    .and_then(std::convert::identity)
+                };
+                return match recovery {
+                    Ok(_) => Err(format!("热重载事务收尾失败，旧配置与核心已恢复：{error}")),
+                    Err(recovery_error) => Err(format!(
+                        "热重载事务收尾失败，旧配置已恢复但旧核心恢复失败：{error}；{recovery_error}"
+                    )),
+                };
+            }
+        }
+    }
+
+    if let Err(cancelled) = operation.ensure_active() {
+        operation.set_stage(ForegroundOperationStage::Rollback);
+        let stopped = await_foreground_step(
+            fallback_deadline,
+            "取消设置时停止核心",
+            lifecycle::dispatch_stop_and_wait(&app),
+        )
+        .await?;
+        let rollback = {
+            let _transaction = state.lock_routing_transaction().await;
+            state.rollback_deferred_settings(&pending)
+        };
+        if let Err(error) = rollback {
+            return Err(format!(
+                "{cancelled}；已停止热重载核心，但配置回滚未完成：{error}"
+            ));
+        }
+        if stopped != lifecycle::StopRequestResult::Stopped
+            || state.owned_core_pid_authoritative().await?.is_some()
+        {
+            return Err(format!(
+                "{cancelled}；旧配置已恢复，但无法确认 exact-owned core 已停止，保持 Fail Closed"
+            ));
+        }
+        if app
+            .state::<lifecycle::DesktopCoordinator>()
+            .stop_requested()
+        {
+            return Err(format!(
+                "{cancelled}；旧配置已恢复，停止请求优先，核心保持停止"
+            ));
+        }
+        operation.set_stage(ForegroundOperationStage::Recovery);
+        let recovery = {
+            let _transaction = state.lock_routing_transaction().await;
+            await_foreground_step(
+                fallback_deadline,
+                "取消设置后恢复旧核心",
+                start_owned_core_verified(&app, state),
+            )
+            .await
+            .and_then(std::convert::identity)
+        };
+        return match recovery {
+            Ok(_) => Err(format!("{cancelled}；旧配置与旧核心已恢复")),
+            Err(error) => Err(format!(
+                "{cancelled}；旧配置已恢复，但旧核心恢复失败并保持 Fail Closed：{error}"
+            )),
+        };
+    }
+    operation.set_stage(ForegroundOperationStage::FallbackRestart);
+    let fallback_started_at = Instant::now();
+    if await_foreground_step(
+        fallback_deadline,
+        "设置回退停止旧核心",
+        lifecycle::dispatch_stop_and_wait(&app),
+    )
+    .await?
+        != lifecycle::StopRequestResult::Stopped
+        || state.owned_core_pid_authoritative().await?.is_some()
+    {
+        state.record_fast_path(
+            FastPathStage::FallbackRestart,
+            fallback_started_at,
+            FastPathResultCode::Error,
+        );
+        operation.set_stage(ForegroundOperationStage::Rollback);
+        let rollback = {
+            let _transaction = state.lock_routing_transaction().await;
+            state.rollback_deferred_settings(&pending)
+        };
+        return Err(match rollback {
+            Ok(()) => "热重载失败且未能确认 exact-owned core 已停止；已恢复最后有效配置".into(),
+            Err(error) => format!(
+                "热重载失败、exact-owned core 未确认停止且配置回滚失败；保持 Fail Closed：{error}"
+            ),
+        });
+    }
+
     let reload_epoch_before_start = app
         .state::<lifecycle::DesktopCoordinator>()
         .recovery_epoch();
     let start_result = {
         let _transaction = state.lock_routing_transaction().await;
-        start_owned_core_verified(&app, &state).await
+        await_foreground_step(
+            fallback_deadline,
+            "设置回退启动候选核心",
+            start_owned_core_verified(&app, state),
+        )
+        .await
+        .and_then(std::convert::identity)
     };
+    state.record_fast_path(
+        FastPathStage::FallbackRestart,
+        fallback_started_at,
+        if start_result.is_ok() {
+            FastPathResultCode::Ok
+        } else {
+            FastPathResultCode::Error
+        },
+    );
     if let Err(start_error) = start_result {
+        operation.set_stage(ForegroundOperationStage::Rollback);
         let rollback = {
             let _transaction = state.lock_routing_transaction().await;
             state.rollback_deferred_settings(&pending)
@@ -851,6 +1386,7 @@ pub async fn apply_settings(
                 "新核心启动失败且最后有效配置回滚未完成；保持 Fail Closed：{start_error}；{rollback_error}"
             ));
         }
+        operation.set_stage(ForegroundOperationStage::Recovery);
         let coordinator = app.state::<lifecycle::DesktopCoordinator>();
         if coordinator.stop_requested()
             || coordinator.recovery_epoch() != reload_epoch_before_start.saturating_add(1)
@@ -859,7 +1395,13 @@ pub async fn apply_settings(
         }
         let recovery = {
             let _transaction = state.lock_routing_transaction().await;
-            start_owned_core_verified(&app, &state).await
+            await_foreground_step(
+                fallback_deadline,
+                "设置回退恢复旧核心",
+                start_owned_core_verified(&app, state),
+            )
+            .await
+            .and_then(std::convert::identity)
         };
         return match recovery {
             Ok(_) => Err(format!(
@@ -871,19 +1413,29 @@ pub async fn apply_settings(
         };
     }
 
+    operation.enter_commit_barrier()?;
     let finalized = {
         let _transaction = state.lock_routing_transaction().await;
         state.finalize_deferred_settings(&mut pending, true)
     };
     match finalized {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            operation.set_stage(ForegroundOperationStage::Committed);
+            Ok(result)
+        }
         Err(finalize_error) => {
             if state.deferred_settings_commit_decided(&pending) {
                 return Err(format!(
                     "settings_commit_recovery_pending：提交决定已持久化；设置与 Controller 保持新状态，剩余收尾只会幂等前滚：{finalize_error}"
                 ));
             }
-            let _ = lifecycle::dispatch_stop_and_wait(&app).await;
+            operation.set_stage(ForegroundOperationStage::Rollback);
+            let _ = await_foreground_step(
+                fallback_deadline,
+                "设置终态回滚停止核心",
+                lifecycle::dispatch_stop_and_wait(&app),
+            )
+            .await;
             let rollback = {
                 let _transaction = state.lock_routing_transaction().await;
                 state.rollback_deferred_settings(&pending)
@@ -899,9 +1451,16 @@ pub async fn apply_settings(
             {
                 return Err("停止请求优先于设置收尾；已恢复最后有效配置并保持核心停止".into());
             }
+            operation.set_stage(ForegroundOperationStage::Recovery);
             let recovery = {
                 let _transaction = state.lock_routing_transaction().await;
-                start_owned_core_verified(&app, &state).await
+                await_foreground_step(
+                    fallback_deadline,
+                    "设置终态恢复旧核心",
+                    start_owned_core_verified(&app, state),
+                )
+                .await
+                .and_then(std::convert::identity)
             };
             match recovery {
                 Ok(_) => Err(format!(
@@ -913,6 +1472,36 @@ pub async fn apply_settings(
             }
         }
     }
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn cancel_foreground_operation(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> bool {
+    let cancelled = state.cancel_foreground_operation(&operation_id);
+    app.state::<lifecycle::DesktopCoordinator>()
+        .cancel_background_work();
+    cancelled
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn get_foreground_operation_status(
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Option<crate::runtime::ForegroundOperationStatus> {
+    state.foreground_operation_status(&operation_id)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn get_fast_path_performance(
+    state: State<'_, AppState>,
+) -> Result<FastPathPerformanceReport, String> {
+    state.fast_path_performance_report()
 }
 
 fn helper_settings_deployment_required(
@@ -1002,17 +1591,22 @@ async fn record_direct_guardian_cycle(state: &AppState) -> Result<u64, String> {
 }
 
 pub(crate) async fn record_routing_cycle_locked(state: &AppState) -> Result<u64, String> {
-    record_routing_cycle_locked_with_mode(state, true).await
+    record_routing_cycle_controlled(state, true, Arc::new(AtomicBool::new(false))).await
 }
 
+#[cfg(test)]
 async fn record_owned_controller_cycle_locked(state: &AppState) -> Result<u64, String> {
-    record_routing_cycle_locked_with_mode(state, false).await
+    record_routing_cycle_controlled(state, false, Arc::new(AtomicBool::new(false))).await
 }
 
-async fn record_routing_cycle_locked_with_mode(
+pub(crate) async fn record_routing_cycle_controlled(
     state: &AppState,
     allow_direct_fallback: bool,
+    cancel: Arc<AtomicBool>,
 ) -> Result<u64, String> {
+    if cancel.load(Ordering::Acquire) {
+        return Err("Guardian 路由周期已取消".into());
+    }
     if state.settings_terminal_active() {
         state.enforce_settings_terminal_fail_closed().await?;
         return Err(
@@ -1025,6 +1619,9 @@ async fn record_routing_cycle_locked_with_mode(
     let private = state.private_config()?;
     let Some(controller) = state.controller_client()? else {
         return if allow_direct_fallback {
+            if cancel.load(Ordering::Acquire) {
+                return Err("Guardian 路由周期已取消".into());
+            }
             record_direct_guardian_cycle(state).await
         } else {
             Err("应用自管核心未提供可验证 Controller；不会把直连探测降级当作启动成功".into())
@@ -1036,7 +1633,8 @@ async fn record_routing_cycle_locked_with_mode(
         .sync_history_outlets(&history_outlets(&private), &Utc::now().to_rfc3339())
         .map_err(|error| format!("无法同步脱敏历史出口目录：{error}"))?;
 
-    run_controller_guardian_cycle(
+    let guardian_started_at = Instant::now();
+    let guardian_result = run_controller_guardian_cycle_controlled(
         &controller,
         &private,
         &state.resolved_subscription_urls(&private)?,
@@ -1044,9 +1642,24 @@ async fn record_routing_cycle_locked_with_mode(
         &mut store,
         state,
         unix_time_ms(),
+        Arc::clone(&cancel),
+        DEFAULT_GUARDIAN_CYCLE_BUDGET,
+        DEFAULT_GUARDIAN_CONCURRENCY,
     )
     .await
-    .map_err(|error| format!("Guardian 路由周期失败：{error}"))?;
+    .map_err(|error| format!("Guardian 路由周期失败：{error}"));
+    state.record_fast_path(
+        FastPathStage::GuardianCycle,
+        guardian_started_at,
+        if guardian_result.is_ok() {
+            FastPathResultCode::Ok
+        } else if cancel.load(Ordering::Acquire) {
+            FastPathResultCode::Cancelled
+        } else {
+            FastPathResultCode::Error
+        },
+    );
+    guardian_result?;
     Ok(guardian.monitor.interval_seconds)
 }
 
@@ -1343,6 +1956,34 @@ async fn start_owned_core_verified(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<CoreStatus, String> {
+    let started_at = Instant::now();
+    let timed = tokio::time::timeout(
+        Duration::from_secs(5),
+        start_owned_core_verified_inner(app, state),
+    )
+    .await;
+    let (result, result_code) = match timed {
+        Ok(result) => {
+            let code = if result.is_ok() {
+                FastPathResultCode::Ok
+            } else {
+                FastPathResultCode::Error
+            };
+            (result, code)
+        }
+        Err(_) => (
+            Err("核心启动超过 5 秒总预算；未发布迟到进程并保持 Fail Closed".to_string()),
+            FastPathResultCode::Timeout,
+        ),
+    };
+    state.record_fast_path(FastPathStage::CoreStartup, started_at, result_code);
+    result
+}
+
+async fn start_owned_core_verified_inner(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<CoreStatus, String> {
     let coordinator = app.state::<lifecycle::DesktopCoordinator>();
     let cancel = Arc::new(AtomicBool::new(false));
     let start_epoch = coordinator.prepare_manual_start(&cancel)?;
@@ -1377,16 +2018,10 @@ async fn start_owned_core_verified(
     {
         let _ = state.stop_supervised_core_if_pid(pid).await;
         coordinator.complete_manual_start_failure(start_epoch);
-        return Err("应用自管核心在首次 Guardian 前失去 PID 或 Controller ownership；已停止并保持 Fail Closed".into());
-    }
-    let guardian_result = record_owned_controller_cycle_locked(state).await;
-    if guardian_result.is_err()
-        || !coordinator.manual_start_allowed(start_epoch)
-        || !state.owned_core_controller_is_running(pid)
-    {
-        let _ = state.stop_supervised_core_if_pid(pid).await;
-        coordinator.complete_manual_start_failure(start_epoch);
-        return Err("应用自管核心未通过首次 Guardian 的 PID 与 Controller ownership 复核；已停止并保持 Fail Closed".into());
+        return Err(
+            "应用自管核心未通过 PID、入口与 Controller ownership 复核；已停止并保持 Fail Closed"
+                .into(),
+        );
     }
     if !coordinator.complete_manual_start(pid, start_epoch)
         || !state.owned_core_controller_is_running(pid)
@@ -1394,7 +2029,13 @@ async fn start_owned_core_verified(
         let _ = state.stop_supervised_core_if_pid(pid).await;
         return Err("停止请求已优先于迟到的启动结果；应用自管核心已清理".into());
     }
-    status.message = "开发核心已启动，并完成首次真实 Controller 健康决策".into();
+    lifecycle::dispatch(
+        app,
+        LifecycleEvent::ConfigReload {
+            now_ms: unix_time_ms(),
+        },
+    );
+    status.message = "开发核心已启动并验证双 REJECT；出口健康确认正在后台进行".into();
     Ok(status)
 }
 
@@ -1489,6 +2130,555 @@ pub async fn stop_development_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    async fn read_live_policy_fixture_request(
+        reader: &mut (impl AsyncRead + Unpin),
+    ) -> Result<String, String> {
+        const MAX_REQUEST_BYTES: usize = 16 * 1024;
+        const READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+        let mut request = Vec::with_capacity(1_024);
+        loop {
+            if let Some(header_end) = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|offset| offset + 4)
+            {
+                let headers = std::str::from_utf8(&request[..header_end])
+                    .map_err(|_| "fixture request headers are not UTF-8".to_string())?;
+                let content_length = headers
+                    .lines()
+                    .skip(1)
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then_some(value.trim())
+                    })
+                    .map_or(Ok(0_usize), |value| {
+                        value
+                            .parse::<usize>()
+                            .map_err(|_| "fixture Content-Length is invalid".to_string())
+                    })?;
+                let complete_length = header_end
+                    .checked_add(content_length)
+                    .filter(|length| *length <= MAX_REQUEST_BYTES)
+                    .ok_or_else(|| "fixture request is too large".to_string())?;
+                if request.len() >= complete_length {
+                    return String::from_utf8(request[..complete_length].to_vec())
+                        .map_err(|_| "fixture request body is not UTF-8".to_string());
+                }
+            }
+            if request.len() >= MAX_REQUEST_BYTES {
+                return Err("fixture request is too large".into());
+            }
+            let mut chunk = [0_u8; 1_024];
+            let read = tokio::time::timeout(READ_TIMEOUT, reader.read(&mut chunk))
+                .await
+                .map_err(|_| "fixture request read timed out".to_string())?
+                .map_err(|error| format!("fixture request read failed: {error}"))?;
+            if read == 0 {
+                return Err("fixture request ended before Content-Length bytes arrived".into());
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    async fn stop_live_policy_fixture_server(
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        mut server: tokio::task::JoinHandle<()>,
+    ) {
+        let _ = shutdown.send(());
+        if let Ok(result) = tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+            result.expect("live-policy fixture server task must finish cleanly");
+        } else {
+            server.abort();
+            let _ = server.await;
+            panic!("live-policy fixture server did not stop within two seconds");
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_fallback_steps_share_one_total_deadline() {
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        await_foreground_step(
+            deadline,
+            "stop",
+            tokio::time::sleep(Duration::from_millis(65)),
+        )
+        .await
+        .expect("first step");
+        let error = await_foreground_step(
+            deadline,
+            "recovery",
+            tokio::time::sleep(Duration::from_millis(65)),
+        )
+        .await
+        .expect_err("second step must consume only the remaining time");
+        assert!(error.contains("总预算 10 秒"));
+        assert!(started.elapsed() < Duration::from_millis(180));
+    }
+
+    #[tokio::test]
+    async fn live_policy_fixture_reads_fragmented_content_length_body() {
+        let body = br#"{"name":"vpn-hub-outlet-local-b"}"#;
+        let headers = format!(
+            "PUT /proxies/vpn-hub-master HTTP/1.1\r\ncontent-type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut writer, mut reader) = tokio::io::duplex(1_024);
+        let fixture_read =
+            tokio::spawn(async move { read_live_policy_fixture_request(&mut reader).await });
+
+        writer
+            .write_all(&headers.as_bytes()[..headers.len() / 2])
+            .await
+            .expect("first header fragment");
+        tokio::task::yield_now().await;
+        writer
+            .write_all(&headers.as_bytes()[headers.len() / 2..])
+            .await
+            .expect("second header fragment");
+        writer
+            .write_all(&body[..8])
+            .await
+            .expect("first body fragment");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        writer
+            .write_all(&body[8..])
+            .await
+            .expect("second body fragment");
+        drop(writer);
+
+        let request = tokio::time::timeout(Duration::from_secs(1), fixture_read)
+            .await
+            .expect("fragmented fixture read must stay bounded")
+            .expect("fixture reader task")
+            .expect("complete fixture request");
+        assert!(request.ends_with(std::str::from_utf8(body).expect("body UTF-8")));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn real_preview_and_apply_entries_cancel_routing_lock_contention_without_state_progress()
+    {
+        async fn cancel_when_registered(state: &AppState, operation_id: &str) -> bool {
+            for _ in 0..200 {
+                if state.foreground_operation_status(operation_id).is_some() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    return state.cancel_foreground_operation(operation_id);
+                }
+                tokio::task::yield_now().await;
+            }
+            false
+        }
+
+        let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let directory = tempfile::tempdir().expect("tempdir");
+        let runtime_directory = directory.path().join("runtime");
+        std::fs::create_dir_all(&runtime_directory).expect("runtime directory");
+        let provider_runtime_path = runtime_directory.join("provider-runtime.json");
+        std::fs::write(
+            &provider_runtime_path,
+            br#"{"version":1,"config_generation":7,"states":{"sub-a":"available"}}"#,
+        )
+        .expect("seed provider runtime");
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let settings_before = state.settings_view().expect("settings before contention");
+        let provider_before = std::fs::read(&provider_runtime_path).expect("provider before");
+        let generation_before = state.config_generation();
+        assert_eq!(generation_before, 7);
+
+        let mut draft = settings_before.draft.clone();
+        draft.retention_days = draft.retention_days.saturating_add(1);
+        let fingerprint = crate::runtime::settings_request_fingerprint(&draft, None, false, &[])
+            .expect("fingerprint");
+        let preview_request = SettingsPreviewRequest {
+            draft: draft.clone(),
+            credential_intents: Vec::new(),
+            active_outlet_replacement: None,
+            fail_closed_on_removed_active: false,
+            request_fingerprint: fingerprint.clone(),
+        };
+        let apply_request = SettingsApplyRequest {
+            draft,
+            credential_mutations: Vec::new(),
+            active_outlet_replacement: None,
+            fail_closed_on_removed_active: false,
+            preview_fingerprint: fingerprint,
+        };
+
+        // This is the same routing lock awaited by the real preview/apply
+        // command entry functions. Neither command may wait for its ten-second
+        // budget once cancellation is accepted.
+        let routing_guard = state.lock_routing_transaction().await;
+
+        let preview_started = tokio::time::Instant::now();
+        let (preview_result, preview_cancelled) = tokio::join!(
+            preview_settings_inner(
+                &state,
+                &preview_request,
+                "contended-preview",
+                preview_started + Duration::from_secs(10),
+            ),
+            cancel_when_registered(&state, "contended-preview"),
+        );
+        assert!(preview_cancelled, "preview cancellation must be accepted");
+        let Err(preview_error) = preview_result else {
+            panic!("contended preview must not reach authority preflight");
+        };
+        assert!(preview_error.contains("已取消"), "{preview_error}");
+        assert!(
+            preview_started.elapsed() < Duration::from_secs(1),
+            "preview cancellation took {:?}",
+            preview_started.elapsed()
+        );
+
+        let apply_started = tokio::time::Instant::now();
+        let (apply_result, apply_cancelled) = tokio::join!(
+            begin_settings_apply_entry(
+                &state,
+                &apply_request,
+                "contended-apply",
+                apply_started + Duration::from_secs(10),
+            ),
+            cancel_when_registered(&state, "contended-apply"),
+        );
+        assert!(apply_cancelled, "apply cancellation must be accepted");
+        let Err(apply_error) = apply_result else {
+            panic!("contended apply must not reach authority preflight");
+        };
+        assert!(apply_error.contains("已取消"), "{apply_error}");
+        assert!(
+            apply_started.elapsed() < Duration::from_secs(1),
+            "apply cancellation took {:?}",
+            apply_started.elapsed()
+        );
+        drop(routing_guard);
+
+        assert_eq!(state.config_generation(), generation_before);
+        assert_eq!(
+            std::fs::read(&provider_runtime_path).expect("provider after"),
+            provider_before,
+            "cancelled preflight must not clear or rewrite Provider runtime state"
+        );
+        assert_eq!(
+            state.settings_view().expect("settings after contention"),
+            settings_before,
+            "cancelled preflight must not persist candidate settings"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn live_policy_command_path_cancels_slow_controller_and_restores_without_partial_commit()
+    {
+        use std::sync::Mutex;
+
+        use tokio::net::TcpListener;
+        use vpn_hub_core::{ControllerClient, PrivateRoutingConfig, outlet_proxy_name};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let workspace_root = directory.path().join("workspace-without-mihomo");
+        std::fs::create_dir_all(&workspace_root).expect("empty workspace");
+        assert!(!workspace_root.join("tools/mihomo.lock.json").exists());
+        assert!(!workspace_root.join(".tools/mihomo").exists());
+        let initial = AppState::new_for_test(workspace_root.clone(), directory.path());
+        let mut private = PrivateRoutingConfig::default();
+        private.route_mode = RouteMode::Priority;
+        private.manual_outlet = None;
+        private.outlets = vec![
+            OutletConfig {
+                id: "local-a".into(),
+                label: "Local A".into(),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: "socks5h://127.0.0.1:45112".into(),
+                },
+            },
+            OutletConfig {
+                id: "local-b".into(),
+                label: "Local B".into(),
+                enabled: true,
+                kind: OutletKind::LocalProxy {
+                    endpoint: "socks5h://127.0.0.1:45113".into(),
+                },
+            },
+        ];
+        private
+            .save(initial.private_config_path_for_test())
+            .expect("initial config");
+        drop(initial);
+        let state = AppState::new_for_test(workspace_root, directory.path());
+        let validation_invoked = Arc::new(AtomicBool::new(false));
+        let hook_validation_invoked = Arc::clone(&validation_invoked);
+        state.set_settings_validation_hook_for_test(move |validation_directory, candidate_path| {
+            if !validation_directory.is_dir() || !candidate_path.is_file() {
+                return Err("isolated candidate validation artifacts are missing".into());
+            }
+            let yaml = std::fs::read_to_string(candidate_path)
+                .map_err(|error| format!("cannot read isolated candidate: {error}"))?;
+            if yaml.lines().any(|line| line.trim() == "DIRECT") {
+                return Err("isolated candidate violates Fail Closed".into());
+            }
+            hook_validation_invoked.store(true, Ordering::Release);
+            Ok(())
+        });
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("controller listener");
+        let address = listener.local_addr().expect("controller address");
+        let old_master = outlet_proxy_name("local-a");
+        let candidate_master = outlet_proxy_name("local-b");
+        let selected = Arc::new(Mutex::new((
+            old_master.clone(),
+            vpn_hub_core::FAIL_CLOSED_PROXY.to_string(),
+        )));
+        let candidate_observed = Arc::new(tokio::sync::Notify::new());
+        let candidate_response_release = Arc::new(tokio::sync::Notify::new());
+        let candidate_response_finished = Arc::new(AtomicBool::new(false));
+        let server_selected = Arc::clone(&selected);
+        let server_candidate_observed = Arc::clone(&candidate_observed);
+        let server_candidate_response_release = Arc::clone(&candidate_response_release);
+        let server_candidate_finished = Arc::clone(&candidate_response_finished);
+        let server_candidate = candidate_master.clone();
+        let server_old_master = old_master.clone();
+        // Model a loaded shared runner where the operation is not scheduled
+        // until after the old three-second synchronization threshold.
+        // Cancellation latency is measured separately after the candidate
+        // milestone is observed.
+        let candidate_observation_delay = Duration::from_millis(3_200);
+        let fixture_errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_fixture_errors = Arc::clone(&fixture_errors);
+        let (shutdown_server, mut server_shutdown) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut server_shutdown => break,
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(error)) = joined {
+                            server_fixture_errors
+                                .lock()
+                                .expect("fixture errors")
+                                .push(format!("fixture connection task failed: {error}"));
+                        }
+                    }
+                    accepted = listener.accept() => {
+                        let Ok((mut stream, _)) = accepted else {
+                            break;
+                        };
+                        let selected = Arc::clone(&server_selected);
+                        let candidate_observed = Arc::clone(&server_candidate_observed);
+                        let candidate_response_release =
+                            Arc::clone(&server_candidate_response_release);
+                        let candidate_finished = Arc::clone(&server_candidate_finished);
+                        let candidate = server_candidate.clone();
+                        let old_master = server_old_master.clone();
+                        let fixture_errors = Arc::clone(&server_fixture_errors);
+                        connections.spawn(async move {
+                            let request = match read_live_policy_fixture_request(&mut stream).await {
+                                Ok(request) => request,
+                                Err(error) => {
+                                    fixture_errors.lock().expect("fixture errors").push(error);
+                                    return;
+                                }
+                            };
+                            let path = request
+                                .lines()
+                                .next()
+                                .and_then(|line| line.split_whitespace().nth(1))
+                                .unwrap_or_default();
+                            let body_text = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                            let target = body_text
+                                .split("\"name\":\"")
+                                .nth(1)
+                                .and_then(|tail| tail.split('"').next());
+                            let mut slow = false;
+                            if request.starts_with("PUT ")
+                                && let Some(target) = target
+                            {
+                                let candidate_master_put = request
+                                    .contains(vpn_hub_core::MASTER_SELECTOR)
+                                    && target == candidate;
+                                let mut current = selected.lock().expect("selected");
+                                if request.contains(vpn_hub_core::UDP_SELECTOR) {
+                                    current.1 = target.into();
+                                } else if request.contains(vpn_hub_core::MASTER_SELECTOR) {
+                                    current.0 = target.into();
+                                    if candidate_master_put {
+                                        candidate_observed.notify_one();
+                                        slow = true;
+                                    }
+                                }
+                            }
+                            if slow {
+                                if tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    candidate_response_release.notified(),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    fixture_errors
+                                        .lock()
+                                        .expect("fixture errors")
+                                        .push("candidate response release timed out".into());
+                                    return;
+                                }
+                                candidate_finished.store(true, Ordering::Release);
+                            }
+                            let (status, body) = if request.starts_with("GET ") && path == "/proxies" {
+                                let current = selected.lock().expect("selected").clone();
+                                (
+                                    "200 OK",
+                                    format!(
+                                        r#"{{"proxies":{{"{}":{{"type":"Selector","now":"{}","all":["{}","{}"]}},"{}":{{"type":"Selector","now":"{}","all":["REJECT"]}}}}}}"#,
+                                        vpn_hub_core::MASTER_SELECTOR,
+                                        current.0,
+                                        old_master,
+                                        candidate,
+                                        vpn_hub_core::UDP_SELECTOR,
+                                        current.1,
+                                    ),
+                                )
+                            } else if request.starts_with("GET ")
+                                && request.contains(vpn_hub_core::UDP_SELECTOR)
+                            {
+                                let current = selected.lock().expect("selected").1.clone();
+                                ("200 OK", format!(r#"{{"now":"{current}"}}"#))
+                            } else if request.starts_with("GET ")
+                                && request.contains(vpn_hub_core::MASTER_SELECTOR)
+                            {
+                                let current = selected.lock().expect("selected").0.clone();
+                                ("200 OK", format!(r#"{{"now":"{current}"}}"#))
+                            } else {
+                                ("204 No Content", String::new())
+                            };
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        });
+                    }
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {
+                // Drain every cancelled connection before the server task exits.
+            }
+        });
+        let controller =
+            ControllerClient::new(&format!("http://{address}"), "test-secret".into(), 2_000)
+                .expect("controller");
+        state.set_controller_client_for_test(controller);
+
+        let mut draft = state.settings_view().expect("view").draft;
+        draft.route_mode = RouteMode::Manual;
+        draft.manual_outlet = Some("local-b".into());
+        let fingerprint = crate::runtime::settings_request_fingerprint(&draft, None, false, &[])
+            .expect("fingerprint");
+        let preview = state
+            .preview_settings(&SettingsPreviewRequest {
+                draft: draft.clone(),
+                credential_intents: Vec::new(),
+                active_outlet_replacement: None,
+                fail_closed_on_removed_active: false,
+                request_fingerprint: fingerprint,
+            })
+            .expect("preview");
+        assert_eq!(preview.diff.changes.len(), 1);
+        assert_eq!(preview.diff.changes[0].code, "route_policy_changed");
+        assert!(!preview.requires_managed_core_restart);
+        let request = SettingsApplyRequest {
+            draft,
+            credential_mutations: Vec::new(),
+            active_outlet_replacement: None,
+            fail_closed_on_removed_active: false,
+            preview_fingerprint: preview.request_fingerprint,
+        };
+        let operation = state
+            .begin_foreground_operation("slow-live-policy")
+            .expect("operation");
+        let started = tokio::time::Instant::now();
+        let operation_deadline = started + Duration::from_secs(10);
+        let apply = async {
+            tokio::time::sleep(candidate_observation_delay).await;
+            apply_live_policy_settings_transaction(&state, request, &operation, operation_deadline)
+                .await
+        };
+        tokio::pin!(apply);
+        let candidate_milestone = candidate_observed.notified();
+        tokio::pin!(candidate_milestone);
+        let milestone = tokio::select! {
+            biased;
+            result = &mut apply => Ok(Some(result)),
+            () = &mut candidate_milestone => Ok(None),
+            () = tokio::time::sleep_until(operation_deadline) => Err(()),
+        };
+        match milestone {
+            Ok(None) => {}
+            Ok(Some(result)) => {
+                stop_live_policy_fixture_server(shutdown_server, server).await;
+                panic!(
+                    "live-policy apply finished before the candidate milestone: {result:?}; fixture errors: {:?}",
+                    fixture_errors.lock().expect("fixture errors")
+                );
+            }
+            Err(()) => {
+                stop_live_policy_fixture_server(shutdown_server, server).await;
+                panic!(
+                    "candidate PUT was not observed before the ten-second operation deadline: {:?}",
+                    fixture_errors.lock().expect("fixture errors")
+                );
+            }
+        }
+        assert!(started.elapsed() >= candidate_observation_delay);
+
+        let cancellation_started = tokio::time::Instant::now();
+        let cancelled = state.cancel_foreground_operation("slow-live-policy");
+        let cancelled_while_request_in_flight =
+            !candidate_response_finished.load(Ordering::Acquire);
+        candidate_response_release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut apply).await;
+        stop_live_policy_fixture_server(shutdown_server, server).await;
+        let result = result.unwrap_or_else(|_| {
+            panic!(
+                "cancelled live-policy apply did not join within five seconds: {:?}",
+                fixture_errors.lock().expect("fixture errors")
+            )
+        });
+
+        assert!(validation_invoked.load(Ordering::Acquire));
+        assert!(cancelled);
+        assert!(cancelled_while_request_in_flight);
+        let error = result.expect_err("cancelled live policy must not commit");
+        assert!(error.contains("已恢复旧配置、路由状态与 Controller selectors"));
+        // Windows durable rollback includes atomic file flushes, so the bound
+        // deliberately allows that local cost while proving cancellation does
+        // not wait for the ten-second operation deadline or leave recovery work
+        // running in the foreground indefinitely.
+        assert!(
+            cancellation_started.elapsed() < Duration::from_secs(3),
+            "cancellation elapsed={:?}, total elapsed={:?}, error={error}, selected={:?}",
+            cancellation_started.elapsed(),
+            started.elapsed(),
+            selected.lock().expect("selected debug")
+        );
+        let current = selected.lock().expect("selected").clone();
+        assert_eq!(current.0, old_master);
+        assert_eq!(current.1, vpn_hub_core::FAIL_CLOSED_PROXY);
+        let restored = state.settings_view().expect("restored settings").draft;
+        assert_eq!(restored.route_mode, RouteMode::Priority);
+        assert_eq!(restored.manual_outlet, None);
+        assert!(!state.settings_recovery_pending());
+        assert!(!state.settings_terminal_active());
+    }
 
     #[test]
     fn entry_switch_preview_rejects_terminal_and_unsupported_platform() {

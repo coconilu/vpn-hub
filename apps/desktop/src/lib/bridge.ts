@@ -304,6 +304,7 @@ export async function previewEntrySwitch(
 
 export async function applyEntrySwitch(
   request: EntrySwitchApplyRequest,
+  operationId: string,
 ): Promise<EntrySwitchApplyResult> {
   if (!isTauriRuntime()) {
     if (!browserEntrySwitchAuthorization
@@ -331,7 +332,7 @@ export async function applyEntrySwitch(
       managed_core_restarted: true,
     };
   }
-  return invoke<EntrySwitchApplyResult>("apply_entry_switch", { request });
+  return invoke<EntrySwitchApplyResult>("apply_entry_switch", { request, operationId });
 }
 
 export async function getSettingsTerminalStatus(): Promise<SettingsTerminalStatus> {
@@ -448,7 +449,10 @@ export async function cancelSubscriptionNodeLatencyBatch(operationId: string): P
   return invoke<boolean>("cancel_subscription_node_latency_batch", { operationId });
 }
 
-export async function previewSettings(request: SettingsPreviewRequest): Promise<SettingsPreview> {
+export async function previewSettings(
+  request: SettingsPreviewRequest,
+  operationId: string,
+): Promise<SettingsPreview> {
   if (!isTauriRuntime()) {
     const fingerprint = settingsRequestFingerprint(
       request.draft,
@@ -534,10 +538,13 @@ export async function previewSettings(request: SettingsPreviewRequest): Promise<
     browserSettingsPreviewTicket = result.can_apply ? fingerprint : null;
     return result;
   }
-  return invoke<SettingsPreview>("preview_settings", { request });
+  return invoke<SettingsPreview>("preview_settings", { request, operationId });
 }
 
-export async function applySettings(request: SettingsApplyRequest): Promise<SettingsApplyResult> {
+export async function applySettings(
+  request: SettingsApplyRequest,
+  operationId: string,
+): Promise<SettingsApplyResult> {
   if (!isTauriRuntime()) {
     const intents = request.credential_mutations.map(({ subscription_id, action }) => ({
       subscription_id,
@@ -581,10 +588,52 @@ export async function applySettings(request: SettingsApplyRequest): Promise<Sett
       settings: structuredClone(browserSettings),
       diff,
       removed_history_rows: 0,
-      managed_core_restarted: browserSnapshot.mihomo.managed
-        && browserSnapshot.mihomo.pid !== null
-        && diff.changes.some((change) => change.impact === "managed_core_reload"),
+      managed_core_restarted: false,
     };
   }
-  return invoke<SettingsApplyResult>("apply_settings", { request });
+  return invoke<SettingsApplyResult>("apply_settings", { request, operationId });
+}
+
+export async function retrySubscriptionProvider(
+  subscriptionId: string,
+): Promise<SubscriptionNodeGroup> {
+  if (!isTauriRuntime()) {
+    const group = browserNodeCatalog.subscriptions.find(
+      (item) => item.subscription_id === subscriptionId,
+    );
+    if (!group) throw new Error("订阅出口不存在或未启用");
+    const updated = { ...group, state: "provider_loading" as const, nodes: [], current_node: null };
+    browserNodeCatalog = {
+      ...browserNodeCatalog,
+      subscriptions: browserNodeCatalog.subscriptions.map((item) => (
+        item.subscription_id === subscriptionId ? updated : item
+      )),
+    };
+    return structuredClone(updated);
+  }
+  return invoke<SubscriptionNodeGroup>("retry_subscription_provider", { subscriptionId });
+}
+
+export type ForegroundOperationStage = "validating" | "applying" | "hot_reload"
+  | "fallback_restart" | "rollback" | "recovery" | "committed";
+
+export interface ForegroundOperationStatus {
+  operation_id: string;
+  stage: ForegroundOperationStage;
+  cancellable: boolean;
+  cancel_requested: boolean;
+}
+
+export async function cancelForegroundOperation(operationId: string): Promise<boolean> {
+  if (!isTauriRuntime()) return true;
+  return invoke<boolean>("cancel_foreground_operation", { operationId });
+}
+
+export async function getForegroundOperationStatus(
+  operationId: string,
+): Promise<ForegroundOperationStatus | null> {
+  if (!isTauriRuntime()) return null;
+  return invoke<ForegroundOperationStatus | null>("get_foreground_operation_status", {
+    operationId,
+  });
 }
