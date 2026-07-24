@@ -24,35 +24,20 @@ import {
   initialNodeLatencyState,
   latencyResultToView,
   mergeBatchLatencyResults,
+  nodePageCapabilities,
   nodeLatencyKey,
   replaceSubscriptionNodeGroup,
+  subscriptionNodeGroupMessage,
 } from "./lib/subscriptionNodesModel";
 import type {
   NodeLatencyErrorCode,
   NodeLatencyViewState,
   SubscriptionNode,
   SubscriptionNodeCatalog,
-  SubscriptionNodeGroup,
 } from "./types";
 
-function groupStateMessage(group: SubscriptionNodeGroup) {
-  if (group.state === "core_unavailable") {
-    return "请先在总览中启动本应用自管 Mihomo 核心。不会连接或控制其他代理客户端。";
-  }
-  if (group.state === "provider_unavailable") {
-    return "订阅 provider 尚未返回可选节点。可以立即重试；配置无需再次保存。";
-  }
-  if (group.state === "provider_loading") {
-    return "配置已生效，provider 正在后台加载；完成后刷新即可加入路由。";
-  }
-  if (group.state === "provider_failed") {
-    return "provider 刷新失败。凭据与配置仍已安全保存，可以重试且无需再次保存。";
-  }
-  return null;
-}
-
 const errorLabel: Record<NodeLatencyErrorCode, string> = {
-  core_unavailable: "核心未启动",
+  core_unavailable: "隔离探测不可用",
   provider_unavailable: "Provider 未就绪",
   node_disappeared: "节点已消失",
   timeout: "测速超时",
@@ -127,7 +112,8 @@ export function NodesPage() {
     () => filterSubscriptionNodes(activeGroup?.nodes ?? [], query),
     [activeGroup, query],
   );
-  const stateMessage = activeGroup ? groupStateMessage(activeGroup) : null;
+  const stateMessage = subscriptionNodeGroupMessage(activeGroup);
+  const capabilities = nodePageCapabilities(catalog, activeGroup);
   const testing = testingNode !== null || batchOperation !== null;
   const busy = loading || selecting !== null || testing || retryingProvider;
 
@@ -258,11 +244,11 @@ export function NodesPage() {
               <Square aria-hidden="true" />{cancelling ? "正在取消…" : "取消批量测速"}
             </button>
           ) : (
-            <button className="primary-button" disabled={busy || !activeGroup || activeGroup.state !== "available"} onClick={() => void testAll()} type="button">
+            <button className="primary-button" disabled={busy || !capabilities.canTest} onClick={() => void testAll()} type="button">
               <Gauge aria-hidden="true" />测试全部
             </button>
           )}
-          <button className="secondary-button" disabled={busy} onClick={() => void load()} type="button">
+          <button className="secondary-button" disabled={busy || !capabilities.canRefresh} onClick={() => void load()} type="button">
             <RefreshCw aria-hidden="true" className={loading ? "spin" : ""} />刷新状态
           </button>
         </div>
@@ -298,11 +284,14 @@ export function NodesPage() {
               <Search aria-hidden="true" /><span className="sr-only">搜索节点</span>
               <input onChange={(event) => setQuery(event.target.value)} placeholder="搜索节点名称或协议" type="search" value={query} />
             </label>
-            <div className="node-current-summary"><span>当前节点（测速不会改变）</span><strong>{activeGroup?.current_node ?? "尚未选择"}</strong></div>
+            <div className="node-current-summary">
+              <span>当前节点（测速不会改变）</span>
+              <strong>{capabilities.currentNodeLabel}</strong>
+            </div>
           </section>
 
           {stateMessage ? (
-            <div className="node-empty is-warning"><CircleAlert aria-hidden="true" /><h2>节点列表暂不可用</h2><p>{stateMessage}</p>{activeGroup?.state !== "core_unavailable" && <button className="secondary-button" disabled={retryingProvider} onClick={() => void retryProvider()} type="button"><RefreshCw aria-hidden="true" className={retryingProvider ? "spin" : ""} />{retryingProvider ? "正在提交重试…" : "重试 Provider"}</button>}</div>
+            <div className="node-empty is-warning"><CircleAlert aria-hidden="true" /><h2>节点列表暂不可用</h2><p>{stateMessage}</p>{activeGroup?.state !== "core_unavailable" && activeGroup?.state !== "controller_error" && <button className="secondary-button" disabled={retryingProvider} onClick={() => void retryProvider()} type="button"><RefreshCw aria-hidden="true" className={retryingProvider ? "spin" : ""} />{retryingProvider ? "正在提交重试…" : "重试 Provider"}</button>}</div>
           ) : visibleNodes.length === 0 ? (
             <div className="node-empty"><Search aria-hidden="true" /><h2>没有匹配节点</h2><p>换一个关键词，或清空搜索条件。</p></div>
           ) : (
@@ -325,8 +314,8 @@ export function NodesPage() {
                       <button aria-label={`重测 ${node.name}`} className="secondary-button node-test-button" disabled={busy} onClick={() => void testOne(node.name)} type="button">
                         <Gauge aria-hidden="true" />{testingNode === node.name ? "测试中…" : "单节点重测"}
                       </button>
-                      <button aria-pressed={selected} className="node-select-button" disabled={busy || selected} onClick={() => void chooseNode(node.name)} type="button">
-                        {selectingThis ? "正在确认…" : selected ? "已选择" : "选择此节点"}
+                      <button aria-pressed={selected} className="node-select-button" disabled={busy || selected || !capabilities.canSelect} onClick={() => void chooseNode(node.name)} type="button">
+                        {selectingThis ? "正在确认…" : selected ? "已选择" : capabilities.selectNodeLabel}
                       </button>
                     </div>
                   </article>

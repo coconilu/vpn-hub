@@ -4,7 +4,7 @@
 
 | 项目 | 约束 |
 |---|---|
-| 数据来源 | 仅本应用自管、带随机 secret 的 loopback Mihomo Controller |
+| 数据来源 | 主核心运行时读取其带随机 secret 的 loopback Controller；主核心关闭时回退到随机端口、loopback-only、默认 REJECT 的隔离探测运行时 |
 | 可管理对象 | 已启用且凭据状态为 `configured` 的 `subscription` 出口 |
 | 展示字段 | 节点名称、代理类型、健康状态、Mihomo 已知的最近延迟 |
 | 明确排除 | server、port、UUID、密码、token、订阅 URL、第三方客户端内部节点 |
@@ -44,7 +44,8 @@ sequenceDiagram
 | 状态 | UI 行为 |
 |---|---|
 | `available` | 展示节点、搜索并允许选择 |
-| `core_unavailable` | Controller 未配置、连接失败、HTTP/响应无效时提示检查本应用自管核心；不探测其他进程 |
+| `core_unavailable` | 主核心与隔离探测运行时都不可用时，提示检查 Mihomo 文件与订阅配置；不探测其他进程 |
+| `controller_error` | 主核心存在但 Controller 查询失败时，提示检查主核心状态；不误导为隔离运行时启动失败 |
 | `provider_unavailable` | 提示等待 provider；原选择保持不变 |
 | 无可管理订阅 | 引导到设置页启用订阅并保存凭据 |
 
@@ -61,3 +62,6 @@ npm run build
 ```
 
 真实订阅验收只能在用户明确授权的隔离环境中进行，且不得把节点名称、订阅 URL、Controller secret 或运行日志复制到 Issue、PR 或测试证据。
+
+主核心关闭时，节点目录不会暴露隔离运行时自动选择的成员为“当前节点”，
+也不会允许提交真实节点切换；必须启动主核心并重新读取权威 selector 后才能选择。

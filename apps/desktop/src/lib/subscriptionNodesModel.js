@@ -16,6 +16,39 @@ export function replaceSubscriptionNodeGroup(catalog, updatedGroup) {
   };
 }
 
+export function subscriptionNodeGroupMessage(group) {
+  if (!group) return null;
+  if (group.state === "core_unavailable") {
+    return "无法启动隔离订阅探测。请检查 Mihomo 文件与订阅配置后重试。";
+  }
+  if (group.state === "controller_error") {
+    return "主核心正在运行，但 Mihomo Controller 查询失败。请检查核心状态后刷新。";
+  }
+  if (group.state === "provider_unavailable") {
+    return "订阅 provider 尚未返回可选节点。可以立即重试；配置无需再次保存。";
+  }
+  if (group.state === "provider_loading") {
+    return "配置已生效，provider 正在后台加载；完成后刷新即可加入路由。";
+  }
+  if (group.state === "provider_failed") {
+    return "provider 刷新失败。凭据与配置仍已安全保存，可以重试且无需再次保存。";
+  }
+  return null;
+}
+
+export function nodePageCapabilities(catalog, group) {
+  const selectionReady = Boolean(catalog?.selection_ready);
+  return {
+    canRefresh: true,
+    canTest: Boolean(catalog?.controller_ready && group?.state === "available"),
+    canSelect: Boolean(selectionReady && group?.state === "available"),
+    currentNodeLabel: selectionReady
+      ? group?.current_node ?? "尚未选择"
+      : "启动主核心后可查看",
+    selectNodeLabel: selectionReady ? "选择此节点" : "启动核心后可选",
+  };
+}
+
 export const NODE_LATENCY_CONCURRENCY = 4;
 
 export function nodeLatencyKey(subscriptionId, nodeName) {

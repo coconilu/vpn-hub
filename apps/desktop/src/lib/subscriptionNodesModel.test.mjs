@@ -8,8 +8,10 @@ import {
   initialNodeLatencyState,
   latencyResultToView,
   mergeBatchLatencyResults,
+  nodePageCapabilities,
   nodeLatencyKey,
   replaceSubscriptionNodeGroup,
+  subscriptionNodeGroupMessage,
 } from "./subscriptionNodesModel.js";
 
 const nodes = [
@@ -26,12 +28,47 @@ test("filters subscription nodes by name or proxy type", () => {
 test("replaces only the selected subscription group", () => {
   const first = { subscription_id: "sub-a", current_node: "Synthetic Alpha" };
   const second = { subscription_id: "sub-b", current_node: "Synthetic Beta" };
-  const catalog = { controller_ready: true, subscriptions: [first, second], message: "ready" };
+  const catalog = { controller_ready: true, selection_ready: false, subscriptions: [first, second], message: "ready" };
   const updated = { ...first, current_node: "Synthetic Gamma" };
 
   const result = replaceSubscriptionNodeGroup(catalog, updated);
   assert.equal(result.subscriptions[0], updated);
   assert.equal(result.subscriptions[1], second);
+  assert.equal(result.selection_ready, false);
+});
+
+test("isolated probe keeps refresh and tests available while selection stays disabled", () => {
+  const group = {
+    subscription_id: "sub-a",
+    state: "available",
+    current_node: null,
+    nodes,
+  };
+  const catalog = {
+    controller_ready: true,
+    selection_ready: false,
+    subscriptions: [group],
+    message: "isolated",
+  };
+
+  assert.deepEqual(nodePageCapabilities(catalog, group), {
+    canRefresh: true,
+    canTest: true,
+    canSelect: false,
+    currentNodeLabel: "启动主核心后可查看",
+    selectNodeLabel: "启动核心后可选",
+  });
+});
+
+test("catalog failures distinguish managed Controller errors from probe startup errors", () => {
+  assert.equal(
+    subscriptionNodeGroupMessage({ state: "controller_error" }),
+    "主核心正在运行，但 Mihomo Controller 查询失败。请检查核心状态后刷新。",
+  );
+  assert.equal(
+    subscriptionNodeGroupMessage({ state: "core_unavailable" }),
+    "无法启动隔离订阅探测。请检查 Mihomo 文件与订阅配置后重试。",
+  );
 });
 
 test("uses collision-safe runtime-only keys and marks Controller history stale", () => {

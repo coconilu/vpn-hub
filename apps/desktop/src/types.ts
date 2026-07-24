@@ -169,7 +169,7 @@ export interface RoutingOutlet {
   configured: boolean;
 }
 
-export type SubscriptionNodeGroupState = "available" | "core_unavailable" | "provider_unavailable" | "provider_loading" | "provider_failed";
+export type SubscriptionNodeGroupState = "available" | "core_unavailable" | "controller_error" | "provider_unavailable" | "provider_loading" | "provider_failed";
 
 export interface SubscriptionNode {
   name: string;
@@ -188,6 +188,7 @@ export interface SubscriptionNodeGroup {
 
 export interface SubscriptionNodeCatalog {
   controller_ready: boolean;
+  selection_ready: boolean;
   subscriptions: SubscriptionNodeGroup[];
   message: string;
 }
